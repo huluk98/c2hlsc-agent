@@ -1,5 +1,7 @@
 import tempfile
 import unittest
+import shutil
+import subprocess
 from pathlib import Path
 import sys
 
@@ -8,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from c2hlsc_agent.analyze import analyze_source
 from c2hlsc_agent.config import AgentConfig, ArgumentConfig
 from c2hlsc_agent.convert import generate_hls_sources
-from c2hlsc_agent.hls_project import render_run_csim, render_run_cosim, render_run_csynth, render_run_hls
+from c2hlsc_agent.hls_project import render_run_csim, render_run_cosim, render_run_csynth, render_run_hls, write_project
 from c2hlsc_agent.testgen import generate_testbench
 
 
@@ -79,6 +81,7 @@ class ConvertTests(unittest.TestCase):
     def test_generated_testbench_compares_output_arrays(self):
         analysis, cfg = self._analysis()
         testbench = generate_testbench(analysis, cfg)
+        self.assertIn("// - out: direction=output length=4 compare first clamp(n, 4) elements", testbench)
         self.assertIn("const int compare_len_out = clamp_count(static_cast<long long>(n), 4);", testbench)
         self.assertIn("for (int i = 0; i < compare_len_out; ++i)", testbench)
         self.assertIn("if (ref_out[i] != hls_out[i])", testbench)
@@ -93,6 +96,30 @@ class ConvertTests(unittest.TestCase):
         self.assertIn("output_sentinel<int32_t>(test_idx, i)", testbench)
         self.assertIn("if (std::numeric_limits<T>::is_integer)", testbench)
         self.assertNotIn("if constexpr", testbench)
+
+    @unittest.skipUnless(shutil.which("g++") and shutil.which("make"), "g++ and make are required")
+    def test_generated_testbench_passes_and_rejects_mutated_hls(self):
+        analysis, cfg = self._analysis()
+        generated = generate_hls_sources(analysis, cfg)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        project = Path(tmp.name) / "project"
+        write_project(project, analysis, generated, cfg)
+
+        passing = subprocess.run(["make", "-C", str(project), "test"], text=True, capture_output=True)
+        self.assertEqual(passing.returncode, 0, passing.stdout + passing.stderr)
+
+        source_path = project / "src" / "hls_top.cpp"
+        source = source_path.read_text(encoding="utf-8")
+        self.assertIn("out[i] = a[i] + b[i];", source)
+        source_path.write_text(source.replace("out[i] = a[i] + b[i];", "out[i] = a[i] - b[i];"), encoding="utf-8")
+
+        failing = subprocess.run(["make", "-C", str(project), "clean", "test"], text=True, capture_output=True)
+        output = failing.stdout + failing.stderr
+        self.assertNotEqual(failing.returncode, 0, output)
+        self.assertIn("Mismatch test=", output)
+        self.assertIn("arg=out", output)
+        self.assertIn("compare_len=", output)
 
 
 if __name__ == "__main__":
