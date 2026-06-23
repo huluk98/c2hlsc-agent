@@ -1,0 +1,20 @@
+input_files:
+  - input.c
+top: simple_fir
+part: xczu7ev-ffvc1156-2-e
+clock: 10
+num_tests: 64
+seed: 11
+interface_mode: default
+arguments:
+  x:
+    direction: input
+    length: 16
+  coef:
+    direction: input
+    length: 4
+  y:
+    direction: output
+    length: 16
+  n:
+    range: [0, 16]

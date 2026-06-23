@@ -1,0 +1,20 @@
+CXX ?= g++
+CXXFLAGS ?= -std=c++17 -Wall -Wextra -I src {{ compiler_flags }}
+TB_EXE ?= c2hlsc_tb
+
+.PHONY: all test clean vitis
+
+all: test
+
+$(TB_EXE): tb/testbench.cpp src/hls_top.cpp src/hls_top.hpp input.c
+	$(CXX) $(CXXFLAGS) tb/testbench.cpp src/hls_top.cpp -o $(TB_EXE)
+
+test: $(TB_EXE)
+	./$(TB_EXE)
+
+vitis:
+	vitis_hls -f run_hls.tcl
+
+clean:
+	rm -f $(TB_EXE)
+	rm -rf c2hlsc_project

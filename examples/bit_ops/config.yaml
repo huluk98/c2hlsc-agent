@@ -1,0 +1,15 @@
+input_files:
+  - input.c
+top: bit_mix
+part: xczu7ev-ffvc1156-2-e
+clock: 10
+num_tests: 128
+seed: 19
+interface_mode: default
+arguments:
+  a:
+    range: [-2147483648, 2147483647]
+  b:
+    range: [0, 4294967295]
+  shift:
+    range: [0, 31]

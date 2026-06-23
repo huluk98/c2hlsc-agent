@@ -1,0 +1,17 @@
+name: c2hlsc-linux
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip>=24
+  - pyyaml>=6
+  - make
+  - cmake
+  - ninja
+  - git
+  - rsync
+  - which
+  - pkg-config
+  - gcc_linux-64=13
+  - gxx_linux-64=13
+  - binutils_linux-64

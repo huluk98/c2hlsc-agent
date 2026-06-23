@@ -1,0 +1,12 @@
+open_project c2hlsc_project
+set_top {{ top }}
+add_files src/hls_top.cpp
+add_files -tb tb/testbench.cpp
+add_files -tb input.c
+open_solution "solution1" -flow_target vivado
+set_part { {{ part }} }
+create_clock -period {{ clock }} -name default
+csim_design
+csynth_design
+cosim_design {{ cosim_args }}
+exit
