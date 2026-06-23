@@ -44,6 +44,13 @@ From this repository:
 python3 -m pip install -e c2hlsc_agent
 ```
 
+Or, from the standalone GitHub repo root:
+
+```bash
+python3.11 -m pip install -r requirements.txt
+python3.11 -m pip install -e .
+```
+
 No commercial parser is required. The analyzer uses a robust regex fallback. Optional
 `PyYAML` is used when available, but a small built-in YAML subset parser supports the
 example configs.
