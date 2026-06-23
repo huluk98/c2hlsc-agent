@@ -241,6 +241,22 @@ For each conversion, the output directory contains:
 When `--no-run-vitis` is used, Vitis phases are marked `skipped`; host equivalence is
 still run when `g++` is available.
 
+## Testbench Generation
+
+The generated `tb/testbench.cpp` keeps one synchronized oracle path:
+
+- macro-renamed original C as the golden reference
+- generated HLS-C top under the same input vectors
+- directed scalar boundaries for ranged arguments such as `n: [0, 16]`
+- output-only buffer sentinels so missed writes are easier to expose
+- active-length output comparisons when a length-like scalar, such as `n`, is declared
+- compact mismatch traces with the seed, active compare length, scalar values, and
+  same-index input values
+
+This matters for CoSim because C/RTL simulation checks the RTL through the testbench.
+Inactive output elements outside the declared active range are not used as functional
+equivalence evidence unless the config says they are part of the contract.
+
 ## Limitations
 
 This first implementation is intentionally conservative:

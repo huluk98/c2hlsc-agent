@@ -79,8 +79,20 @@ class ConvertTests(unittest.TestCase):
     def test_generated_testbench_compares_output_arrays(self):
         analysis, cfg = self._analysis()
         testbench = generate_testbench(analysis, cfg)
+        self.assertIn("const int compare_len_out = clamp_count(static_cast<long long>(n), 4);", testbench)
+        self.assertIn("for (int i = 0; i < compare_len_out; ++i)", testbench)
         self.assertIn("if (ref_out[i] != hls_out[i])", testbench)
+        self.assertIn('<< " compare_len=" << compare_len_out', testbench)
+        self.assertIn('<< " n=" << static_cast<long long>(n)', testbench)
         self.assertIn('"Mismatch test=" << test_idx << " arg=out index="', testbench)
+
+    def test_generated_testbench_uses_vitis_friendly_stimulus(self):
+        analysis, cfg = self._analysis()
+        testbench = generate_testbench(analysis, cfg)
+        self.assertIn("int n = bounded_scalar<int>(test_idx, rng, 0LL, 4LL);", testbench)
+        self.assertIn("output_sentinel<int32_t>(test_idx, i)", testbench)
+        self.assertIn("if (std::numeric_limits<T>::is_integer)", testbench)
+        self.assertNotIn("if constexpr", testbench)
 
 
 if __name__ == "__main__":
