@@ -70,7 +70,12 @@ ls build/vector_add/c2hlsc_project/solution1/syn/verilog
 8. If CSim or Vitis still fails, collect debug info
 
 cat build/vector_add/run_hls.tcl
-tail -120 build/vector_add/vitis_hls.log
+cat build/vector_add/run_csim.tcl
+cat build/vector_add/run_csynth.tcl
+cat build/vector_add/run_cosim.tcl
+tail -120 build/vector_add/csim.log
+tail -120 build/vector_add/csynth.log
+tail -120 build/vector_add/cosim.log
 find build/vector_add/c2hlsc_project -type f -name "*.log" -print
 
 

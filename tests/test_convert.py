@@ -8,7 +8,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from c2hlsc_agent.analyze import analyze_source
 from c2hlsc_agent.config import AgentConfig, ArgumentConfig
 from c2hlsc_agent.convert import generate_hls_sources
-from c2hlsc_agent.hls_project import render_run_hls
+from c2hlsc_agent.hls_project import render_run_csim, render_run_cosim, render_run_csynth, render_run_hls
 from c2hlsc_agent.testgen import generate_testbench
 
 
@@ -52,6 +52,20 @@ class ConvertTests(unittest.TestCase):
         self.assertIn("csynth_design", tcl)
         self.assertIn("cosim_design -tool xsim -rtl verilog", tcl)
         self.assertNotIn("add_files -tb input.c", tcl)
+
+    def test_split_tcl_generation_is_phase_specific(self):
+        analysis, cfg = self._analysis()
+        cfg.cosim_tool = "xsim"
+        csim = render_run_csim(analysis, cfg)
+        csynth = render_run_csynth()
+        cosim = render_run_cosim(cfg)
+        self.assertIn("open_project -reset c2hlsc_project", csim)
+        self.assertIn("csim_design", csim)
+        self.assertNotIn("csynth_design", csim)
+        self.assertIn("csynth_design", csynth)
+        self.assertNotIn("csim_design", csynth)
+        self.assertIn("cosim_design -tool xsim -rtl verilog", cosim)
+        self.assertNotIn("csynth_design", cosim)
 
     def test_generated_testbench_compares_output_arrays(self):
         analysis, cfg = self._analysis()

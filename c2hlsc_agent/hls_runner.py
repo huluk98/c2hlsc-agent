@@ -35,13 +35,27 @@ def run_vitis(project_dir: Path, run_requested: bool) -> dict[str, PhaseResult]:
             "cosim": PhaseResult("cosim", "blocked", summary=message),
         }
     try:
-        result = run_command(["vitis_hls", "-f", "run_hls.tcl"], project_dir, "vitis_hls", timeout=3600)
+        phases["csim"] = run_command(["vitis_hls", "-f", "run_csim.tcl"], project_dir, "csim", timeout=1800)
     except subprocess.TimeoutExpired as exc:
-        result = PhaseResult("vitis_hls", "fail", summary=f"Vitis HLS timed out: {exc}")
-    text = (result.stdout + "\n" + result.stderr).lower()
-    phases["csim"] = PhaseResult("csim", "pass" if "csim_design" in text and result.status == "pass" else result.status, result.returncode, result.stdout, result.stderr, result.log_path)
-    phases["csynth"] = PhaseResult("csynth", "pass" if "csynth_design" in text and result.status == "pass" else result.status, result.returncode, result.stdout, result.stderr, result.log_path)
-    phases["cosim"] = PhaseResult("cosim", "pass" if "cosim_design" in text and result.status == "pass" else result.status, result.returncode, result.stdout, result.stderr, result.log_path)
+        phases["csim"] = PhaseResult("csim", "fail", summary=f"Vitis CSim timed out: {exc}")
+    if phases["csim"].status != "pass":
+        message = "csim failed"
+        phases["csynth"] = PhaseResult("csynth", "blocked", summary=message)
+        phases["cosim"] = PhaseResult("cosim", "blocked", summary=message)
+        return phases
+
+    try:
+        phases["csynth"] = run_command(["vitis_hls", "-f", "run_csynth.tcl"], project_dir, "csynth", timeout=3600)
+    except subprocess.TimeoutExpired as exc:
+        phases["csynth"] = PhaseResult("csynth", "fail", summary=f"Vitis synthesis timed out: {exc}")
+    if phases["csynth"].status != "pass":
+        phases["cosim"] = PhaseResult("cosim", "blocked", summary="csynth failed")
+        return phases
+
+    try:
+        phases["cosim"] = run_command(["vitis_hls", "-f", "run_cosim.tcl"], project_dir, "cosim", timeout=3600)
+    except subprocess.TimeoutExpired as exc:
+        phases["cosim"] = PhaseResult("cosim", "fail", summary=f"Vitis CoSim timed out: {exc}")
     return phases
 
 
