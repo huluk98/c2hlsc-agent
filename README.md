@@ -119,6 +119,26 @@ VITIS_HLS_BIN="/nvme1/vitis2024.2 1113 1001/Vitis_HLS/2024.2/bin/vitis_hls" \
   --out build/vector_add
 ```
 
+There is also a Python wrapper if you want to paste the binary path directly into
+one file. Edit `VITIS_HLS_BIN = ""` near the top of `scripts/run_vitis_with_bin.py`,
+then run:
+
+```bash
+conda activate hlsc
+python scripts/run_vitis_with_bin.py \
+  --config examples/vector_add/config.yaml \
+  --out build/vector_add
+```
+
+Or pass the binary path without editing:
+
+```bash
+python scripts/run_vitis_with_bin.py \
+  --vitis-hls-bin "/nvme1/vitis2024.2 1113 1001/Vitis_HLS/2024.2/bin/vitis_hls" \
+  --config examples/vector_add/config.yaml \
+  --out build/vector_add
+```
+
 Run on a remote Linux host from this machine:
 
 ```bash
