@@ -14,17 +14,13 @@ python -m pip install -r requirements.txt
 python -m pip install -e .
 
 
-3. Edit the Python runner and paste your vitis_hls binary path
+3. Put your vitis_hls binary path in the local path file
 
-nano scripts/run_vitis_with_bin.py
+nano vitis_hls_bin_path.txt
 
-Find this line:
+Put exactly one line in the file, for example:
 
-VITIS_HLS_BIN = ""
-
-Change it to your actual path, for example:
-
-VITIS_HLS_BIN = "/nvme1/vitis2024.2 1113 1001/Vitis_HLS/2024.2/bin/vitis_hls"
+/nvme1/vitis2024.2 1113 1001/Vitis_HLS/2024.2/bin/vitis_hls
 
 Save and exit nano:
 
@@ -44,6 +40,10 @@ python scripts/run_vitis_with_bin.py \
   --config examples/vector_add/config.yaml \
   --out build/vector_add \
   --print-env
+
+This command works because scripts/run_vitis_with_bin.py reads the path from
+vitis_hls_bin_path.txt. The file is intentionally ignored by git so your local
+machine path does not get committed.
 
 
 6. Check the conversion report
@@ -75,7 +75,7 @@ find build/vector_add/c2hlsc_project -type f -name "*.log" -print
 
 
 Alternative: pass the binary path on the command line without editing the Python file
-===============================================================================
+================================================================================
 
 rm -rf build/vector_add
 

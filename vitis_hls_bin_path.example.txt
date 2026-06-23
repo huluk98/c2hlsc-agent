@@ -1,0 +1,4 @@
+# Copy this file to vitis_hls_bin_path.txt, then replace the example path
+# with your real vitis_hls binary path. The run_vitis_with_bin.py script
+# reads the first non-comment line from vitis_hls_bin_path.txt.
+/nvme1/vitis2024.2 1113 1001/Vitis_HLS/2024.2/bin/vitis_hls

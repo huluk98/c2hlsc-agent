@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """Run c2hlsc-agent with an explicit vitis_hls binary path.
 
-Edit VITIS_HLS_BIN below, or pass --vitis-hls-bin on the command line.
-This script uses the currently active Python environment, so activate your
-preferred Conda env first:
+Put your path in vitis_hls_bin_path.txt, edit VITIS_HLS_BIN below, or pass
+--vitis-hls-bin on the command line. This script uses the currently active
+Python environment, so activate your preferred Conda env first:
 
     conda activate hlsc
+    echo "/path/to/Vitis_HLS/2024.2/bin/vitis_hls" > vitis_hls_bin_path.txt
     python scripts/run_vitis_with_bin.py \
       --config examples/vector_add/config.yaml \
       --out build/vector_add
 
-If you do not edit VITIS_HLS_BIN, pass it explicitly:
+Or pass it explicitly:
 
     python scripts/run_vitis_with_bin.py \
       --vitis-hls-bin "/path/to/Vitis_HLS/2024.2/bin/vitis_hls" \
@@ -34,8 +35,42 @@ from pathlib import Path
 VITIS_HLS_BIN = ""
 
 
+# Optional local text file. Put exactly one line in it:
+# /path/to/Vitis_HLS/2024.2/bin/vitis_hls
+VITIS_HLS_BIN_FILE = "vitis_hls_bin_path.txt"
+
+
 def _repo_root() -> Path:
     return Path(__file__).resolve().parents[1]
+
+
+def _read_path_file(repo_root: Path) -> str:
+    path_file = repo_root / VITIS_HLS_BIN_FILE
+    if not path_file.exists():
+        return ""
+    for line in path_file.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            return line
+    return ""
+
+
+def _auto_find_vitis_hls() -> str:
+    patterns = [
+        "/nvme1/*/Vitis_HLS/2024.2/bin/vitis_hls",
+        "/nvme1/*/Vitis_HLS/*/bin/vitis_hls",
+        "/opt/Xilinx/Vitis_HLS/2024.2/bin/vitis_hls",
+        "/opt/Xilinx/Vitis_HLS/*/bin/vitis_hls",
+        "/tools/Xilinx/Vitis_HLS/2024.2/bin/vitis_hls",
+        "/tools/Xilinx/Vitis_HLS/*/bin/vitis_hls",
+        str(Path.home() / "Xilinx/Vitis_HLS/2024.2/bin/vitis_hls"),
+        str(Path.home() / "Xilinx/Vitis_HLS/*/bin/vitis_hls"),
+    ]
+    for pattern in patterns:
+        for match in sorted(Path("/").glob(pattern.lstrip("/"))):
+            if match.is_file() and os.access(match, os.X_OK):
+                return str(match)
+    return ""
 
 
 def _split_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
@@ -48,13 +83,13 @@ def _split_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
     --config examples/vector_add/config.yaml \\
     --out build/vector_add
 
-  # Or edit VITIS_HLS_BIN at the top of this file, then:
+  # Or put the path in vitis_hls_bin_path.txt, then:
   python scripts/run_vitis_with_bin.py --config examples/vector_add/config.yaml --out build/vector_add
 """,
     )
     parser.add_argument(
         "--vitis-hls-bin",
-        default=os.environ.get("VITIS_HLS_BIN") or VITIS_HLS_BIN,
+        default=None,
         help="Full path to the vitis_hls executable. May contain spaces.",
     )
     parser.add_argument(
@@ -68,17 +103,28 @@ def _split_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
 
 def main(argv: list[str] | None = None) -> int:
     args, convert_args = _split_args(list(sys.argv[1:] if argv is None else argv))
+    repo_root = _repo_root()
+    vitis_hls_bin = (
+        args.vitis_hls_bin
+        or os.environ.get("VITIS_HLS_BIN")
+        or VITIS_HLS_BIN
+        or _read_path_file(repo_root)
+        or _auto_find_vitis_hls()
+    )
     if not convert_args:
         print("No c2hlsc-agent convert arguments were provided.", file=sys.stderr)
         print("Example: --config examples/vector_add/config.yaml --out build/vector_add", file=sys.stderr)
         return 2
 
-    if not args.vitis_hls_bin:
+    if not vitis_hls_bin:
         print("vitis_hls path is missing.", file=sys.stderr)
-        print("Either edit VITIS_HLS_BIN in scripts/run_vitis_with_bin.py or pass --vitis-hls-bin.", file=sys.stderr)
+        print("Use one of these options:", file=sys.stderr)
+        print("  1. Edit VITIS_HLS_BIN in scripts/run_vitis_with_bin.py", file=sys.stderr)
+        print("  2. Put the path in vitis_hls_bin_path.txt", file=sys.stderr)
+        print("  3. Pass --vitis-hls-bin /path/to/bin/vitis_hls", file=sys.stderr)
         return 2
 
-    vitis_hls = Path(args.vitis_hls_bin).expanduser()
+    vitis_hls = Path(vitis_hls_bin).expanduser()
     if not vitis_hls.exists():
         print(f"vitis_hls binary does not exist: {vitis_hls}", file=sys.stderr)
         return 2
@@ -87,7 +133,6 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Try: chmod +x {vitis_hls}", file=sys.stderr)
         return 2
 
-    repo_root = _repo_root()
     env = os.environ.copy()
     env["PATH"] = f"{vitis_hls.parent}{os.pathsep}{env.get('PATH', '')}"
     env["VITIS_HLS_BIN"] = str(vitis_hls)
