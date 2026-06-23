@@ -44,6 +44,15 @@ class ConvertTests(unittest.TestCase):
         self.assertIn('#include "hls_top.hpp"', generated.source)
         self.assertIn("out[i] = a[i] + b[i]", generated.source)
 
+    def test_ap_memory_interface_pragmas_for_pointer_args(self):
+        analysis, cfg = self._analysis()
+        cfg.interface_mode = "ap_memory"
+        generated = generate_hls_sources(analysis, cfg)
+        self.assertIn("#pragma HLS INTERFACE ap_memory port=a", generated.source)
+        self.assertIn("#pragma HLS INTERFACE ap_memory port=b", generated.source)
+        self.assertIn("#pragma HLS INTERFACE ap_memory port=out", generated.source)
+        self.assertIn("#pragma HLS INTERFACE s_axilite port=n", generated.source)
+
     def test_tcl_generation_contains_required_vitis_phases(self):
         analysis, cfg = self._analysis()
         cfg.cosim_tool = "xsim"

@@ -196,7 +196,7 @@ part: xczu7ev-ffvc1156-2-e
 clock: 10
 num_tests: 100
 seed: 1
-interface_mode: default
+interface_mode: ap_memory
 allow_pragmas: true
 allow_performance_pragmas: false
 arguments:
