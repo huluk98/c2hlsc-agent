@@ -1,0 +1,86 @@
+Linux Vitis run commands
+========================
+
+1. Pull the latest fixes
+
+cd c2hlsc-agent
+git pull
+
+
+2. Activate your existing Conda environment
+
+conda activate hlsc
+python -m pip install -r requirements.txt
+python -m pip install -e .
+
+
+3. Edit the Python runner and paste your vitis_hls binary path
+
+nano scripts/run_vitis_with_bin.py
+
+Find this line:
+
+VITIS_HLS_BIN = ""
+
+Change it to your actual path, for example:
+
+VITIS_HLS_BIN = "/nvme1/vitis2024.2 1113 1001/Vitis_HLS/2024.2/bin/vitis_hls"
+
+Save and exit nano:
+
+Ctrl+O
+Enter
+Ctrl+X
+
+
+4. Clean the old failed output
+
+rm -rf build/vector_add
+
+
+5. Run the Vitis flow
+
+python scripts/run_vitis_with_bin.py \
+  --config examples/vector_add/config.yaml \
+  --out build/vector_add \
+  --print-env
+
+
+6. Check the conversion report
+
+cat build/vector_add/conversion_report.md
+
+You want to see:
+
+Software equivalence: pass
+C simulation: pass
+C synthesis: pass
+C/RTL co-simulation: pass
+
+
+7. Find generated RTL files
+
+find build/vector_add -type f \( -name "*.v" -o -name "*.sv" -o -name "*.vhd" \)
+
+Likely RTL folder:
+
+ls build/vector_add/c2hlsc_project/solution1/syn/verilog
+
+
+8. If CSim or Vitis still fails, collect debug info
+
+cat build/vector_add/run_hls.tcl
+tail -120 build/vector_add/vitis_hls.log
+find build/vector_add/c2hlsc_project -type f -name "*.log" -print
+
+
+Alternative: pass the binary path on the command line without editing the Python file
+===============================================================================
+
+rm -rf build/vector_add
+
+python scripts/run_vitis_with_bin.py \
+  --vitis-hls-bin "/nvme1/vitis2024.2 1113 1001/Vitis_HLS/2024.2/bin/vitis_hls" \
+  --config examples/vector_add/config.yaml \
+  --out build/vector_add \
+  --print-env
