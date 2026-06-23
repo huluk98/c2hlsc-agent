@@ -86,6 +86,30 @@ VITIS_HLS_ROOT="/nvme1/vitis2024.2 1113 1001/Vitis_HLS/2024.2" \
   --out build/vector_add
 ```
 
+If you already activated your own Conda environment, for example `hlsc`, use
+the active environment instead of the script's default `c2hlsc-linux` env:
+
+```bash
+conda activate hlsc
+python -m pip install -r requirements.txt
+python -m pip install -e .
+C2HLSC_USE_ACTIVE_ENV=1 \
+VITIS_HLS_ROOT="/nvme1/vitis2024.2 1113 1001/Vitis_HLS/2024.2" \
+  bash scripts/run_vitis_linux.sh \
+  --config examples/vector_add/config.yaml \
+  --out build/vector_add
+```
+
+Alternatively, let the script call that named Conda env directly:
+
+```bash
+C2HLSC_CONDA_ENV=hlsc \
+VITIS_HLS_ROOT="/nvme1/vitis2024.2 1113 1001/Vitis_HLS/2024.2" \
+  bash scripts/run_vitis_linux.sh \
+  --config examples/vector_add/config.yaml \
+  --out build/vector_add
+```
+
 If the settings script does not put `vitis_hls` on `PATH`, pass the binary directly:
 
 ```bash
