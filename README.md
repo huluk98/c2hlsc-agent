@@ -71,7 +71,25 @@ Run Vitis locally on that Linux machine:
 
 ```bash
 cd c2hlsc_agent
-VITIS_SETTINGS=/opt/Xilinx/Vitis/2022.1/settings64.sh \
+VITIS_HLS_ROOT="/opt/Xilinx/Vitis_HLS/2024.2" \
+  bash scripts/run_vitis_linux.sh \
+  --config examples/vector_add/config.yaml \
+  --out build/vector_add
+```
+
+If your Vitis path contains spaces, keep the quotes:
+
+```bash
+VITIS_HLS_ROOT="/nvme1/vitis2024.2 1113 1001/Vitis_HLS/2024.2" \
+  bash scripts/run_vitis_linux.sh \
+  --config examples/vector_add/config.yaml \
+  --out build/vector_add
+```
+
+If the settings script does not put `vitis_hls` on `PATH`, pass the binary directly:
+
+```bash
+VITIS_HLS_BIN="/nvme1/vitis2024.2 1113 1001/Vitis_HLS/2024.2/bin/vitis_hls" \
   bash scripts/run_vitis_linux.sh \
   --config examples/vector_add/config.yaml \
   --out build/vector_add
