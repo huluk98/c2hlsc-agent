@@ -51,6 +51,7 @@ class ConvertTests(unittest.TestCase):
         self.assertIn("csim_design", tcl)
         self.assertIn("csynth_design", tcl)
         self.assertIn("cosim_design -tool xsim -rtl verilog", tcl)
+        self.assertNotIn("add_files -tb input.c", tcl)
 
     def test_generated_testbench_compares_output_arrays(self):
         analysis, cfg = self._analysis()

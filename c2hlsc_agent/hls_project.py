@@ -28,7 +28,6 @@ open_project c2hlsc_project
 set_top {fn.name}
 add_files src/hls_top.cpp
 add_files -tb tb/testbench.cpp
-add_files -tb input.c
 open_solution "solution1" -flow_target vivado
 set_part {{{config.part}}}
 create_clock -period {config.clock} -name default
