@@ -290,6 +290,18 @@ python -m c2hlsc_agent.cli convert \
   --no-run-vitis
 ```
 
+Generate Vitis-oriented testbench bundles from an `HLS_NL.json` dataset:
+
+```bash
+python scripts/generate_hls_nl_testbenches.py \
+  --input /path/to/HLS_NL.json \
+  --out-dir build/hls_nl_testbenches
+```
+
+The generated bundles are labeled by oracle strength: `semantic` for recognized
+self-checking patterns, `property` for stateful/protocol drivers that need a
+contract audit, and `smoke` for deterministic CoSim stimulus only.
+
 Run unit tests:
 
 ```bash
