@@ -228,7 +228,7 @@ Run the accepted HLS_NL JSONL dataset and verify that Vitis emits Verilog:
 ```bash
 VITIS_HLS_BIN="/path/to/Vitis_HLS/2024.2/bin/vitis_hls" \
 python scripts/run_hls_nl_vitis_batch.py \
-  --input /path/to/hls_nl_repaired.accepted.jsonl \
+  --input data/hls_nl/hls_nl_repaired.accepted.jsonl \
   --out-dir build/hls_nl_accepted_vitis \
   --limit 10 \
   --part xczu7ev-ffvc1156-2-e \
@@ -247,11 +247,7 @@ For a full-CoSim corpus where only passing cases are kept for upload:
 ```bash
 VITIS_HLS_BIN="/path/to/Vitis_HLS/2024.2/bin/vitis_hls" \
 python scripts/run_hls_nl_vitis_batch.py \
-  --input /path/to/hls_nl_repaired.accepted.jsonl \
-  --out-dir build/hls_nl_accepted_full_cosim \
-  --part xczu7ev-ffvc1156-2-e \
-  --clock 10 \
-  --run-full-cosim
+  --config configs/hls_nl_full_cosim.json
 
 python scripts/export_cosim_successes.py \
   --report build/hls_nl_accepted_full_cosim/vitis_batch_report.json \
@@ -267,12 +263,12 @@ For the first CoSim check, use the small JSON config and shell wrapper:
 ```bash
 cd c2hlsc_agent
 VITIS_HLS_BIN="/path/to/Vitis_HLS/2024.2/bin/vitis_hls" \
-HLS_NL_JSONL="/path/to/hls_nl_repaired.accepted.jsonl" \
   bash scripts/run_hls_nl_cosim_smoke.sh
 ```
 
 The default config is `configs/hls_nl_cosim_smoke.json`, which runs one JSONL
-record through CSim, CSynth, and C/RTL CoSim. The wrapper prints the summary,
+record from `data/hls_nl/hls_nl_repaired.accepted.jsonl` through CSim, CSynth,
+and C/RTL CoSim. The wrapper prints the summary,
 the Vitis log tail, generated Verilog files, and any discovered CoSim artifacts.
 Increase the sample with `HLS_NL_LIMIT=3` after the first row looks sane.
 

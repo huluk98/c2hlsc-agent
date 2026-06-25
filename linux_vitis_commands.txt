@@ -117,7 +117,7 @@ Small smoke check:
 
 VITIS_HLS_BIN="/path/to/Vitis_HLS/2024.2/bin/vitis_hls" \
 python scripts/run_hls_nl_vitis_batch.py \
-  --input /path/to/hls_nl_repaired.accepted.jsonl \
+  --input data/hls_nl/hls_nl_repaired.accepted.jsonl \
   --out-dir build/hls_nl_accepted_vitis_smoke \
   --limit 10 \
   --part xczu7ev-ffvc1156-2-e \
@@ -127,7 +127,7 @@ Full accepted JSONL run:
 
 VITIS_HLS_BIN="/path/to/Vitis_HLS/2024.2/bin/vitis_hls" \
 python scripts/run_hls_nl_vitis_batch.py \
-  --input /path/to/hls_nl_repaired.accepted.jsonl \
+  --input data/hls_nl/hls_nl_repaired.accepted.jsonl \
   --out-dir build/hls_nl_accepted_vitis_full \
   --part xczu7ev-ffvc1156-2-e \
   --clock 10
@@ -153,11 +153,7 @@ Run the full batch in CoSim mode:
 
 VITIS_HLS_BIN="/path/to/Vitis_HLS/2024.2/bin/vitis_hls" \
 python scripts/run_hls_nl_vitis_batch.py \
-  --input /path/to/hls_nl_repaired.accepted.jsonl \
-  --out-dir build/hls_nl_accepted_full_cosim \
-  --part xczu7ev-ffvc1156-2-e \
-  --clock 10 \
-  --run-full-cosim
+  --config configs/hls_nl_full_cosim.json
 
 Then export only passing cases into a clean uploadable corpus:
 
@@ -179,7 +175,6 @@ generated Verilog paths, and CoSim artifact paths.
 cd c2hlsc_agent
 
 VITIS_HLS_BIN="/path/to/Vitis_HLS/2024.2/bin/vitis_hls" \
-HLS_NL_JSONL="/path/to/hls_nl_repaired.accepted.jsonl" \
   bash scripts/run_hls_nl_cosim_smoke.sh
 
 Useful overrides:
@@ -192,6 +187,4 @@ VITIS_CLOCK=10
 
 Generate projects without running Vitis:
 
-HLS_NL_GENERATE_ONLY=1 \
-HLS_NL_JSONL="/path/to/hls_nl_repaired.accepted.jsonl" \
-  bash scripts/run_hls_nl_cosim_smoke.sh
+HLS_NL_GENERATE_ONLY=1 bash scripts/run_hls_nl_cosim_smoke.sh

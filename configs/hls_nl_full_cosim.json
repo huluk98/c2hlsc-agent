@@ -1,0 +1,11 @@
+{
+  "input": "data/hls_nl/hls_nl_repaired.accepted.jsonl",
+  "out_dir": "build/hls_nl_accepted_full_cosim",
+  "offset": 0,
+  "part": "xczu7ev-ffvc1156-2-e",
+  "clock": "10",
+  "timeout_seconds": 7200,
+  "log_tail_lines": 120,
+  "run_full_cosim": true,
+  "stop_on_fail": false
+}
