@@ -89,3 +89,73 @@ python scripts/run_vitis_with_bin.py \
   --config examples/vector_add/config.yaml \
   --out build/vector_add \
   --print-env
+
+
+Run the accepted JSONL dataset and verify Verilog generation
+============================================================
+
+Use this for dataset rows such as hls_nl_repaired.accepted.jsonl. The runner
+generates one Vitis project folder per JSONL row, runs CSim + CSynth, and marks
+a row pass only when Vitis exits successfully and emits .v/.sv files under:
+
+hls_nl_project/solution1/syn/verilog
+
+Small smoke check:
+
+VITIS_HLS_BIN="/nvme1/vitis2024.2 1113 1001/Vitis_HLS/2024.2/bin/vitis_hls" \
+python scripts/run_hls_nl_vitis_batch.py \
+  --input /path/to/hls_nl_repaired.accepted.jsonl \
+  --out-dir build/hls_nl_accepted_vitis_smoke \
+  --limit 10 \
+  --part xczu7ev-ffvc1156-2-e \
+  --clock 10
+
+Full accepted JSONL run:
+
+VITIS_HLS_BIN="/nvme1/vitis2024.2 1113 1001/Vitis_HLS/2024.2/bin/vitis_hls" \
+python scripts/run_hls_nl_vitis_batch.py \
+  --input /path/to/hls_nl_repaired.accepted.jsonl \
+  --out-dir build/hls_nl_accepted_vitis_full \
+  --part xczu7ev-ffvc1156-2-e \
+  --clock 10
+
+Check summary:
+
+python - <<'PY'
+import json
+from pathlib import Path
+r = json.loads(Path("build/hls_nl_accepted_vitis_smoke/vitis_verilog_report.json").read_text())
+print(json.dumps(r["summary"], indent=2))
+PY
+
+For C/RTL CoSim too, add:
+
+--run-full-cosim
+
+
+Small JSONL CoSim smoke before scaling up
+========================================
+
+This uses configs/hls_nl_cosim_smoke.json. By default it runs one accepted JSONL
+row through CSim, CSynth, and C/RTL CoSim, then prints the Vitis log tail,
+generated Verilog paths, and CoSim artifact paths.
+
+cd c2hlsc_agent
+
+VITIS_HLS_BIN="/nvme1/vitis2024.2 1113 1001/Vitis_HLS/2024.2/bin/vitis_hls" \
+HLS_NL_JSONL="/path/to/hls_nl_repaired.accepted.jsonl" \
+  bash scripts/run_hls_nl_cosim_smoke.sh
+
+Useful overrides:
+
+HLS_NL_LIMIT=3
+HLS_NL_OFFSET=100
+HLS_NL_OUT_DIR=build/hls_nl_cosim_offset100
+VITIS_PART=xczu7ev-ffvc1156-2-e
+VITIS_CLOCK=10
+
+Generate projects without running Vitis:
+
+HLS_NL_GENERATE_ONLY=1 \
+HLS_NL_JSONL="/path/to/hls_nl_repaired.accepted.jsonl" \
+  bash scripts/run_hls_nl_cosim_smoke.sh

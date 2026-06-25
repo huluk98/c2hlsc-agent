@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import sys
 import tempfile
 import unittest
@@ -75,6 +76,35 @@ class HlsNlTestbenchGenerationTests(unittest.TestCase):
             self.assertTrue((design_dir / "dut.cpp").exists())
             self.assertTrue((design_dir / "tb.cpp").exists())
             self.assertIn("cosim_design -rtl verilog", (design_dir / "run_hls.tcl").read_text(encoding="utf-8"))
+
+    def test_loads_repaired_jsonl_and_preserves_original_file_metadata(self):
+        record = {
+            "record_id": 42,
+            "original_file": "42_hls.txt",
+            "design_title": "Tiny Add",
+            "HLS_instruction": "Generate Vitis HLS code.",
+            "hls_cpp": """
+            #include <ap_int.h>
+            void tiny_add(ap_uint<8> a, ap_uint<8> b, ap_uint<8>& out) {
+              out = a + b;
+            }
+            """,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            jsonl = Path(tmp) / "accepted.jsonl"
+            jsonl.write_text(json.dumps(record) + "\n", encoding="utf-8")
+            records = gen.load_records(jsonl)
+            self.assertEqual(len(records), 1)
+            self.assertEqual(gen.record_source_file(records[0]), "42_hls.txt")
+            self.assertEqual(gen.record_id_for(records[0], 0), 42)
+
+            sig = gen.extract_function(records[0]["hls_cpp"])
+            row = gen.write_design(Path(tmp) / "out", records[0], sig, gen.record_id_for(records[0], 0), "xc7z020clg484-1", "10")
+            design_dir = Path(row["path"])
+            self.assertEqual(row["source_file"], "42_hls.txt")
+            self.assertEqual(row["design_title"], "Tiny Add")
+            self.assertIn("00042_42_hls_tiny_add", str(design_dir))
+            self.assertIn("Source file: 42_hls.txt", (design_dir / "tb.cpp").read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

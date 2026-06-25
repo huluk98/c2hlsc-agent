@@ -36,6 +36,78 @@ original C. For a defensible "functional equivalent RTL" claim, the loop must ke
 original C in the oracle path, maintain synchronized stimuli, and rerun the complete
 verification stack after every repair or optimization.
 
+## HLS-C Generator Agent
+
+The HLS-C generator contract lives in `c2hlsc_agent/hlsc_generator.py` as
+`hlsc_generator_vitis_beginner_v1`. It is intentionally separate from the sidecar
+testbench generator in `c2hlsc_agent/testgen.py`.
+
+That generator policy instructs `hlsc_generator_agent` to:
+
+- default to AMD/Xilinx Vitis HLS syntax when the target is unspecified
+- analyze hotspot loops, loop-carried dependencies, memory-port bottlenecks, helper
+  function boundaries, and top-level interfaces before editing
+- preserve functional correctness first and only add justified pragmas
+- copy the original function exactly in the user-facing HLS report
+- emit beginner-readable Vitis HLS annotated code with comments explaining every pragma
+- include expected hardware impact, trade-offs, Intel HLS notes, and a synthesis report
+  checklist
+
+The expected user-facing HLS-C generator response sections are:
+
+1. Assumptions
+2. Hotspot analysis
+3. Original code
+4. Vitis HLS annotated code
+5. Expected hardware impact
+6. Trade-offs / risks
+7. Intel HLS notes
+8. Report checklist
+
+## HLS-LeVeri-Style Testbench Generator
+
+AUTO RTL also emits an HLS-LeVeri-inspired paired trace testbench bundle. The reference
+framework is [`cz-5f/HLS-LeVeri`](https://github.com/cz-5f/HLS-LeVeri), whose preview
+dataset is organized around paired artifacts:
+
+```text
+(golden C, HLS-C, golden-C testbench, HLS-C testbench)
+```
+
+The local policy lives in `c2hlsc_agent/leveri_testgen.py` as
+`hls_leveri_shift_left_v1`. It is owned by `shift_left_testbench_agent`, not by
+`hlsc_generator_agent`.
+
+For every generated project, AUTO RTL now writes:
+
+- `tb/leveri_golden_tb.cpp`: runs the macro-renamed original C and writes
+  `leveri_golden_trace.csv`
+- `tb/leveri_hls_tb.cpp`: runs the generated HLS-C top and writes
+  `leveri_hls_trace.csv`
+- `tb/leveri_compare.py`: checks static trace alignment and dynamic output consistency
+- `tb/run_gcov.py`: compiles/runs the paired traces with gcov coverage flags
+- `tb/klee_driver.cpp`: symbolic KLEE driver for the golden C top function
+- `tb/run_klee.py`: optional KLEE runner that writes a skip report if KLEE is absent
+- `tb/leveri_manifest.json`: records KG-ready metadata for the testbench bundle
+
+Run the paired trace check with:
+
+```bash
+make leveri-test
+```
+
+Run coverage hooks with:
+
+```bash
+make gcov-coverage
+make klee-coverage
+make coverage
+```
+
+`gcov` reports are written to `coverage/gcov_report.json`. KLEE reports are written to
+`coverage/klee_report.json`; when KLEE is not installed, the script exits successfully
+with a `skipped` report so the generated project remains portable.
+
 ## Install
 
 From this repository:
@@ -138,6 +210,39 @@ python scripts/run_vitis_with_bin.py \
   --config examples/vector_add/config.yaml \
   --out build/vector_add
 ```
+
+Run the accepted HLS_NL JSONL dataset and verify that Vitis emits Verilog:
+
+```bash
+VITIS_HLS_BIN="/nvme1/vitis2024.2 1113 1001/Vitis_HLS/2024.2/bin/vitis_hls" \
+python scripts/run_hls_nl_vitis_batch.py \
+  --input /path/to/hls_nl_repaired.accepted.jsonl \
+  --out-dir build/hls_nl_accepted_vitis \
+  --limit 10 \
+  --part xczu7ev-ffvc1156-2-e \
+  --clock 10
+```
+
+The batch runner writes `vitis_verilog_report.json` and
+`vitis_verilog_results.jsonl` under the output directory. A record is marked
+`pass` only when `vitis_hls` exits successfully and at least one `.v` or `.sv`
+file appears under `hls_nl_project/solution1/syn/verilog`.
+
+Use `--run-full-cosim` when you want C/RTL CoSim as well as Verilog emission.
+
+For the first CoSim check, use the small JSON config and shell wrapper:
+
+```bash
+cd c2hlsc_agent
+VITIS_HLS_BIN="/nvme1/vitis2024.2 1113 1001/Vitis_HLS/2024.2/bin/vitis_hls" \
+HLS_NL_JSONL="/path/to/hls_nl_repaired.accepted.jsonl" \
+  bash scripts/run_hls_nl_cosim_smoke.sh
+```
+
+The default config is `configs/hls_nl_cosim_smoke.json`, which runs one JSONL
+record through CSim, CSynth, and C/RTL CoSim. The wrapper prints the summary,
+the Vitis log tail, generated Verilog files, and any discovered CoSim artifacts.
+Increase the sample with `HLS_NL_LIMIT=3` after the first row looks sane.
 
 Run on a remote Linux host from this machine:
 

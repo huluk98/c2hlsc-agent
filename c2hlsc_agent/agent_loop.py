@@ -4,6 +4,8 @@ import re
 from dataclasses import dataclass
 
 from .equivalence import VerificationState
+from .hlsc_generator import HLSC_GENERATOR_PROMPT_ID, get_hlsc_generator_contract
+from .leveri_testgen import LEVERI_TESTBENCH_POLICY_ID, get_leveri_testbench_contract
 
 
 @dataclass(frozen=True)
@@ -59,17 +61,36 @@ def multi_agent_procedures() -> tuple[AgentProcedure, ...]:
         AgentProcedure(
             name="shift_left_testbench_agent",
             role="Testbench and coverage agent",
-            owns="Build a golden-C oracle harness and high-coverage stimuli before synthesis.",
+            owns=(
+                "Build a golden-C oracle harness and high-coverage stimuli before synthesis; "
+                f"follow {LEVERI_TESTBENCH_POLICY_ID} for paired trace generation and dual-tier consistency checks."
+            ),
             inputs=("original C/C++", "must-preserve contract", "argument metadata"),
-            outputs=("host testbench", "directed/random stimuli", "coverage plan", "input/output trace schema"),
+            outputs=(
+                "host testbench",
+                "paired golden/HLS trace testbenches",
+                "directed/random stimuli",
+                "gcov/KLEE coverage artifacts",
+                "coverage plan",
+                "input/output trace schema",
+            ),
             stop_condition="Host testbench compiles, feeds identical inputs to golden C and HLS-C, and reaches the configured coverage target.",
         ),
         AgentProcedure(
             name="hlsc_generator_agent",
             role="C-to-HLS-C generator",
-            owns="Emit synthesizable HLS-C while preserving functional behavior and the external contract.",
+            owns=(
+                "Emit synthesizable HLS-C while preserving functional behavior and the external contract; "
+                f"follow {HLSC_GENERATOR_PROMPT_ID} for beginner-facing generation and keep testbench generation separate."
+            ),
             inputs=("original C/C++", "static diagnostics", "must-preserve contract", "testbench expectations"),
-            outputs=("hls_top.hpp", "hls_top.cpp", "transformation ledger", "interface pragma ledger"),
+            outputs=(
+                "hls_top.hpp",
+                "hls_top.cpp",
+                "beginner-facing HLS analysis",
+                "transformation ledger",
+                "interface pragma ledger",
+            ),
             stop_condition="Candidate HLS-C is host-compilable and contains only justified, equivalence-preserving transformations.",
         ),
         AgentProcedure(
@@ -265,3 +286,15 @@ def render_procedures_markdown() -> str:
             )
         )
     return "\n".join(blocks)
+
+
+def hlsc_generator_policy() -> dict[str, object]:
+    """Return the prompt contract for the HLS-C generator side of AUTO RTL."""
+
+    return get_hlsc_generator_contract().to_dict()
+
+
+def leveri_testbench_policy() -> dict[str, object]:
+    """Return the HLS-LeVeri-inspired prompt contract for the testbench side."""
+
+    return get_leveri_testbench_contract().to_dict()

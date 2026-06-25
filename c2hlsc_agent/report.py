@@ -9,6 +9,7 @@ from .config import AgentConfig
 from .convert import GeneratedSource
 from .equivalence import VerificationState
 from .hls_project import ProjectFiles
+from .leveri_testgen import LEVERI_TESTBENCH_POLICY_ID
 
 
 def _table(headers: list[str], rows: list[list[str]]) -> str:
@@ -59,6 +60,8 @@ def write_reports(
 - Clock period: `{config.clock}`
 - Random seed: `{config.seed}`
 - Test count: `{config.num_tests}`
+- HLS-C generator policy: `{generated.generator_prompt_id}`
+- Testbench generator policy: `{LEVERI_TESTBENCH_POLICY_ID}`
 
 ## Generated Files
 
@@ -115,6 +118,8 @@ def write_reports(
     machine = {
         "status": status,
         "top": fn.name,
+        "generator_prompt_id": generated.generator_prompt_id,
+        "testbench_policy_id": LEVERI_TESTBENCH_POLICY_ID,
         "software_equivalence": state.status_for("software_equivalence"),
         "csim": state.status_for("csim"),
         "csynth": state.status_for("csynth"),

@@ -9,6 +9,7 @@ from pathlib import Path
 from .analyze import AnalysisResult
 from .config import AgentConfig
 from .convert import GeneratedSource
+from .leveri_testgen import generate_leveri_testbenches
 from .testgen import generate_testbench
 
 
@@ -79,22 +80,46 @@ def render_makefile(config: AgentConfig) -> str:
     return f"""CXX ?= g++
 CXXFLAGS ?= -std=c++17 -Wall -Wextra -I src {flags}
 TB_EXE ?= c2hlsc_tb
+LEVERI_GOLDEN_EXE ?= leveri_golden_tb
+LEVERI_HLS_EXE ?= leveri_hls_tb
 
-.PHONY: all test clean vitis
+.PHONY: all test leveri-test gcov-coverage klee-coverage coverage clean vitis
 
 all: test
 
 $(TB_EXE): tb/testbench.cpp src/hls_top.cpp src/hls_top.hpp input.c
 \t$(CXX) $(CXXFLAGS) tb/testbench.cpp src/hls_top.cpp -o $(TB_EXE)
 
+$(LEVERI_GOLDEN_EXE): tb/leveri_golden_tb.cpp input.c
+\t$(CXX) $(CXXFLAGS) tb/leveri_golden_tb.cpp -o $(LEVERI_GOLDEN_EXE)
+
+$(LEVERI_HLS_EXE): tb/leveri_hls_tb.cpp src/hls_top.cpp src/hls_top.hpp
+\t$(CXX) $(CXXFLAGS) tb/leveri_hls_tb.cpp src/hls_top.cpp -o $(LEVERI_HLS_EXE)
+
 test: $(TB_EXE)
 \t./$(TB_EXE)
+
+leveri-test: $(LEVERI_GOLDEN_EXE) $(LEVERI_HLS_EXE)
+\t./$(LEVERI_GOLDEN_EXE)
+\t./$(LEVERI_HLS_EXE)
+\tpython3 tb/leveri_compare.py leveri_golden_trace.csv leveri_hls_trace.csv
+
+gcov-coverage:
+\tpython3 tb/run_gcov.py
+
+klee-coverage:
+\tpython3 tb/run_klee.py
+
+coverage: gcov-coverage klee-coverage
 
 vitis:
 \tvitis_hls -f run_hls.tcl
 
 clean:
-\trm -f $(TB_EXE)
+\trm -f $(TB_EXE) $(LEVERI_GOLDEN_EXE) $(LEVERI_HLS_EXE)
+\trm -f leveri_golden_trace.csv leveri_hls_trace.csv
+\trm -rf coverage
+\trm -f *.gcda *.gcno *.gcov
 \trm -rf c2hlsc_project
 """
 
@@ -115,12 +140,20 @@ def write_project(out_dir: Path, analysis: AnalysisResult, generated: GeneratedS
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "src").mkdir(exist_ok=True)
     (out_dir / "tb").mkdir(exist_ok=True)
+    leveri_bundle = generate_leveri_testbenches(analysis, config)
     shutil.copyfile(analysis.function.source_path, out_dir / "input.c")
     files = [
         out_dir / "input.c",
         out_dir / "src" / "hls_top.hpp",
         out_dir / "src" / "hls_top.cpp",
         out_dir / "tb" / "testbench.cpp",
+        out_dir / "tb" / "leveri_golden_tb.cpp",
+        out_dir / "tb" / "leveri_hls_tb.cpp",
+        out_dir / "tb" / "leveri_compare.py",
+        out_dir / "tb" / "run_gcov.py",
+        out_dir / "tb" / "klee_driver.cpp",
+        out_dir / "tb" / "run_klee.py",
+        out_dir / "tb" / "leveri_manifest.json",
         out_dir / "run_hls.tcl",
         out_dir / "run_csim.tcl",
         out_dir / "run_csynth.tcl",
@@ -131,6 +164,13 @@ def write_project(out_dir: Path, analysis: AnalysisResult, generated: GeneratedS
     (out_dir / "src" / "hls_top.hpp").write_text(generated.header, encoding="utf-8")
     (out_dir / "src" / "hls_top.cpp").write_text(generated.source, encoding="utf-8")
     (out_dir / "tb" / "testbench.cpp").write_text(generate_testbench(analysis, config), encoding="utf-8")
+    (out_dir / "tb" / "leveri_golden_tb.cpp").write_text(leveri_bundle.golden_tb, encoding="utf-8")
+    (out_dir / "tb" / "leveri_hls_tb.cpp").write_text(leveri_bundle.hls_tb, encoding="utf-8")
+    (out_dir / "tb" / "leveri_compare.py").write_text(leveri_bundle.compare_script, encoding="utf-8")
+    (out_dir / "tb" / "run_gcov.py").write_text(leveri_bundle.gcov_script, encoding="utf-8")
+    (out_dir / "tb" / "klee_driver.cpp").write_text(leveri_bundle.klee_driver, encoding="utf-8")
+    (out_dir / "tb" / "run_klee.py").write_text(leveri_bundle.klee_script, encoding="utf-8")
+    (out_dir / "tb" / "leveri_manifest.json").write_text(leveri_bundle.manifest_json, encoding="utf-8")
     (out_dir / "run_hls.tcl").write_text(render_run_hls(analysis, config), encoding="utf-8")
     (out_dir / "run_csim.tcl").write_text(render_run_csim(analysis, config), encoding="utf-8")
     (out_dir / "run_csynth.tcl").write_text(render_run_csynth(), encoding="utf-8")
@@ -139,4 +179,9 @@ def write_project(out_dir: Path, analysis: AnalysisResult, generated: GeneratedS
     run_all = out_dir / "run_all.sh"
     run_all.write_text(render_run_all(), encoding="utf-8")
     run_all.chmod(run_all.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    leveri_compare = out_dir / "tb" / "leveri_compare.py"
+    leveri_compare.chmod(leveri_compare.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    for script_name in ("run_gcov.py", "run_klee.py"):
+        script = out_dir / "tb" / script_name
+        script.chmod(script.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     return ProjectFiles(out_dir, files)

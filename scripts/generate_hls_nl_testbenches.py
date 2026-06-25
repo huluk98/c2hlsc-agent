@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate Vitis-oriented testbench scaffolds for HLS_NL.json records.
+"""Generate Vitis-oriented testbench scaffolds for HLS_NL JSON/JSONL records.
 
 The generator is intentionally conservative. It emits semantic self-checking
 testbenches only for recognized small patterns; otherwise it emits deterministic
@@ -153,6 +153,46 @@ def extract_design_title(prompt: str) -> str | None:
         return match.group(1).strip()
     match = re.search(r"Design Task:\s*([^\n]+)", prompt)
     return match.group(1).strip() if match else None
+
+
+def load_records(path: Path) -> list[dict[str, Any]]:
+    """Load either HLS_NL.json or repaired HLS_NL JSONL records."""
+
+    text = path.read_text(encoding="utf-8")
+    stripped = text.lstrip()
+    if path.suffix.lower() == ".jsonl" or (stripped and not stripped.startswith("[")):
+        records: list[dict[str, Any]] = []
+        for line_no, line in enumerate(text.splitlines(), start=1):
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            if not isinstance(row, dict):
+                raise SystemExit(f"JSONL line {line_no} must be an object")
+            records.append(row)
+        return records
+
+    data = json.loads(text)
+    if not isinstance(data, list):
+        raise SystemExit("HLS_NL JSON root must be a list")
+    if not all(isinstance(record, dict) for record in data):
+        raise SystemExit("HLS_NL records must be objects")
+    return data
+
+
+def record_source_file(record: dict[str, Any]) -> Any:
+    return record.get("file") or record.get("original_file") or record.get("source")
+
+
+def record_design_title(record: dict[str, Any]) -> str | None:
+    return record.get("design_title") or extract_design_title(str(record.get("HLS_instruction", "")))
+
+
+def record_id_for(record: dict[str, Any], fallback: int) -> int:
+    try:
+        return int(record.get("record_id", fallback))
+    except (TypeError, ValueError):
+        return fallback
 
 
 def identifier(text: str) -> str:
@@ -361,7 +401,7 @@ def render_testbench(record: dict[str, Any], sig: FunctionSig, record_id: int) -
     if sig.return_type != "void":
         ret_decl = f"    {sig.return_type} ret = {{}};"
         ret_assign = "ret = "
-    title = extract_design_title(str(record.get("HLS_instruction", ""))) or sig.name
+    title = record_design_title(record) or sig.name
     defines = "\n".join(macro_lines(str(record.get("hls_cpp", ""))))
     if defines:
         defines += "\n"
@@ -369,7 +409,7 @@ def render_testbench(record: dict[str, Any], sig: FunctionSig, record_id: int) -
         oracle_kind,
         f"""// Generated from HLS_NL.json by generate_hls_nl_testbenches.py.
 // Record: {record_id}
-// Source file: {record.get('file')}
+// Source file: {record_source_file(record)}
 // Design title: {title}
 // Oracle kind: {oracle_kind}
 #include <ap_int.h>
@@ -420,7 +460,8 @@ exit
 
 
 def write_design(out_dir: Path, record: dict[str, Any], sig: FunctionSig, record_id: int, part: str, clock: str) -> dict[str, Any]:
-    stem = identifier(Path(str(record.get("file", f"record_{record_id}"))).stem)
+    source_file = record_source_file(record)
+    stem = identifier(Path(str(source_file or f"record_{record_id}")).stem)
     design_dir = out_dir / f"{record_id:05d}_{stem}_{sig.name}"
     design_dir.mkdir(parents=True, exist_ok=True)
     code = str(record.get("hls_cpp", "")).replace("\r\n", "\n").replace("\r", "\n").strip() + "\n"
@@ -431,8 +472,8 @@ def write_design(out_dir: Path, record: dict[str, Any], sig: FunctionSig, record
     (design_dir / "instruction.txt").write_text(str(record.get("HLS_instruction", "")), encoding="utf-8")
     return {
         "record_id": record_id,
-        "source_file": record.get("file"),
-        "design_title": extract_design_title(str(record.get("HLS_instruction", ""))),
+        "source_file": source_file,
+        "design_title": record_design_title(record),
         "top": sig.name,
         "signature": sig.signature,
         "oracle_kind": oracle_kind,
@@ -442,7 +483,7 @@ def write_design(out_dir: Path, record: dict[str, Any], sig: FunctionSig, record
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Generate HLS_NL Vitis testbench scaffolds.")
-    parser.add_argument("--input", required=True, type=Path, help="Path to HLS_NL.json")
+    parser.add_argument("--input", required=True, type=Path, help="Path to HLS_NL JSON or JSONL")
     parser.add_argument("--out-dir", required=True, type=Path, help="Output corpus directory")
     parser.add_argument("--limit", type=int, help="Maximum records to process")
     parser.add_argument("--offset", type=int, default=0, help="Starting record offset")
@@ -450,9 +491,7 @@ def main() -> int:
     parser.add_argument("--clock", default="10")
     args = parser.parse_args()
 
-    data = json.loads(args.input.read_text(encoding="utf-8"))
-    if not isinstance(data, list):
-        raise SystemExit("HLS_NL JSON root must be a list")
+    data = load_records(args.input)
     records = data[args.offset :]
     if args.limit is not None:
         records = records[: args.limit]
@@ -462,10 +501,10 @@ def main() -> int:
     skipped: list[dict[str, Any]] = []
     counts: dict[str, int] = {}
     for local_idx, record in enumerate(records):
-        record_id = args.offset + local_idx
+        record_id = record_id_for(record, args.offset + local_idx)
         sig = extract_function(str(record.get("hls_cpp", "")))
         if sig is None:
-            skipped.append({"record_id": record_id, "source_file": record.get("file"), "reason": "no_parseable_function_definition"})
+            skipped.append({"record_id": record_id, "source_file": record_source_file(record), "reason": "no_parseable_function_definition"})
             continue
         row = write_design(args.out_dir, record, sig, record_id, args.part, args.clock)
         manifest.append(row)

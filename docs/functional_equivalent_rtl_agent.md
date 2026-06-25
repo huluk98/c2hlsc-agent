@@ -158,7 +158,7 @@ write report and audit memory
 
 - Add a real repair backend for `hlsc_repair_agent`; the current package classifies the
   owner/action but does not yet patch failed candidates.
-- Add coverage collection with `gcov` and optional KLEE-derived vectors.
+- Coverage collection now has generated `gcov` and optional KLEE hooks; the next step is to feed uncovered branches and KLEE counterexamples back into stimulus refinement.
 - Add PMLC instrumentation for CSim/CoSim mismatches.
 - Add an optimizer queue that snapshots candidates and rolls back rejected QoR changes.
 - Add a structured audit ledger and repair-card store.

@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 
 from .analyze import AnalysisResult, FunctionArg
 from .config import AgentConfig
+from .hlsc_generator import HLSC_GENERATOR_PROMPT_ID
 
 
 @dataclass
@@ -12,6 +13,7 @@ class GeneratedSource:
     source: str
     transformations: list[str] = field(default_factory=list)
     interface_pragmas: list[dict[str, str]] = field(default_factory=list)
+    generator_prompt_id: str = HLSC_GENERATOR_PROMPT_ID
 
 
 def _include_for_types(args: list[FunctionArg], return_type: str) -> str:
@@ -74,6 +76,9 @@ def generate_hls_sources(analysis: AnalysisResult, config: AgentConfig) -> Gener
     return GeneratedSource(
         header=header,
         source=source,
-        transformations=["Preserved original top-function body and signature for equivalence-first HLS baseline."],
+        transformations=[
+            f"Applied {HLSC_GENERATOR_PROMPT_ID} as the HLS-C generator policy.",
+            "Preserved original top-function body and signature for equivalence-first HLS baseline.",
+        ],
         interface_pragmas=pragma_rows,
     )
