@@ -255,12 +255,12 @@ python scripts/run_hls_nl_vitis_batch.py \
 
 python scripts/export_cosim_successes.py \
   --report build/hls_nl_accepted_full_cosim/vitis_batch_report.json \
-  --out-dir verified/hls_nl_full_cosim_passes
+  --out-dir hls_nl_full_cosim_passes
 ```
 
 The export directory contains only `status=pass` full-CoSim cases with compact
 evidence files. Failed rows are not copied as projects; they are listed in
-`verified/hls_nl_full_cosim_passes/failed.jsonl` for later inspection.
+`hls_nl_full_cosim_passes/failed.jsonl` for later inspection.
 
 For the first CoSim check, use the small JSON config and shell wrapper:
 

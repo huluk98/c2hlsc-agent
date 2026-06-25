@@ -163,7 +163,7 @@ Then export only passing cases into a clean uploadable corpus:
 
 python scripts/export_cosim_successes.py \
   --report build/hls_nl_accepted_full_cosim/vitis_batch_report.json \
-  --out-dir verified/hls_nl_full_cosim_passes
+  --out-dir hls_nl_full_cosim_passes
 
 The export keeps minimal per-case files plus cosim_pass_evidence.json. Failed
 and skipped rows stay in failed.jsonl and skipped.jsonl for inspection.
