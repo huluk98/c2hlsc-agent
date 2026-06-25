@@ -146,6 +146,29 @@ For C/RTL CoSim too, add:
 --run-full-cosim
 
 
+Export only full-CoSim passes for upload
+========================================
+
+Run the full batch in CoSim mode:
+
+VITIS_HLS_BIN="/path/to/Vitis_HLS/2024.2/bin/vitis_hls" \
+python scripts/run_hls_nl_vitis_batch.py \
+  --input /path/to/hls_nl_repaired.accepted.jsonl \
+  --out-dir build/hls_nl_accepted_full_cosim \
+  --part xczu7ev-ffvc1156-2-e \
+  --clock 10 \
+  --run-full-cosim
+
+Then export only passing cases into a clean uploadable corpus:
+
+python scripts/export_cosim_successes.py \
+  --report build/hls_nl_accepted_full_cosim/vitis_batch_report.json \
+  --out-dir verified/hls_nl_full_cosim_passes
+
+The export keeps minimal per-case files plus cosim_pass_evidence.json. Failed
+and skipped rows stay in failed.jsonl and skipped.jsonl for inspection.
+
+
 Small JSONL CoSim smoke before scaling up
 ========================================
 

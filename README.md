@@ -242,6 +242,26 @@ file appears under `hls_nl_project/solution1/syn/verilog`.
 
 Use `--run-full-cosim` when you want C/RTL CoSim as well as Verilog emission.
 
+For a full-CoSim corpus where only passing cases are kept for upload:
+
+```bash
+VITIS_HLS_BIN="/path/to/Vitis_HLS/2024.2/bin/vitis_hls" \
+python scripts/run_hls_nl_vitis_batch.py \
+  --input /path/to/hls_nl_repaired.accepted.jsonl \
+  --out-dir build/hls_nl_accepted_full_cosim \
+  --part xczu7ev-ffvc1156-2-e \
+  --clock 10 \
+  --run-full-cosim
+
+python scripts/export_cosim_successes.py \
+  --report build/hls_nl_accepted_full_cosim/vitis_batch_report.json \
+  --out-dir verified/hls_nl_full_cosim_passes
+```
+
+The export directory contains only `status=pass` full-CoSim cases with compact
+evidence files. Failed rows are not copied as projects; they are listed in
+`verified/hls_nl_full_cosim_passes/failed.jsonl` for later inspection.
+
 For the first CoSim check, use the small JSON config and shell wrapper:
 
 ```bash
