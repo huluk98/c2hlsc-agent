@@ -28,7 +28,7 @@ def default_bundle() -> Path:
 
 
 def default_work_dir() -> Path:
-    return repo_root() / "c2hlsc_agent" / "build" / "vitis_bundle_run"
+    return repo_root() / "build" / "vitis_bundle_run"
 
 
 def resolve_vitis_hls(vitis: str) -> Path:
@@ -59,6 +59,15 @@ def resolve_vitis_hls(vitis: str) -> Path:
     )
 
 
+def bundle_file_text(name: str, value: object) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list) and all(isinstance(line, str) for line in value):
+        text = "\n".join(value)
+        return text + ("\n" if text else "")
+    raise ValueError(f"Bundle file {name!r} must contain a string or list of strings")
+
+
 def unpack_bundle(bundle_path: Path, work_dir: Path, clean: bool) -> dict:
     if clean and work_dir.exists():
         shutil.rmtree(work_dir)
@@ -69,12 +78,10 @@ def unpack_bundle(bundle_path: Path, work_dir: Path, clean: bool) -> dict:
     if not isinstance(files, dict):
         raise ValueError(f"{bundle_path} does not contain a JSON object field named 'files'")
 
-    for name, text in files.items():
+    for name, value in files.items():
         if "/" in name or "\\" in name or name.startswith("."):
             raise ValueError(f"Refusing unsafe bundle filename: {name!r}")
-        if not isinstance(text, str):
-            raise ValueError(f"Bundle file {name!r} must contain string text")
-        (work_dir / name).write_text(text, encoding="utf-8")
+        (work_dir / name).write_text(bundle_file_text(name, value), encoding="utf-8")
 
     if not (work_dir / "run_hls.tcl").is_file():
         raise ValueError("Bundle did not produce run_hls.tcl")
@@ -102,6 +109,12 @@ def main() -> int:
     )
     parser.add_argument("--no-clean", action="store_true", help="Do not delete an existing work directory first.")
     parser.add_argument("--unpack-only", action="store_true", help="Only unpack files; do not launch Vitis.")
+    parser.add_argument(
+        "--log-tail-lines",
+        type=int,
+        default=120,
+        help="Number of Vitis log lines to print when the flow fails. Default: 120.",
+    )
     args = parser.parse_args()
 
     bundle = args.bundle.expanduser().resolve()
@@ -119,11 +132,26 @@ def main() -> int:
         print("Unpack-only mode: not running Vitis.")
         return 0
 
-    result = subprocess.run([str(vitis_hls), "-f", "run_hls.tcl"], cwd=work_dir)
+    log_path = work_dir / "vitis_hls.log"
+    result = subprocess.run(
+        [str(vitis_hls), "-f", "run_hls.tcl"],
+        cwd=work_dir,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        check=False,
+    )
+    log_path.write_text(result.stdout, encoding="utf-8", errors="replace")
     if result.returncode == 0:
         print("Vitis HLS flow completed successfully.")
     else:
         print(f"Vitis HLS flow failed with exit code {result.returncode}.", file=sys.stderr)
+        print(f"Log: {log_path}", file=sys.stderr)
+        if args.log_tail_lines > 0:
+            print("\nVitis log tail", file=sys.stderr)
+            print("--------------", file=sys.stderr)
+            for line in result.stdout.splitlines()[-args.log_tail_lines :]:
+                print(line, file=sys.stderr)
     return result.returncode
 
 

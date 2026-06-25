@@ -152,7 +152,7 @@ VITIS_HLS_ROOT="/opt/Xilinx/Vitis_HLS/2024.2" \
 If your Vitis path contains spaces, keep the quotes:
 
 ```bash
-VITIS_HLS_ROOT="/nvme1/vitis2024.2 1113 1001/Vitis_HLS/2024.2" \
+VITIS_HLS_ROOT="/path/to/Vitis_HLS/2024.2" \
   bash scripts/run_vitis_linux.sh \
   --config examples/vector_add/config.yaml \
   --out build/vector_add
@@ -166,7 +166,7 @@ conda activate hlsc
 python -m pip install -r requirements.txt
 python -m pip install -e .
 C2HLSC_USE_ACTIVE_ENV=1 \
-VITIS_HLS_ROOT="/nvme1/vitis2024.2 1113 1001/Vitis_HLS/2024.2" \
+VITIS_HLS_ROOT="/path/to/Vitis_HLS/2024.2" \
   bash scripts/run_vitis_linux.sh \
   --config examples/vector_add/config.yaml \
   --out build/vector_add
@@ -176,7 +176,7 @@ Alternatively, let the script call that named Conda env directly:
 
 ```bash
 C2HLSC_CONDA_ENV=hlsc \
-VITIS_HLS_ROOT="/nvme1/vitis2024.2 1113 1001/Vitis_HLS/2024.2" \
+VITIS_HLS_ROOT="/path/to/Vitis_HLS/2024.2" \
   bash scripts/run_vitis_linux.sh \
   --config examples/vector_add/config.yaml \
   --out build/vector_add
@@ -185,7 +185,7 @@ VITIS_HLS_ROOT="/nvme1/vitis2024.2 1113 1001/Vitis_HLS/2024.2" \
 If the settings script does not put `vitis_hls` on `PATH`, pass the binary directly:
 
 ```bash
-VITIS_HLS_BIN="/nvme1/vitis2024.2 1113 1001/Vitis_HLS/2024.2/bin/vitis_hls" \
+VITIS_HLS_BIN="/path/to/Vitis_HLS/2024.2/bin/vitis_hls" \
   bash scripts/run_vitis_linux.sh \
   --config examples/vector_add/config.yaml \
   --out build/vector_add
@@ -196,7 +196,7 @@ file. Put your path in `vitis_hls_bin_path.txt`, then run the wrapper:
 
 ```bash
 conda activate hlsc
-echo "/nvme1/vitis2024.2 1113 1001/Vitis_HLS/2024.2/bin/vitis_hls" > vitis_hls_bin_path.txt
+echo "/path/to/Vitis_HLS/2024.2/bin/vitis_hls" > vitis_hls_bin_path.txt
 python scripts/run_vitis_with_bin.py \
   --config examples/vector_add/config.yaml \
   --out build/vector_add
@@ -206,15 +206,27 @@ Or pass the binary path without editing:
 
 ```bash
 python scripts/run_vitis_with_bin.py \
-  --vitis-hls-bin "/nvme1/vitis2024.2 1113 1001/Vitis_HLS/2024.2/bin/vitis_hls" \
+  --vitis-hls-bin "/path/to/Vitis_HLS/2024.2/bin/vitis_hls" \
   --config examples/vector_add/config.yaml \
   --out build/vector_add
 ```
 
+Run the single embedded JSON smoke bundle with only a Vitis path:
+
+```bash
+python scripts/run_vitis_bundle.py \
+  --vitis "/path/to/Vitis_HLS/2024.2/bin/vitis_hls"
+```
+
+This unpacks `configs/simple_calculator_vitis_cosim_bundle.json` into
+`build/vitis_bundle_run`, then runs CSim, CSynth, and C/RTL CoSim. If Vitis
+fails, the wrapper writes `build/vitis_bundle_run/vitis_hls.log` and prints the
+tail of the log so the real CSim or synthesis error is visible.
+
 Run the accepted HLS_NL JSONL dataset and verify that Vitis emits Verilog:
 
 ```bash
-VITIS_HLS_BIN="/nvme1/vitis2024.2 1113 1001/Vitis_HLS/2024.2/bin/vitis_hls" \
+VITIS_HLS_BIN="/path/to/Vitis_HLS/2024.2/bin/vitis_hls" \
 python scripts/run_hls_nl_vitis_batch.py \
   --input /path/to/hls_nl_repaired.accepted.jsonl \
   --out-dir build/hls_nl_accepted_vitis \
@@ -234,7 +246,7 @@ For the first CoSim check, use the small JSON config and shell wrapper:
 
 ```bash
 cd c2hlsc_agent
-VITIS_HLS_BIN="/nvme1/vitis2024.2 1113 1001/Vitis_HLS/2024.2/bin/vitis_hls" \
+VITIS_HLS_BIN="/path/to/Vitis_HLS/2024.2/bin/vitis_hls" \
 HLS_NL_JSONL="/path/to/hls_nl_repaired.accepted.jsonl" \
   bash scripts/run_hls_nl_cosim_smoke.sh
 ```

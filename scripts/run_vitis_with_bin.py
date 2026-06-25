@@ -31,7 +31,7 @@ from pathlib import Path
 
 # Paste your path here if you want a one-command runner.
 # Example:
-# VITIS_HLS_BIN = "/nvme1/vitis2024.2 1113 1001/Vitis_HLS/2024.2/bin/vitis_hls"
+# VITIS_HLS_BIN = "/path/to/Vitis_HLS/2024.2/bin/vitis_hls"
 VITIS_HLS_BIN = ""
 
 
@@ -57,8 +57,6 @@ def _read_path_file(repo_root: Path) -> str:
 
 def _auto_find_vitis_hls() -> str:
     patterns = [
-        "/nvme1/*/Vitis_HLS/2024.2/bin/vitis_hls",
-        "/nvme1/*/Vitis_HLS/*/bin/vitis_hls",
         "/opt/Xilinx/Vitis_HLS/2024.2/bin/vitis_hls",
         "/opt/Xilinx/Vitis_HLS/*/bin/vitis_hls",
         "/tools/Xilinx/Vitis_HLS/2024.2/bin/vitis_hls",
@@ -79,7 +77,7 @@ def _split_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""Examples:
   python scripts/run_vitis_with_bin.py \\
-    --vitis-hls-bin "/nvme1/vitis2024.2 1113 1001/Vitis_HLS/2024.2/bin/vitis_hls" \\
+    --vitis-hls-bin "/path/to/Vitis_HLS/2024.2/bin/vitis_hls" \\
     --config examples/vector_add/config.yaml \\
     --out build/vector_add
 

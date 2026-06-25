@@ -237,7 +237,7 @@ def value_expr(arg: Arg, salt: int) -> str:
 
 
 def print_expr(expr: str) -> str:
-    return f"static_cast<long long>({expr})"
+    return expr
 
 
 def declare_arg(arg: Arg, idx: int) -> str:

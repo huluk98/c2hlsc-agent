@@ -19,15 +19,15 @@ Environment:
                      has the desired env activated, e.g. conda activate hlsc.
   VITIS_SETTINGS     Path to Xilinx/Vitis settings64.sh or .settings64-Vitis_HLS.sh.
   VITIS_HLS_ROOT     Path to the Vitis_HLS/<version> directory, for example
-                     "/nvme1/vitis2024.2 1113 1001/Vitis_HLS/2024.2".
+                     "/path/to/Vitis_HLS/2024.2".
   VITIS_HLS_BIN      Direct path to the vitis_hls executable. This is the most explicit fallback.
 
 Examples:
-  VITIS_HLS_ROOT="/nvme1/vitis2024.2 1113 1001/Vitis_HLS/2024.2" \
+  VITIS_HLS_ROOT="/path/to/Vitis_HLS/2024.2" \
     scripts/run_vitis_linux.sh --config examples/vector_add/config.yaml --out build/vector_add
 
   C2HLSC_USE_ACTIVE_ENV=1 \
-  VITIS_HLS_ROOT="/nvme1/vitis2024.2 1113 1001/Vitis_HLS/2024.2" \
+  VITIS_HLS_ROOT="/path/to/Vitis_HLS/2024.2" \
     scripts/run_vitis_linux.sh --config examples/vector_add/config.yaml --out build/vector_add
 
   VITIS_SETTINGS="/opt/Xilinx/Vitis/2024.2/settings64.sh" \

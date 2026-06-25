@@ -20,7 +20,7 @@ nano vitis_hls_bin_path.txt
 
 Put exactly one line in the file, for example:
 
-/nvme1/vitis2024.2 1113 1001/Vitis_HLS/2024.2/bin/vitis_hls
+/path/to/Vitis_HLS/2024.2/bin/vitis_hls
 
 Save and exit nano:
 
@@ -85,10 +85,23 @@ Alternative: pass the binary path on the command line without editing the Python
 rm -rf build/vector_add
 
 python scripts/run_vitis_with_bin.py \
-  --vitis-hls-bin "/nvme1/vitis2024.2 1113 1001/Vitis_HLS/2024.2/bin/vitis_hls" \
+  --vitis-hls-bin "/path/to/Vitis_HLS/2024.2/bin/vitis_hls" \
   --config examples/vector_add/config.yaml \
   --out build/vector_add \
   --print-env
+
+
+Run the single embedded JSON smoke bundle
+=========================================
+
+Use this when you only want to check that your local Vitis can run CSim,
+CSynth, and C/RTL CoSim on a small known-good HLS-C/testbench bundle:
+
+python scripts/run_vitis_bundle.py \
+  --vitis "/path/to/Vitis_HLS/2024.2/bin/vitis_hls"
+
+The runner unpacks configs/simple_calculator_vitis_cosim_bundle.json into
+build/vitis_bundle_run and writes build/vitis_bundle_run/vitis_hls.log.
 
 
 Run the accepted JSONL dataset and verify Verilog generation
@@ -102,7 +115,7 @@ hls_nl_project/solution1/syn/verilog
 
 Small smoke check:
 
-VITIS_HLS_BIN="/nvme1/vitis2024.2 1113 1001/Vitis_HLS/2024.2/bin/vitis_hls" \
+VITIS_HLS_BIN="/path/to/Vitis_HLS/2024.2/bin/vitis_hls" \
 python scripts/run_hls_nl_vitis_batch.py \
   --input /path/to/hls_nl_repaired.accepted.jsonl \
   --out-dir build/hls_nl_accepted_vitis_smoke \
@@ -112,7 +125,7 @@ python scripts/run_hls_nl_vitis_batch.py \
 
 Full accepted JSONL run:
 
-VITIS_HLS_BIN="/nvme1/vitis2024.2 1113 1001/Vitis_HLS/2024.2/bin/vitis_hls" \
+VITIS_HLS_BIN="/path/to/Vitis_HLS/2024.2/bin/vitis_hls" \
 python scripts/run_hls_nl_vitis_batch.py \
   --input /path/to/hls_nl_repaired.accepted.jsonl \
   --out-dir build/hls_nl_accepted_vitis_full \
@@ -142,7 +155,7 @@ generated Verilog paths, and CoSim artifact paths.
 
 cd c2hlsc_agent
 
-VITIS_HLS_BIN="/nvme1/vitis2024.2 1113 1001/Vitis_HLS/2024.2/bin/vitis_hls" \
+VITIS_HLS_BIN="/path/to/Vitis_HLS/2024.2/bin/vitis_hls" \
 HLS_NL_JSONL="/path/to/hls_nl_repaired.accepted.jsonl" \
   bash scripts/run_hls_nl_cosim_smoke.sh
 

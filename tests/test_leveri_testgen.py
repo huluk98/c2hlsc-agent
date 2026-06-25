@@ -119,7 +119,7 @@ class LeVeriTestgenTests(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("make") and shutil.which("python3"), "make and python3 are required")
     def test_project_klee_target_skips_cleanly_when_klee_missing(self):
-        if shutil.which("klee") or Path("/Users/luke/.local/klee/bin/klee").exists():
+        if shutil.which("klee"):
             self.skipTest("this test only checks the portable no-KLEE fallback")
         analysis, cfg = self._analysis()
         generated = generate_hls_sources(analysis, cfg)

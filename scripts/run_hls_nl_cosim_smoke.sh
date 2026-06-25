@@ -34,6 +34,24 @@ fi
 
 cd "${REPO_ROOT}"
 
+if [[ -z "${HLS_NL_JSONL:-}" ]]; then
+  CONFIG_HAS_INPUT="$("${PYTHON_BIN}" - "${CONFIG_PATH}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+config = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+print("1" if config.get("input") else "0")
+PY
+)"
+  if [[ "${CONFIG_HAS_INPUT}" != "1" ]]; then
+    echo "HLS_NL_JSONL is required because ${CONFIG_PATH} does not hard-code a dataset path." >&2
+    echo "Example:" >&2
+    echo "  HLS_NL_JSONL=/path/to/hls_nl_repaired.accepted.jsonl bash scripts/run_hls_nl_cosim_smoke.sh" >&2
+    exit 2
+  fi
+fi
+
 if [[ -n "${VITIS_HLS_ROOT:-}" ]]; then
   export PATH="${VITIS_HLS_ROOT}/bin:${PATH}"
   if [[ -z "${VITIS_SETTINGS:-}" ]]; then

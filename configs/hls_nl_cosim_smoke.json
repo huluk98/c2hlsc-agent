@@ -1,5 +1,4 @@
 {
-  "input": "../dataset_repair/hls_nl/hls_nl_repaired.accepted.jsonl",
   "out_dir": "build/hls_nl_cosim_smoke",
   "offset": 0,
   "limit": 1,
