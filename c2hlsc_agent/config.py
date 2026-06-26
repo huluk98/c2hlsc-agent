@@ -35,6 +35,8 @@ class AgentConfig:
     max_iterations: int = 1
     keep_going: bool = False
     run_vitis: bool = False
+    use_llm: bool = False
+    llm_model: str = "claude-opus-4-8"
 
 
 def _parse_scalar(value: str) -> Any:
@@ -171,6 +173,8 @@ def load_config(path: Path | None) -> AgentConfig:
         allow_pragmas=bool(data.get("allow_pragmas", True)),
         allow_performance_pragmas=bool(data.get("allow_performance_pragmas", False)),
         seed=int(data.get("seed", 1)),
+        use_llm=bool(data.get("use_llm", False)),
+        llm_model=str(data.get("llm_model", "claude-opus-4-8")),
     )
 
 
@@ -198,4 +202,10 @@ def merge_cli_config(config: AgentConfig, args: Any) -> AgentConfig:
         config.run_vitis = True
     if getattr(args, "no_run_vitis", False):
         config.run_vitis = False
+    if getattr(args, "use_llm", False):
+        config.use_llm = True
+    elif getattr(args, "no_llm", False):
+        config.use_llm = False
+    if getattr(args, "llm_model", None):
+        config.llm_model = args.llm_model
     return config

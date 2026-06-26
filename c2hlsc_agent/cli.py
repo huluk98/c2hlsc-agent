@@ -10,6 +10,7 @@ from .convert import generate_hls_sources
 from .hlsc_repair_agent import clear_repair_audit, repair_project
 from .hls_project import write_project
 from .hls_runner import verify_project
+from .llm import build_llm_client, missing_llm_reason
 from .report import final_status, write_reports
 
 
@@ -29,6 +30,15 @@ def build_parser() -> argparse.ArgumentParser:
     vitis.add_argument("--no-run-vitis", action="store_true", help="skip Vitis execution")
     convert.add_argument("--cosim-tool", help="cosim simulator tool, e.g. xsim")
     convert.add_argument("--rtl", default="verilog", help="RTL language for cosim, default verilog")
+    llm = convert.add_mutually_exclusive_group()
+    llm.add_argument(
+        "--use-llm",
+        action="store_true",
+        help="use an Anthropic Claude model for HLS-C generation and repair "
+        "(needs ANTHROPIC_API_KEY and the 'anthropic' package)",
+    )
+    llm.add_argument("--no-llm", action="store_true", help="force the deterministic generator/repair (default)")
+    convert.add_argument("--llm-model", help="Claude model id for --use-llm (default claude-opus-4-8)")
     convert.add_argument("--seed", type=int, help="random seed")
     convert.add_argument("--max-iterations", type=int, default=1, help="max verification iterations including repaired reruns")
     convert.add_argument("--keep-going", action="store_true", help="emit project even when static diagnostics contain errors")
@@ -43,8 +53,17 @@ def run_convert(args: argparse.Namespace) -> int:
     if not config.top:
         raise SystemExit("--top or config top is required")
     out_dir = Path(args.out).resolve()
+    llm = build_llm_client(config)
+    if config.use_llm and llm is None:
+        print(
+            f"--use-llm requested but the LLM path is unavailable: {missing_llm_reason(config)}; "
+            "using the deterministic generator and repair instead.",
+            file=sys.stderr,
+        )
+    elif llm is not None and args.verbose:
+        print(f"LLM generator/repair enabled (model={llm.model})")
     analysis = analyze_source(config.input_files[0], config.top, config)
-    generated = generate_hls_sources(analysis, config)
+    generated = generate_hls_sources(analysis, config, llm=llm)
     project = write_project(out_dir, analysis, generated, config)
     clear_repair_audit(out_dir)
     repair_history = []
@@ -68,7 +87,7 @@ def run_convert(args: argparse.Namespace) -> int:
             break
         if completed_iterations >= iterations:
             break
-        repair = repair_project(out_dir, analysis, config, state, completed_iterations)
+        repair = repair_project(out_dir, analysis, config, state, completed_iterations, llm=llm)
         repair_history.append(repair)
         if args.verbose:
             print(f"Repair iteration {completed_iterations}: {repair.summary}")

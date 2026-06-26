@@ -64,6 +64,41 @@ The expected user-facing HLS-C generator response sections are:
 7. Intel HLS notes
 8. Report checklist
 
+### LLM-backed generation and repair (opt-in)
+
+By default the generator copies the original top-function body verbatim and the
+`hlsc_repair_agent` applies only mechanical regex fixes, so the whole pipeline is
+deterministic and offline. Passing `--use-llm` activates a real model behind the two
+agents:
+
+- `hlsc_generator_agent` sends the `hlsc_generator_vitis_beginner_v1` policy plus the
+  source and argument contract to Claude and uses the returned synthesizable
+  translation unit as `src/hls_top.cpp`.
+- `hlsc_repair_agent` escalates to Claude for a minimal patch when no mechanical repair
+  matches the earliest failing stage, using the classified failure evidence.
+
+The model is the default `claude-opus-4-8` (override with `--llm-model`). The LLM only
+*proposes* candidate HLS-C — the existing verifier ladder (host equivalence → CSim →
+CSynth → CoSim) is still the equivalence gate, the golden `input.c` is never handed to
+the model, and any unavailable/unparsable response falls back to the conservative path.
+
+```bash
+python3 -m pip install -e '.[llm]'   # installs the anthropic SDK
+export ANTHROPIC_API_KEY=sk-ant-...
+
+python -m c2hlsc_agent.cli convert \
+  --config examples/vector_add/config.yaml \
+  --out build/vector_add \
+  --use-llm \
+  --no-run-vitis            # add --run-vitis on a machine with Vitis HLS
+```
+
+`--use-llm` can also be set with `use_llm: true` / `llm_model: ...` in a config file.
+When `--use-llm` is requested but the `anthropic` package or `ANTHROPIC_API_KEY` is
+missing, the run prints a warning and continues deterministically (exit code unaffected).
+The LLM repair only ever rewrites `src/hls_top.cpp`; the generated golden-oracle testbench
+and the original `input.c` are never sent to the model or overwritten.
+
 ## HLS-LeVeri-Style Testbench Generator
 
 AUTO RTL also emits an HLS-LeVeri-inspired paired trace testbench bundle. The reference
@@ -315,6 +350,8 @@ Supported options:
 - `--seed 1234`
 - `--max-iterations 1`
 - `--keep-going`
+- `--use-llm` / `--no-llm`
+- `--llm-model claude-opus-4-8`
 - `--verbose`
 
 ## Config Format

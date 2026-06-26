@@ -12,6 +12,7 @@ from .analyze import AnalysisResult
 from .config import AgentConfig
 from .equivalence import VerificationState
 from .hls_runner import earliest_failing_phase
+from .llm import LLMClient, build_repair_prompt, extract_full_file, is_plausible_translation_unit
 
 
 REPAIR_AGENT_NAME = "hlsc_repair_agent"
@@ -118,6 +119,7 @@ def repair_project(
     config: AgentConfig,
     state: VerificationState,
     iteration: int,
+    llm: LLMClient | None = None,
 ) -> RepairOutcome:
     phase = earliest_failing_phase(state, config.run_vitis)
     decision = classify_failure(state, config.run_vitis, analysis.diagnostics.has_errors)
@@ -135,10 +137,23 @@ def repair_project(
         changes.extend(_repair_restrict_for_cpp(project_dir, evidence))
         changes.extend(_repair_missing_original_support(project_dir, analysis, evidence))
         changes.extend(_repair_invalid_interface_pragmas(project_dir, phase, decision.family, evidence))
-        status = "applied" if changes else "no_change"
         if changes:
+            status = "applied"
             summary = f"Applied {len(changes)} auditable mechanical repair(s); rerun verification from software equivalence."
+        elif llm is not None and getattr(config, "use_llm", False):
+            llm_changes = _llm_repair(project_dir, analysis, decision, phase, evidence, llm)
+            changes.extend(llm_changes)
+            if llm_changes:
+                status = "applied_llm"
+                summary = (
+                    f"Applied LLM repair to {', '.join(c.path for c in llm_changes)}; "
+                    "rerun verification from software equivalence."
+                )
+            else:
+                status = "no_change"
+                summary = f"No conservative or LLM repair matched family {decision.family!r} at stage {phase!r}."
         else:
+            status = "no_change"
             summary = f"No conservative mechanical repair matched family {decision.family!r} at stage {phase!r}."
 
     target_files = tuple(dict.fromkeys(change.path for change in changes))
@@ -157,6 +172,49 @@ def repair_project(
     )
     _append_audit(project_dir, outcome)
     return outcome
+
+
+def _llm_repair(
+    project_dir: Path,
+    analysis: AnalysisResult,
+    decision: object,
+    phase: str,
+    evidence: str,
+    llm: LLMClient,
+) -> list[RepairFileChange]:
+    """Escalate to an LLM for a minimal patch to the generated HLS-C.
+
+    Only ``src/hls_top.cpp`` is ever rewritten. The host-equivalence testbench and the
+    golden ``input.c`` oracle are never handed to the model and never overwritten, so the
+    verifier ladder stays the equivalence gate even when the model is wrong. The candidate
+    patch is structurally validated before it is accepted, so a prose/log response cannot
+    be written as source.
+    """
+
+    path = project_dir / "src" / "hls_top.cpp"
+    if not path.exists():
+        return []
+    current = path.read_text(encoding="utf-8")
+    top = analysis.function.name
+
+    system, user = build_repair_prompt(analysis, decision, phase, evidence, "src/hls_top.cpp", current)
+    try:
+        response = llm.complete(system, user)
+        new_text = extract_full_file(response, must_contain=f"{top}(")
+    except Exception:
+        return []
+    if not new_text or new_text.strip() == current.strip():
+        return []
+    if not is_plausible_translation_unit(new_text, top):
+        return []
+
+    change = _rewrite_file(
+        project_dir,
+        path,
+        f"llm repair (model={getattr(llm, 'model', '?')}, family={getattr(decision, 'family', '?')}) for {phase} stage",
+        new_text,
+    )
+    return [change] if change else []
 
 
 def _phase_evidence(state: VerificationState, phase: str | None) -> str:

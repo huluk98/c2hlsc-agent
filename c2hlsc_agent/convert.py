@@ -4,7 +4,8 @@ from dataclasses import dataclass, field
 
 from .analyze import AnalysisResult, FunctionArg
 from .config import AgentConfig
-from .hlsc_generator import HLSC_GENERATOR_PROMPT_ID
+from .hlsc_generator import HLSC_GENERATOR_PROMPT_ID, HLSC_GENERATOR_SYSTEM_PROMPT
+from .llm import LLMClient, build_generator_user_prompt, extract_hls_source
 
 
 @dataclass
@@ -48,7 +49,7 @@ def _pragma_lines(config: AgentConfig, args: list[FunctionArg]) -> tuple[list[st
     return lines, rows
 
 
-def generate_hls_sources(analysis: AnalysisResult, config: AgentConfig) -> GeneratedSource:
+def _generate_conservative_sources(analysis: AnalysisResult, config: AgentConfig) -> GeneratedSource:
     function = analysis.function
     pragma_lines, pragma_rows = _pragma_lines(config, function.args)
     body = function.body.rstrip()
@@ -81,4 +82,54 @@ def generate_hls_sources(analysis: AnalysisResult, config: AgentConfig) -> Gener
             "Preserved original top-function body and signature for equivalence-first HLS baseline.",
         ],
         interface_pragmas=pragma_rows,
+    )
+
+
+def generate_hls_sources(
+    analysis: AnalysisResult,
+    config: AgentConfig,
+    llm: LLMClient | None = None,
+) -> GeneratedSource:
+    """Generate HLS-C sources.
+
+    When an LLM client is supplied and ``config.use_llm`` is set, the generator asks
+    the model (following the ``hlsc_generator_vitis_beginner_v1`` policy) for a
+    synthesizable translation unit and uses it in place of the verbatim copy. The
+    conservative deterministic source is always built first and used as the fallback if
+    the LLM is unavailable or its output cannot be parsed, so behaviour stays safe and
+    the verifier remains the equivalence gate.
+    """
+
+    conservative = _generate_conservative_sources(analysis, config)
+    if llm is None or not getattr(config, "use_llm", False):
+        return conservative
+
+    model = getattr(llm, "model", "?")
+    try:
+        original_source = analysis.function.source_path.read_text(encoding="utf-8")
+        response = llm.complete(
+            HLSC_GENERATOR_SYSTEM_PROMPT,
+            build_generator_user_prompt(analysis, original_source),
+        )
+        source = extract_hls_source(response, analysis.function.name, original_source)
+    except Exception:
+        source = None
+
+    if not source:
+        conservative.transformations.append(
+            f"LLM HLS-C generation requested (model={model}) but unavailable or unparsable; "
+            "fell back to the conservative top-function copy."
+        )
+        return conservative
+
+    return GeneratedSource(
+        header=conservative.header,
+        source=source,
+        transformations=[
+            f"LLM HLS-C generator (model={model}, policy={HLSC_GENERATOR_PROMPT_ID}) produced a "
+            "synthesizable translation unit.",
+            "Verifier-gated: output is checked by host equivalence and Vitis CSim/CSynth/CoSim; "
+            "failures trigger repair or fall back to the conservative copy.",
+        ],
+        interface_pragmas=[],
     )
