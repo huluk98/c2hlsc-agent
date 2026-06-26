@@ -89,6 +89,14 @@ def text_tail(text: str, lines: int) -> str:
     return "\n".join(split[-lines:])
 
 
+def subprocess_output_text(value: str | bytes | None) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value
+
+
 def generate_designs(args: argparse.Namespace) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     records = load_records(args.input)
     selected = records[args.offset :]
@@ -138,14 +146,15 @@ def run_design(vitis_hls: str, design: dict[str, Any], timeout: int, run_full_co
             timeout=timeout,
             check=False,
         )
-        log_path.write_text(proc.stdout, encoding="utf-8", errors="replace")
+        stdout = subprocess_output_text(proc.stdout)
+        log_path.write_text(stdout, encoding="utf-8", errors="replace")
         rtl = verilog_files(design_dir)
         cosim = cosim_artifacts(design_dir)
         result["returncode"] = proc.returncode
         result["verilog_files"] = rtl
         result["cosim_artifacts"] = cosim
         if log_tail_lines:
-            result["vitis_log_tail"] = text_tail(proc.stdout, log_tail_lines)
+            result["vitis_log_tail"] = text_tail(stdout, log_tail_lines)
         if proc.returncode == 0 and rtl:
             result["status"] = "pass"
         elif proc.returncode == 0:
@@ -154,7 +163,11 @@ def run_design(vitis_hls: str, design: dict[str, Any], timeout: int, run_full_co
             result["status"] = "fail"
         return result
     except subprocess.TimeoutExpired as exc:
-        combined = (exc.stdout or "") + "\n" + (exc.stderr or "")
+        stdout = subprocess_output_text(exc.stdout)
+        stderr = subprocess_output_text(exc.stderr)
+        combined = stdout
+        if stderr:
+            combined = f"{combined}\n{stderr}" if combined else stderr
         log_path.write_text(combined, encoding="utf-8", errors="replace")
         result["returncode"] = None
         result["verilog_files"] = verilog_files(design_dir)
