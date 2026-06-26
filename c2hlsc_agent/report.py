@@ -8,6 +8,7 @@ from .analyze import AnalysisResult
 from .config import AgentConfig
 from .convert import GeneratedSource
 from .equivalence import VerificationState
+from .hlsc_repair_agent import REPAIR_AUDIT_FILENAME, RepairOutcome
 from .hls_project import ProjectFiles
 from .leveri_testgen import LEVERI_TESTBENCH_POLICY_ID
 
@@ -36,7 +37,9 @@ def write_reports(
     config: AgentConfig,
     state: VerificationState,
     iterations: int,
+    repairs: list[RepairOutcome] | None = None,
 ) -> None:
+    repairs = repairs or []
     status = final_status(state, config.run_vitis, analysis.diagnostics.has_errors)
     fn = analysis.function
     arg_rows = [[arg.name, arg.c_type, arg.direction, str(arg.length or ""), arg.interface or config.interface_mode] for arg in fn.args]
@@ -45,6 +48,20 @@ def write_reports(
     unsupported_rows = [[d.severity, d.code, d.message, d.suggestion or ""] for d in analysis.unsupported_constructs]
     generated_files = [str(path.relative_to(project.root)) for path in project.generated_files]
     agent_decision = classify_failure(state, config.run_vitis, analysis.diagnostics.has_errors)
+    repair_rows = [
+        [
+            str(repair.iteration),
+            repair.stage or "",
+            repair.family,
+            repair.status,
+            ", ".join(repair.target_files) or "_None_",
+            repair.summary,
+        ]
+        for repair in repairs
+    ]
+    report_files = ["conversion_report.md", "conversion_report.json"]
+    if repairs:
+        report_files.append(REPAIR_AUDIT_FILENAME)
 
     md = f"""# c2hlsc_agent Conversion Report
 
@@ -109,6 +126,10 @@ def write_reports(
 - Repair scope: {agent_decision.repair_scope}
 - Evidence needed: {", ".join(agent_decision.evidence_needed)}
 
+## Repair Audit Trail
+
+{_table(["Iteration", "Stage", "Family", "Status", "Files", "Summary"], repair_rows)}
+
 ## Mismatch Summary
 
 {chr(10).join(f"- {m.to_dict()}" for m in state.mismatches) or "_None captured by agent; inspect phase logs if a test failed._"}
@@ -126,10 +147,12 @@ def write_reports(
         "cosim": state.status_for("cosim"),
         "iterations": iterations,
         "mismatches": [m.to_dict() for m in state.mismatches],
+        "repairs": [repair.to_dict() for repair in repairs],
+        "repair_audit_file": REPAIR_AUDIT_FILENAME if repairs else None,
         "unsupported_constructs": [d.to_dict() for d in analysis.unsupported_constructs],
         "diagnostics": analysis.diagnostics.to_list(),
         "agent_decision": agent_decision.to_dict(),
-        "generated_files": generated_files + ["conversion_report.md", "conversion_report.json"],
+        "generated_files": generated_files + report_files,
         "phases": {name: result.to_dict() for name, result in state.phases.items()},
     }
     (project.root / "conversion_report.json").write_text(json.dumps(machine, indent=2), encoding="utf-8")

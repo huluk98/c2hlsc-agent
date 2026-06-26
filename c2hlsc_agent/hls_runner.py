@@ -7,6 +7,19 @@ from pathlib import Path
 from .equivalence import PhaseResult, VerificationState, parse_mismatches, run_command
 
 
+PHASE_ORDER = ("software_equivalence", "csim", "csynth", "cosim")
+
+
+def earliest_failing_phase(state: VerificationState, run_vitis_requested: bool) -> str | None:
+    required = ["software_equivalence"]
+    if run_vitis_requested:
+        required.extend(["csim", "csynth", "cosim"])
+    for phase in required:
+        if state.status_for(phase) != "pass":
+            return phase
+    return None
+
+
 def run_software_equivalence(project_dir: Path, verbose: bool = False) -> PhaseResult:
     try:
         result = run_command(["make", "test"], project_dir, "software_equivalence", timeout=120)

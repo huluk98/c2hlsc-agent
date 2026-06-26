@@ -7,6 +7,7 @@ from pathlib import Path
 from .analyze import analyze_source
 from .config import load_config, merge_cli_config
 from .convert import generate_hls_sources
+from .hlsc_repair_agent import clear_repair_audit, repair_project
 from .hls_project import write_project
 from .hls_runner import verify_project
 from .report import final_status, write_reports
@@ -29,7 +30,7 @@ def build_parser() -> argparse.ArgumentParser:
     convert.add_argument("--cosim-tool", help="cosim simulator tool, e.g. xsim")
     convert.add_argument("--rtl", default="verilog", help="RTL language for cosim, default verilog")
     convert.add_argument("--seed", type=int, help="random seed")
-    convert.add_argument("--max-iterations", type=int, default=1, help="max repair iterations")
+    convert.add_argument("--max-iterations", type=int, default=1, help="max verification iterations including repaired reruns")
     convert.add_argument("--keep-going", action="store_true", help="emit project even when static diagnostics contain errors")
     convert.add_argument("--verbose", action="store_true", help="print command output")
     return parser
@@ -45,12 +46,14 @@ def run_convert(args: argparse.Namespace) -> int:
     analysis = analyze_source(config.input_files[0], config.top, config)
     generated = generate_hls_sources(analysis, config)
     project = write_project(out_dir, analysis, generated, config)
+    clear_repair_audit(out_dir)
+    repair_history = []
 
     if analysis.diagnostics.has_errors and not config.keep_going:
         from .equivalence import VerificationState
 
         state = VerificationState()
-        write_reports(project, analysis, generated, config, state, 0)
+        write_reports(project, analysis, generated, config, state, 0, repair_history)
         print(f"Static analysis failed; report written to {out_dir / 'conversion_report.md'}", file=sys.stderr)
         return 1
 
@@ -63,11 +66,16 @@ def run_convert(args: argparse.Namespace) -> int:
         status = final_status(state, config.run_vitis, analysis.diagnostics.has_errors)
         if status == "pass":
             break
-        # The current local implementation classifies the next repair owner, but
-        # does not yet mutate the candidate with an LLM repair backend.
-        break
+        if completed_iterations >= iterations:
+            break
+        repair = repair_project(out_dir, analysis, config, state, completed_iterations)
+        repair_history.append(repair)
+        if args.verbose:
+            print(f"Repair iteration {completed_iterations}: {repair.summary}")
+        if not repair.changed:
+            break
     assert state is not None
-    write_reports(project, analysis, generated, config, state, completed_iterations)
+    write_reports(project, analysis, generated, config, state, completed_iterations, repair_history)
     status = final_status(state, config.run_vitis, analysis.diagnostics.has_errors)
     if args.verbose:
         print(f"Report: {out_dir / 'conversion_report.md'}")
