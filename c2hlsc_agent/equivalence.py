@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import signal
 import subprocess
 import re
 from dataclasses import dataclass, field
@@ -92,11 +94,38 @@ def parse_mismatches(text: str) -> list[Mismatch]:
 
 
 def run_command(command: list[str], cwd: Path, phase: str, timeout: int = 120) -> PhaseResult:
-    proc = subprocess.run(command, cwd=cwd, text=True, capture_output=True, timeout=timeout)
+    proc = subprocess.Popen(
+        command,
+        cwd=cwd,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except (AttributeError, ProcessLookupError, PermissionError):
+            proc.kill()
+        try:
+            stdout, stderr = proc.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except (AttributeError, ProcessLookupError, PermissionError):
+                proc.kill()
+            stdout, stderr = proc.communicate()
+        log_path = cwd / f"{phase}.log"
+        log_path.write_text((stdout or "") + "\n--- stderr ---\n" + (stderr or ""), encoding="utf-8")
+        raise subprocess.TimeoutExpired(command, timeout, output=stdout, stderr=stderr)
+    stdout = stdout or ""
+    stderr = stderr or ""
     status = "pass" if proc.returncode == 0 else "fail"
     log_path = cwd / f"{phase}.log"
-    log_path.write_text(proc.stdout + "\n--- stderr ---\n" + proc.stderr, encoding="utf-8")
-    return PhaseResult(phase, status, proc.returncode, proc.stdout, proc.stderr, log_path)
+    log_path.write_text(stdout + "\n--- stderr ---\n" + stderr, encoding="utf-8")
+    return PhaseResult(phase, status, proc.returncode, stdout, stderr, log_path)
 
 
 @dataclass

@@ -26,6 +26,7 @@ FUNCTION_RE = re.compile(
 )
 PRAGMA_RE = re.compile(r"#pragma\s+HLS\s+([A-Za-z_]\w*)")
 INCLUDE_RE = re.compile(r"^\s*#include\s*[<\"]([^>\"]+)[>\"]\s*$", re.M)
+UNBOUNDED_LOOP_RE = re.compile(r"for\s*\(\s*;\s*;\s*\)|while\s*\(\s*(?:1|true)\s*\)", re.I)
 
 
 @dataclass
@@ -111,6 +112,7 @@ def detect_features(code: str) -> dict[str, Any]:
         "has_std_container_or_io": bool(re.search(r"\bstd::|using namespace std|#include\s*<(vector|map|queue|string|iostream)>", code)),
         "has_dynamic_allocation": bool(re.search(r"\bmalloc\s*\(|\bfree\s*\(|\bnew\s+|\bdelete\b", code)),
         "has_non_synth_io": bool(re.search(r"\bprintf\s*\(|std::cout|std::cerr|\bscanf\s*\(|\bfopen\s*\(", code)),
+        "has_unbounded_loop": bool(UNBOUNDED_LOOP_RE.search(code)),
         "has_placeholder": bool(re.search(r"TODO|FIXME|your code|implementation here|placeholder|\.\.\.", code, re.I)),
         "brace_balance": code.count("{") - code.count("}"),
     }
@@ -136,6 +138,18 @@ def likely_semantic_warnings(prompt: str, code: str) -> list[str]:
 
 
 def repair_record(record: dict[str, Any], index: int) -> RepairResult:
+    if record.get("status") == "deleted" and "contains_unbounded_infinite_loop" in (record.get("quarantine_reasons") or []):
+        features = dict(record.get("code_features") or {})
+        features["has_unbounded_loop"] = True
+        return RepairResult(
+            "deleted",
+            "",
+            record.get("top_function"),
+            [],
+            [str(item) for item in record.get("warnings", [])],
+            [str(item) for item in record.get("quarantine_reasons", [])],
+            features,
+        )
     original_code = str(record.get("hls_cpp", ""))
     code = original_code.replace("\r\n", "\n").replace("\r", "\n").lstrip("\ufeff")
     repairs: list[str] = []
@@ -164,10 +178,12 @@ def repair_record(record: dict[str, Any], index: int) -> RepairResult:
         quarantine.append("uses_dynamic_allocation_or_delete")
     if features["has_non_synth_io"]:
         quarantine.append("uses_non_synthesizable_io")
+    if features["has_unbounded_loop"]:
+        quarantine.append("contains_unbounded_infinite_loop")
     if features["has_placeholder"]:
         quarantine.append("contains_placeholder_or_ellipsis")
     warnings.extend(likely_semantic_warnings(str(record.get("HLS_instruction", "")), code))
-    status = "quarantine" if quarantine else "accepted"
+    status = "deleted" if features["has_unbounded_loop"] else ("quarantine" if quarantine else "accepted")
     return RepairResult(status, code, top, repairs, warnings, quarantine, features)
 
 
@@ -193,6 +209,7 @@ def main() -> int:
 
     accepted: list[dict[str, Any]] = []
     quarantine: list[dict[str, Any]] = []
+    deleted: list[dict[str, Any]] = []
     all_records: list[dict[str, Any]] = []
     counters = collections.Counter()
     warning_counts = collections.Counter()
@@ -220,7 +237,7 @@ def main() -> int:
             "original_file": rec.get("file"),
             "design_title": extract_design_title(str(rec.get("HLS_instruction", ""))),
             "HLS_instruction": rec.get("HLS_instruction", ""),
-            "hls_cpp": result.code,
+            "hls_cpp": "" if result.status == "deleted" else result.code,
             "top_function": result.top_function,
             "status": result.status,
             "repairs": result.repairs,
@@ -231,6 +248,7 @@ def main() -> int:
                 "instruction": sha256_text(str(rec.get("HLS_instruction", ""))),
                 "hls_cpp_original": sha256_text(str(rec.get("hls_cpp", ""))),
                 "hls_cpp_repaired": sha256_text(result.code),
+                "hls_cpp_deleted_body": sha256_text(result.code) if result.status == "deleted" else None,
             },
             "verification_provenance": {
                 "prior_cosim_pass_user_reported": bool(args.assume_prior_cosim_pass),
@@ -240,6 +258,8 @@ def main() -> int:
         all_records.append(row)
         if result.status == "accepted":
             accepted.append(row)
+        elif result.status == "deleted":
+            deleted.append(row)
         else:
             quarantine.append(row)
         counters[result.status] += 1
@@ -247,6 +267,7 @@ def main() -> int:
     write_jsonl(out_dir / "hls_nl_repaired.all.jsonl", all_records)
     write_jsonl(out_dir / "hls_nl_repaired.accepted.jsonl", accepted)
     write_jsonl(out_dir / "hls_nl_repaired.quarantine.jsonl", quarantine)
+    write_jsonl(out_dir / "hls_nl_repaired.deleted.jsonl", deleted)
     sft_records = [
         {
             "messages": [
@@ -280,11 +301,13 @@ def main() -> int:
             "all": str(out_dir / "hls_nl_repaired.all.jsonl"),
             "accepted": str(out_dir / "hls_nl_repaired.accepted.jsonl"),
             "quarantine": str(out_dir / "hls_nl_repaired.quarantine.jsonl"),
+            "deleted": str(out_dir / "hls_nl_repaired.deleted.jsonl"),
             "sft": str(out_dir / "hls_nl_sft.accepted.jsonl"),
         },
         "notes": [
             "Repairs are mechanical and do not prove functional correctness.",
             "Quarantined records should be regenerated or tool-verified before training.",
+            "Deleted records keep code-free metadata and hashes only; their HLS-C bodies are intentionally omitted.",
             "Use accepted SFT records only as auxiliary HLSC-style data unless Vitis verification metadata is added.",
         ],
     }
@@ -296,6 +319,7 @@ def main() -> int:
         f"- Records: {len(data)}",
         f"- Accepted: {len(accepted)}",
         f"- Quarantined: {len(quarantine)}",
+        f"- Deleted: {len(deleted)}",
         "",
         "## Repair Counts",
         "",
@@ -315,6 +339,7 @@ def main() -> int:
             f"- All records: `{out_dir / 'hls_nl_repaired.all.jsonl'}`",
             f"- Accepted records: `{out_dir / 'hls_nl_repaired.accepted.jsonl'}`",
             f"- Quarantine records: `{out_dir / 'hls_nl_repaired.quarantine.jsonl'}`",
+            f"- Deleted records: `{out_dir / 'hls_nl_repaired.deleted.jsonl'}`",
             f"- Accepted SFT chat records: `{out_dir / 'hls_nl_sft.accepted.jsonl'}`",
             "",
             "Current script verification: false. This pass preserves user-reported prior cosim provenance separately from current tool verification.",

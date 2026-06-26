@@ -33,6 +33,7 @@ class AgentConfig:
     rtl: str = "verilog"
     seed: int = 1
     max_iterations: int = 1
+    auto_repair: bool = False
     keep_going: bool = False
     run_vitis: bool = False
     use_llm: bool = False
@@ -201,6 +202,8 @@ def merge_cli_config(config: AgentConfig, args: Any) -> AgentConfig:
         config.seed = int(args.seed)
     if getattr(args, "max_iterations", None) is not None:
         config.max_iterations = int(args.max_iterations)
+    if getattr(args, "auto_repair", False):
+        config.auto_repair = True
     config.keep_going = bool(getattr(args, "keep_going", False))
     if getattr(args, "run_vitis", False):
         config.run_vitis = True

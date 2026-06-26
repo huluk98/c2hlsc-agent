@@ -1,5 +1,158 @@
 # c2hlsc_agent
 
+## Ubuntu Server Vitis Quick Triage
+
+Use this workflow on the Ubuntu machine where Vitis HLS is installed. Keep it
+verification-only: let the server run CSim/CSynth/CoSim and produce logs, then bring
+the earliest failing evidence back to the Mac-side Codex/Claude repair loop.
+
+From the `c2hlsc_agent` repo root on Ubuntu:
+
+```bash
+python3 -m pip install -e .
+source /opt/Xilinx/Vitis_HLS/2023.2/settings64.sh  # adjust for your install
+command -v vitis_hls
+```
+
+One-command triage when you already know the Vitis binary path:
+
+```bash
+VITIS_HLS_BIN=/opt/Xilinx/Vitis_HLS/2023.2/bin/vitis_hls bash scripts/run_hls_nl_vitis_triage.sh
+```
+
+That wrapper runs the fast CSim+CSynth sweep, filters passing rows, runs split CoSim on
+the passing subset, writes a summary, and writes a `cosim_attention.jsonl` list for
+timeout/failing cases to inspect.
+
+The default timeout is 300 seconds for each Vitis invocation. In full-CoSim mode that
+means up to 300 seconds for CSim, 300 seconds for CSynth, and 300 seconds for CoSim per
+row. Override with `HLS_NL_CSYNTH_TIMEOUT=600` or `HLS_NL_COSIM_TIMEOUT=600` when you
+want to give slower rows more room.
+
+If you already ran some rows, do not rerun them. Point the wrapper at the previous
+result file:
+
+```bash
+VITIS_HLS_BIN=/opt/Xilinx/Vitis_HLS/2023.2/bin/vitis_hls \
+HLS_NL_COSIM_RESULTS=/path/to/previous/vitis_batch_results.jsonl \
+bash scripts/run_hls_nl_vitis_triage.sh
+```
+
+Use `HLS_NL_CSYNTH_RESULTS=/path/to/vitis_batch_results.jsonl` instead if the previous
+file came from the fast CSim+CSynth pass. A supplied CoSim results file also acts as a
+skip list for the fast pass, so full-CoSim rows that already ran are not sent through
+CSim/CSynth again.
+
+Fast first pass over the repaired HLS_NL rows. This runs CSim+CSynth only, with one
+timeout per row, so bad cases cannot stall the whole sweep:
+
+```bash
+python3 scripts/run_hls_nl_vitis_batch.py \
+  --input data/hls_nl/hls_nl_repaired.accepted.jsonl \
+  --out-dir runs/hls_nl_csynth_triage \
+  --limit 9900 \
+  --timeout-seconds 300 \
+  --log-tail-lines 120
+```
+
+Summarize outcomes:
+
+```bash
+python3 - <<'PY'
+import collections
+import json
+from pathlib import Path
+
+path = Path("runs/hls_nl_csynth_triage/vitis_batch_results.jsonl")
+status = collections.Counter()
+failed_phase = collections.Counter()
+for line in path.read_text(encoding="utf-8").splitlines():
+    row = json.loads(line)
+    status[row.get("status", "unknown")] += 1
+    failed_phase[row.get("failed_phase", "pass_or_unset")] += 1
+print("status_counts:", dict(status))
+print("failed_phase_counts:", dict(failed_phase))
+PY
+```
+
+Create a CoSim input containing only rows that passed the fast CSim+CSynth triage:
+
+```bash
+python3 - <<'PY'
+import json
+from pathlib import Path
+
+source = Path("data/hls_nl/hls_nl_repaired.accepted.jsonl")
+results = Path("runs/hls_nl_csynth_triage/vitis_batch_results.jsonl")
+out = Path("runs/hls_nl_csynth_pass.jsonl")
+
+passed_ids = set()
+for line in results.read_text(encoding="utf-8").splitlines():
+    row = json.loads(line)
+    if row.get("status") == "pass":
+        passed_ids.add(int(row["record_id"]))
+
+out.parent.mkdir(parents=True, exist_ok=True)
+with source.open(encoding="utf-8") as src, out.open("w", encoding="utf-8") as dst:
+    for fallback, line in enumerate(src):
+        record = json.loads(line)
+        try:
+            record_id = int(record.get("record_id", fallback))
+        except (TypeError, ValueError):
+            record_id = fallback
+        if record_id in passed_ids:
+            dst.write(json.dumps(record, sort_keys=True) + "\n")
+
+print(f"wrote {out} with {len(passed_ids)} records")
+PY
+```
+
+Run split CSim/CSynth/CoSim on that smaller set. The timeout applies to each phase, so
+a CoSim hang is recorded as `status=timeout` and `failed_phase=cosim` instead of
+blocking the run indefinitely:
+
+```bash
+python3 scripts/run_hls_nl_vitis_batch.py \
+  --input runs/hls_nl_csynth_pass.jsonl \
+  --out-dir runs/hls_nl_cosim_triage \
+  --run-full-cosim \
+  --timeout-seconds 300 \
+  --log-tail-lines 160
+```
+
+Rerun the summary command against
+`runs/hls_nl_cosim_triage/vitis_batch_results.jsonl` to separate CoSim passes,
+failures, and timeouts.
+
+For very large runs, split by chunk in separate terminals or jobs, using a different
+`--out-dir` per chunk:
+
+```bash
+python3 scripts/run_hls_nl_vitis_batch.py \
+  --input runs/hls_nl_csynth_pass.jsonl \
+  --out-dir runs/hls_nl_cosim_triage_0000 \
+  --run-full-cosim \
+  --offset 0 \
+  --limit 500 \
+  --timeout-seconds 300
+```
+
+Inspect timeout/fail cases by opening the phase log named in
+`runs/.../vitis_batch_results.jsonl`, usually one of `vitis_csim.log`,
+`vitis_csynth.log`, or `vitis_cosim.log`. For generated `c2hlsc_agent` projects, copy
+the earliest failing log back to the Mac and repair from external evidence:
+
+```bash
+python3 -m c2hlsc_agent.cli repair \
+  --project build/my_design \
+  --stage cosim \
+  --evidence /path/to/vitis_cosim.log
+```
+
+After a repair, copy the repaired project back to Ubuntu and rerun from CSim. Avoid
+`--auto-repair` on the server unless generation, Vitis, and repair are intentionally
+running in one local experiment.
+
 `c2hlsc_agent` is a conservative local engineering agent that turns an ordinary C top
 function into a Vitis HLS-oriented C/C++ project and verifies the generated code against
 the original C implementation.
@@ -310,6 +463,11 @@ The batch runner writes `vitis_verilog_report.json` and
 file appears under `hls_nl_project/solution1/syn/verilog`.
 
 Use `--run-full-cosim` when you want C/RTL CoSim as well as Verilog emission.
+In full-CoSim mode the batch runner executes split Vitis phases
+(`run_csim.tcl`, `run_csynth.tcl`, `run_cosim.tcl`) so the JSON report can
+identify the earliest failed or timed-out phase. Each phase gets its own
+`vitis_<phase>.log`, plus an aggregate `vitis_full.log`. The default batch
+timeout is 900 seconds per phase; the smoke config uses 300 seconds per phase.
 
 For a full-CoSim corpus where only passing cases are kept for upload:
 
@@ -339,7 +497,9 @@ The default config is `configs/hls_nl_cosim_smoke.json`, which runs one JSONL
 record from `data/hls_nl/hls_nl_repaired.accepted.jsonl` through CSim, CSynth,
 and C/RTL CoSim. The wrapper prints the summary,
 the Vitis log tail, generated Verilog files, and any discovered CoSim artifacts.
-Increase the sample with `HLS_NL_LIMIT=3` after the first row looks sane.
+The smoke timeout is intentionally short so a bad protocol testbench fails
+quickly. Increase the sample with `HLS_NL_LIMIT=3` after the first row looks
+sane.
 
 Run on a remote Linux host from this machine:
 
@@ -383,12 +543,16 @@ Supported options:
 - `--rtl verilog`
 - `--seed 1234`
 - `--max-iterations 1`
+- `--auto-repair`
 - `--keep-going`
 - `--use-llm` / `--no-llm`
 - `--llm-backend auto|none|anthropic|openai`
 - `--llm-base-url http://localhost:11434/v1`
 - `--llm-model qwen2.5-coder`
 - `--verbose`
+
+Use `python -m c2hlsc_agent.cli repair --help` for the separate external-evidence
+repair command.
 
 ## Config Format
 
@@ -435,6 +599,7 @@ For each conversion, the output directory contains:
 - `run_all.sh`
 - `conversion_report.md`
 - `conversion_report.json`
+- `repair_audit.json` when a repair iteration was attempted
 
 ## Verification Order
 
@@ -446,6 +611,27 @@ For each conversion, the output directory contains:
 
 When `--no-run-vitis` is used, Vitis phases are marked `skipped`; host equivalence is
 still run when `g++` is available.
+
+By default, `convert` does not mutate a failing project after verification. This keeps
+the current split-machine workflow explicit: run Vitis/CoSim wherever the toolchain is
+installed, bring the earliest failing phase log back, then invoke `repair` with that
+evidence. `--auto-repair` is available only for local experiments where generation,
+verification, and repair all run in the same agent session.
+
+Manual repair from external evidence:
+
+```bash
+python -m c2hlsc_agent.cli repair \
+  --project build/vector_add \
+  --stage cosim \
+  --evidence /path/from/vitis_machine/vitis_cosim.log
+```
+
+The repair backend only applies mechanical, auditable repairs to generated files:
+missing standard includes, C++ `restrict` compatibility, original helper-function
+support inclusion, and generated interface pragma removal after interface-stage
+failures. Repairs are recorded in `repair_audit.json`; external-evidence repairs also
+write `manual_repair_report.json`.
 
 ## Testbench Generation
 

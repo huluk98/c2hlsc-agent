@@ -48,7 +48,7 @@ def run_vitis(project_dir: Path, run_requested: bool) -> dict[str, PhaseResult]:
             "cosim": PhaseResult("cosim", "blocked", summary=message),
         }
     try:
-        phases["csim"] = run_command(["vitis_hls", "-f", "run_csim.tcl"], project_dir, "csim", timeout=1800)
+        phases["csim"] = run_command(["vitis_hls", "-f", "run_csim.tcl"], project_dir, "csim", timeout=600)
     except subprocess.TimeoutExpired as exc:
         phases["csim"] = PhaseResult("csim", "fail", summary=f"Vitis CSim timed out: {exc}")
     if phases["csim"].status != "pass":
@@ -58,7 +58,7 @@ def run_vitis(project_dir: Path, run_requested: bool) -> dict[str, PhaseResult]:
         return phases
 
     try:
-        phases["csynth"] = run_command(["vitis_hls", "-f", "run_csynth.tcl"], project_dir, "csynth", timeout=3600)
+        phases["csynth"] = run_command(["vitis_hls", "-f", "run_csynth.tcl"], project_dir, "csynth", timeout=1200)
     except subprocess.TimeoutExpired as exc:
         phases["csynth"] = PhaseResult("csynth", "fail", summary=f"Vitis synthesis timed out: {exc}")
     if phases["csynth"].status != "pass":
@@ -66,7 +66,7 @@ def run_vitis(project_dir: Path, run_requested: bool) -> dict[str, PhaseResult]:
         return phases
 
     try:
-        phases["cosim"] = run_command(["vitis_hls", "-f", "run_cosim.tcl"], project_dir, "cosim", timeout=3600)
+        phases["cosim"] = run_command(["vitis_hls", "-f", "run_cosim.tcl"], project_dir, "cosim", timeout=600)
     except subprocess.TimeoutExpired as exc:
         phases["cosim"] = PhaseResult("cosim", "fail", summary=f"Vitis CoSim timed out: {exc}")
     return phases

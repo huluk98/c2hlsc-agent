@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -50,9 +51,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     convert.add_argument("--llm-model", help="model id for --use-llm (default per backend)")
     convert.add_argument("--seed", type=int, help="random seed")
-    convert.add_argument("--max-iterations", type=int, default=1, help="max verification iterations including repaired reruns")
+    convert.add_argument("--max-iterations", type=int, default=1, help="max verification iterations; repaired reruns require --auto-repair")
+    convert.add_argument("--auto-repair", action="store_true", help="apply local mechanical repairs automatically between verification attempts")
     convert.add_argument("--keep-going", action="store_true", help="emit project even when static diagnostics contain errors")
     convert.add_argument("--verbose", action="store_true", help="print command output")
+    repair = sub.add_parser("repair", help="apply a mechanical repair from externally supplied Vitis/verification evidence")
+    repair.add_argument("--project", required=True, help="existing generated project directory")
+    repair.add_argument("--stage", required=True, choices=["software_equivalence", "csim", "csynth", "cosim"], help="earliest failing stage from the external run")
+    repair.add_argument("--evidence", action="append", default=[], help="path to a log/report file from the failing stage; may be repeated")
+    repair.add_argument("--evidence-text", default="", help="inline failing-stage evidence text")
+    repair.add_argument("--input", help="original input C file; defaults to PROJECT/input.c")
+    repair.add_argument("--top", help="top function name; defaults to conversion_report.json top when available")
+    repair.add_argument("--config", help="YAML/JSON config file used for the original conversion")
+    repair.add_argument("--iteration", type=int, default=1, help="repair iteration number recorded in the audit")
     return parser
 
 
@@ -97,6 +108,10 @@ def run_convert(args: argparse.Namespace) -> int:
             break
         if completed_iterations >= iterations:
             break
+        if not config.auto_repair:
+            if args.verbose:
+                print("Automatic repair is disabled; bring Vitis/CoSim evidence back with the repair command.")
+            break
         repair = repair_project(out_dir, analysis, config, state, completed_iterations, llm=llm)
         repair_history.append(repair)
         if args.verbose:
@@ -111,11 +126,88 @@ def run_convert(args: argparse.Namespace) -> int:
     return 0 if status == "pass" else 1
 
 
+def _load_project_top(project_dir: Path) -> str | None:
+    report = project_dir / "conversion_report.json"
+    if not report.exists():
+        return None
+    try:
+        data = json.loads(report.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    top = data.get("top")
+    return str(top) if top else None
+
+
+def _read_evidence(paths: list[str], inline: str) -> str:
+    parts = [inline] if inline else []
+    for item in paths:
+        path = Path(item).expanduser().resolve()
+        parts.append(f"--- {path} ---\n{path.read_text(encoding='utf-8', errors='replace')}")
+    return "\n\n".join(part for part in parts if part)
+
+
+def _external_failure_state(stage: str, evidence: str, run_vitis: bool):
+    from .equivalence import PhaseResult, VerificationState
+
+    state = VerificationState()
+    phases = ["software_equivalence"]
+    if run_vitis:
+        phases.extend(["csim", "csynth", "cosim"])
+    for phase in phases:
+        if phase == stage:
+            state.add_phase(PhaseResult(phase, "fail", stdout=evidence, summary="external evidence supplied"))
+            break
+        state.add_phase(PhaseResult(phase, "pass", summary="assumed pass before external failing stage"))
+    for phase in phases[phases.index(stage) + 1 :] if stage in phases else []:
+        state.add_phase(PhaseResult(phase, "blocked", summary=f"{stage} failed"))
+    return state
+
+
+def run_repair(args: argparse.Namespace) -> int:
+    project_dir = Path(args.project).resolve()
+    config = merge_cli_config(load_config(Path(args.config).resolve() if args.config else None), args)
+    if not config.input_files:
+        config.input_files = [(project_dir / "input.c").resolve()]
+    if not config.input_files[0].exists():
+        raise SystemExit("--input is required because PROJECT/input.c does not exist")
+    if not config.top:
+        config.top = _load_project_top(project_dir)
+    if not config.top:
+        raise SystemExit("--top is required because conversion_report.json does not record a top function")
+    config.run_vitis = args.stage != "software_equivalence"
+    evidence = _read_evidence(args.evidence, args.evidence_text)
+    if not evidence:
+        raise SystemExit("--evidence or --evidence-text is required")
+
+    analysis = analyze_source(config.input_files[0], config.top, config)
+    state = _external_failure_state(args.stage, evidence, config.run_vitis)
+    repair = repair_project(project_dir, analysis, config, state, args.iteration)
+    manual_report = project_dir / "manual_repair_report.json"
+    manual_report.write_text(
+        json.dumps(
+            {
+                "mode": "external_evidence_manual_repair",
+                "project": str(project_dir),
+                "stage": args.stage,
+                "repair": repair.to_dict(),
+                "next_step": "rerun verification or CoSim from the beginning on the Vitis machine",
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    print(repair.summary)
+    print(f"Manual repair report: {manual_report}")
+    return 0 if repair.changed else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.command == "convert":
         return run_convert(args)
+    if args.command == "repair":
+        return run_repair(args)
     parser.error(f"unknown command {args.command}")
     return 2
 

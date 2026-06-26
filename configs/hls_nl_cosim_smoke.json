@@ -5,7 +5,7 @@
   "limit": 1,
   "part": "xczu7ev-ffvc1156-2-e",
   "clock": "10",
-  "timeout_seconds": 7200,
+  "timeout_seconds": 300,
   "log_tail_lines": 120,
   "run_full_cosim": true,
   "stop_on_fail": true
