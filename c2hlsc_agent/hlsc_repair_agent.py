@@ -246,7 +246,7 @@ def _includes_needed_from_evidence(evidence: str) -> list[str]:
         (r"\b(ap_int|ap_uint)\b|ap_int\.h", "<ap_int.h>"),
     ]
     lowered = evidence.lower()
-    if not re.search(r"not declared|unknown type name|does not name a type|fatal error|undeclared", lowered):
+    if not re.search(r"not declared|not been declared|unknown type name|does not name a type|fatal error|undeclared", lowered):
         return []
     needed: list[str] = []
     for pattern, header in checks:
