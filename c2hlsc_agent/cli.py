@@ -34,11 +34,21 @@ def build_parser() -> argparse.ArgumentParser:
     llm.add_argument(
         "--use-llm",
         action="store_true",
-        help="use an Anthropic Claude model for HLS-C generation and repair "
-        "(needs ANTHROPIC_API_KEY and the 'anthropic' package)",
+        help="use a model for HLS-C generation and repair (see --llm-backend)",
     )
     llm.add_argument("--no-llm", action="store_true", help="force the deterministic generator/repair (default)")
-    convert.add_argument("--llm-model", help="Claude model id for --use-llm (default claude-opus-4-8)")
+    convert.add_argument(
+        "--llm-backend",
+        choices=["auto", "none", "anthropic", "openai"],
+        help="LLM backend for --use-llm: 'openai' is OpenAI Chat Completions-compatible "
+        "and works with local models (Ollama/LM Studio/llama.cpp/vLLM via --llm-base-url) "
+        "or OpenAI-compatible cloud; 'anthropic' uses the Claude API; default auto",
+    )
+    convert.add_argument(
+        "--llm-base-url",
+        help="base URL for --llm-backend openai, e.g. http://localhost:11434/v1 for a local Ollama",
+    )
+    convert.add_argument("--llm-model", help="model id for --use-llm (default per backend)")
     convert.add_argument("--seed", type=int, help="random seed")
     convert.add_argument("--max-iterations", type=int, default=1, help="max verification iterations including repaired reruns")
     convert.add_argument("--keep-going", action="store_true", help="emit project even when static diagnostics contain errors")

@@ -1,28 +1,41 @@
 """LLM client and prompt/parse helpers for the AUTO RTL generator and repair agents.
 
-This module is intentionally dependency-light. The Anthropic SDK is imported
-lazily so the rest of ``c2hlsc_agent`` stays fully deterministic and offline by
-default: if ``--use-llm`` is not requested, the ``anthropic`` package is not
-installed, or no API key is present, the agents fall back to the conservative
-mechanical paths.
+The model is a *pluggable backend*, so the agent never depends on one specific cloud
+API. Three backends are supported:
 
-The LLM only ever *proposes* candidate HLS-C; the existing verifier ladder
-(host equivalence -> CSim -> CSynth -> CoSim) remains the gate, and the original
-C file is never handed to the model for rewriting.
+- ``none``      -- no model; the agents run the conservative deterministic paths.
+- ``openai``    -- any OpenAI Chat Completions-compatible endpoint, using only the
+  standard library (no extra dependency). This is how a **local** model runs with no
+  cloud key: point ``llm_base_url`` at Ollama / LM Studio / llama.cpp / vLLM (e.g.
+  ``http://localhost:11434/v1``). The same backend also reaches OpenAI-compatible cloud
+  providers.
+- ``anthropic`` -- the Anthropic Messages API (lazily imported ``anthropic`` SDK).
+
+Everything stays deterministic and offline by default: if ``--use-llm`` is not requested,
+or no backend resolves, the agents fall back to the conservative mechanical paths. The
+LLM only ever *proposes* candidate HLS-C; the verifier ladder (host equivalence -> CSim
+-> CSynth -> CoSim) remains the gate, and the original C file is never handed to the model.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import re
+import urllib.error
+import urllib.request
 from typing import Protocol
 
 from .analyze import AnalysisResult
 from .hlsc_generator import HLSC_GENERATOR_SYSTEM_PROMPT, render_hlsc_generator_task
 
-DEFAULT_LLM_MODEL = "claude-opus-4-8"
+DEFAULT_ANTHROPIC_MODEL = "claude-opus-4-8"
+DEFAULT_LLM_MODEL = DEFAULT_ANTHROPIC_MODEL  # backward-compatible alias
+DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
+DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
 _DEFAULT_MAX_TOKENS = 8000
 _EVIDENCE_LIMIT = 1600
+_HTTP_TIMEOUT = 600  # local models can be slow
 
 
 class LLMClient(Protocol):
@@ -41,7 +54,7 @@ class AnthropicLLMClient:
     retries without those parameters if an older SDK or model rejects them.
     """
 
-    def __init__(self, model: str = DEFAULT_LLM_MODEL, api_key: str | None = None) -> None:
+    def __init__(self, model: str = DEFAULT_ANTHROPIC_MODEL, api_key: str | None = None) -> None:
         import anthropic  # lazy: keeps the package optional
 
         self._anthropic = anthropic
@@ -68,6 +81,47 @@ class AnthropicLLMClient:
         return _text_from_response(response)
 
 
+class OpenAICompatibleLLMClient:
+    """OpenAI Chat Completions-compatible client (local servers or cloud).
+
+    Works with Ollama, LM Studio, llama.cpp's server, vLLM, and OpenAI-compatible cloud
+    endpoints. Uses only the standard library, so no extra dependency is required, and a
+    local server typically needs no API key.
+    """
+
+    def __init__(
+        self,
+        base_url: str,
+        model: str,
+        api_key: str | None = None,
+        timeout: int = _HTTP_TIMEOUT,
+    ) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.model = model
+        self._api_key = api_key
+        self._timeout = timeout
+
+    def complete(self, system: str, user: str, *, max_tokens: int = _DEFAULT_MAX_TOKENS) -> str:
+        payload = {
+            "model": self.model,
+            "max_tokens": max_tokens,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+        }
+        data = json.dumps(payload).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        if self._api_key:
+            headers["Authorization"] = f"Bearer {self._api_key}"
+        request = urllib.request.Request(
+            f"{self.base_url}/chat/completions", data=data, headers=headers, method="POST"
+        )
+        with urllib.request.urlopen(request, timeout=self._timeout) as response:
+            body = json.loads(response.read().decode("utf-8"))
+        return _openai_text(body)
+
+
 def _text_from_response(response: object) -> str:
     parts: list[str] = []
     for block in getattr(response, "content", None) or []:
@@ -76,27 +130,111 @@ def _text_from_response(response: object) -> str:
     return "\n".join(part for part in parts if part)
 
 
+def _openai_text(body: dict) -> str:
+    choices = body.get("choices") or []
+    if not choices:
+        return ""
+    message = choices[0].get("message") or {}
+    content = message.get("content")
+    if isinstance(content, list):  # some servers return structured content parts
+        return "".join(part.get("text", "") for part in content if isinstance(part, dict))
+    return content or ""
+
+
+def _env(*names: str) -> str | None:
+    for name in names:
+        value = os.environ.get(name)
+        if value:
+            return value
+    return None
+
+
+def _anthropic_installed() -> bool:
+    try:
+        import anthropic  # noqa: F401
+    except ModuleNotFoundError:
+        return False
+    return True
+
+
+def _is_local_url(base_url: str) -> bool:
+    lowered = (base_url or "").lower()
+    return any(host in lowered for host in ("localhost", "127.0.0.1", "0.0.0.0", "::1", "host.docker.internal"))
+
+
+def resolve_backend(config: object) -> str:
+    """Resolve the concrete backend name: ``'none'``, ``'anthropic'`` or ``'openai'``.
+
+    Honours an explicit ``llm_backend``; otherwise ``auto`` prefers a configured
+    OpenAI-compatible endpoint (covers local models), then Anthropic, then OpenAI cloud.
+    """
+
+    requested = (getattr(config, "llm_backend", "auto") or "auto").lower()
+    if requested in {"anthropic", "openai", "none"}:
+        return requested
+    if getattr(config, "llm_base_url", None) or _env("C2HLSC_LLM_BASE_URL", "OPENAI_BASE_URL"):
+        return "openai"
+    if _anthropic_installed() and _env("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"):
+        return "anthropic"
+    if _env("OPENAI_API_KEY"):
+        return "openai"
+    return "none"
+
+
+def _openai_base_url(config: object) -> str:
+    return (
+        getattr(config, "llm_base_url", None)
+        or _env("C2HLSC_LLM_BASE_URL", "OPENAI_BASE_URL")
+        or DEFAULT_OPENAI_BASE_URL
+    )
+
+
 def missing_llm_reason(config: object) -> str | None:
     """Return a human-readable reason the LLM path is unavailable, or ``None``."""
 
     if not getattr(config, "use_llm", False):
         return "LLM not requested (pass --use-llm)"
-    try:
-        import anthropic  # noqa: F401
-    except ModuleNotFoundError:
-        return "the 'anthropic' package is not installed (pip install 'c2hlsc-agent[llm]')"
-    if not (os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")):
-        return "ANTHROPIC_API_KEY is not set"
+    backend = resolve_backend(config)
+    if backend == "none":
+        return (
+            "no LLM backend resolved: point --llm-backend openai at a local model "
+            "(e.g. --llm-base-url http://localhost:11434/v1 for Ollama), or install "
+            "'anthropic' and set ANTHROPIC_API_KEY"
+        )
+    if backend == "anthropic":
+        if not _anthropic_installed():
+            return "the 'anthropic' package is not installed (pip install 'c2hlsc-agent[llm]')"
+        if not _env("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"):
+            return "ANTHROPIC_API_KEY is not set"
+    if backend == "openai":
+        base_url = _openai_base_url(config)
+        if not _is_local_url(base_url) and not _env("C2HLSC_LLM_API_KEY", "OPENAI_API_KEY"):
+            return f"no API key for the OpenAI-compatible endpoint {base_url} (set OPENAI_API_KEY, or use a local --llm-base-url)"
     return None
 
 
 def build_llm_client(config: object) -> LLMClient | None:
-    """Construct an :class:`AnthropicLLMClient` when the LLM path is fully available."""
+    """Construct the configured LLM backend client, or ``None`` when unavailable.
 
-    if missing_llm_reason(config) is not None:
+    Returns ``None`` (deterministic fallback) unless ``config.use_llm`` is set and a
+    backend resolves. Constructing a client never makes a network call -- only
+    :meth:`complete` does -- so resolution stays cheap and side-effect free.
+    """
+
+    if not getattr(config, "use_llm", False):
         return None
-    model = getattr(config, "llm_model", None) or DEFAULT_LLM_MODEL
-    return AnthropicLLMClient(model=model)
+    backend = resolve_backend(config)
+    if backend == "anthropic":
+        if not _anthropic_installed() or not _env("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"):
+            return None
+        model = getattr(config, "llm_model", None) or DEFAULT_ANTHROPIC_MODEL
+        return AnthropicLLMClient(model=model)
+    if backend == "openai":
+        base_url = _openai_base_url(config)
+        model = getattr(config, "llm_model", None) or _env("C2HLSC_LLM_MODEL") or DEFAULT_OPENAI_MODEL
+        api_key = _env("C2HLSC_LLM_API_KEY", "OPENAI_API_KEY")
+        return OpenAICompatibleLLMClient(base_url=base_url, model=model, api_key=api_key)
+    return None
 
 
 # --------------------------------------------------------------------------- #

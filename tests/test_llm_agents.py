@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
+
+from c2hlsc_agent import llm as llm_module
+from c2hlsc_agent.llm import OpenAICompatibleLLMClient, resolve_backend
 
 from c2hlsc_agent.analyze import analyze_source
 from c2hlsc_agent.config import AgentConfig
@@ -298,14 +302,116 @@ class LlmHelperTests(unittest.TestCase):
         self.assertEqual(missing_llm_reason(AgentConfig(use_llm=False)), "LLM not requested (pass --use-llm)")
 
     def test_build_llm_client_none_without_credentials(self):
-        # With no API key present, the client is None even if use_llm is requested,
-        # regardless of whether the 'anthropic' package happens to be installed.
-        with mock.patch.dict("os.environ", {}, clear=False) as _env:
+        # With no backend configured and no credentials/base-url in the env, auto resolves
+        # to 'none' and the client is None even if use_llm is requested.
+        with mock.patch.dict("os.environ", {}, clear=False):
             import os
 
-            os.environ.pop("ANTHROPIC_API_KEY", None)
-            os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
+            for var in (
+                "ANTHROPIC_API_KEY",
+                "ANTHROPIC_AUTH_TOKEN",
+                "OPENAI_API_KEY",
+                "OPENAI_BASE_URL",
+                "C2HLSC_LLM_BASE_URL",
+                "C2HLSC_LLM_API_KEY",
+                "C2HLSC_LLM_MODEL",
+            ):
+                os.environ.pop(var, None)
+            self.assertEqual(resolve_backend(AgentConfig(use_llm=True)), "none")
             self.assertIsNone(build_llm_client(AgentConfig(use_llm=True)))
+
+    def test_build_llm_client_openai_backend_local(self):
+        # A local OpenAI-compatible endpoint needs no key; constructing the client makes
+        # no network call.
+        config = AgentConfig(
+            use_llm=True,
+            llm_backend="openai",
+            llm_base_url="http://localhost:11434/v1",
+            llm_model="qwen2.5-coder",
+        )
+        client = build_llm_client(config)
+        self.assertIsInstance(client, OpenAICompatibleLLMClient)
+        self.assertEqual(client.model, "qwen2.5-coder")
+        self.assertEqual(client.base_url, "http://localhost:11434/v1")
+        self.assertIsNone(missing_llm_reason(config))
+
+    def test_resolve_backend_auto_prefers_base_url(self):
+        self.assertEqual(
+            resolve_backend(AgentConfig(use_llm=True, llm_base_url="http://localhost:11434/v1")),
+            "openai",
+        )
+        self.assertEqual(resolve_backend(AgentConfig(use_llm=True, llm_backend="none")), "none")
+
+    def test_openai_client_builds_request_and_parses_content(self):
+        captured: dict = {}
+
+        class _FakeResp:
+            def __init__(self, payload: dict) -> None:
+                self._payload = json.dumps(payload).encode("utf-8")
+
+            def read(self) -> bytes:
+                return self._payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        def fake_urlopen(request, timeout=0):
+            captured["url"] = request.full_url
+            captured["method"] = request.get_method()
+            captured["body"] = json.loads(request.data.decode("utf-8"))
+            return _FakeResp({"choices": [{"message": {"content": "// LOCAL-MODEL\nvoid foo() {}"}}]})
+
+        with mock.patch.object(llm_module.urllib.request, "urlopen", fake_urlopen):
+            client = OpenAICompatibleLLMClient("http://localhost:11434/v1/", "qwen", api_key=None)
+            out = client.complete("system text", "user text", max_tokens=128)
+
+        self.assertIn("// LOCAL-MODEL", out)
+        self.assertEqual(captured["url"], "http://localhost:11434/v1/chat/completions")
+        self.assertEqual(captured["method"], "POST")
+        self.assertEqual(captured["body"]["model"], "qwen")
+        self.assertEqual(captured["body"]["max_tokens"], 128)
+        self.assertEqual(captured["body"]["messages"][0]["role"], "system")
+        self.assertEqual(captured["body"]["messages"][1]["content"], "user text")
+
+    def test_openai_local_backend_drives_generator_end_to_end(self):
+        # The generator uses whatever backend build_llm_client returns; here a mocked
+        # local OpenAI-compatible server returns the synthesizable unit.
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            config = AgentConfig(
+                use_llm=True,
+                llm_backend="openai",
+                llm_base_url="http://localhost:11434/v1",
+                llm_model="qwen2.5-coder",
+            )
+            analysis = _analyze(tmp, config)
+            client = build_llm_client(config)
+            self.assertIsInstance(client, OpenAICompatibleLLMClient)
+
+            class _FakeResp:
+                def __init__(self, payload: dict) -> None:
+                    self._payload = json.dumps(payload).encode("utf-8")
+
+                def read(self) -> bytes:
+                    return self._payload
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *exc):
+                    return False
+
+            def fake_urlopen(request, timeout=0):
+                return _FakeResp({"choices": [{"message": {"content": GENERATOR_RESPONSE}}]})
+
+            from c2hlsc_agent.convert import generate_hls_sources
+
+            with mock.patch.object(llm_module.urllib.request, "urlopen", fake_urlopen):
+                generated = generate_hls_sources(analysis, config, llm=client)
+            self.assertIn("// LLM-GENERATED", generated.source)
 
 
 if __name__ == "__main__":

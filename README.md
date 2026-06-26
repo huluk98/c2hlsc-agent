@@ -77,27 +77,61 @@ agents:
 - `hlsc_repair_agent` escalates to Claude for a minimal patch when no mechanical repair
   matches the earliest failing stage, using the classified failure evidence.
 
-The model is the default `claude-opus-4-8` (override with `--llm-model`). The LLM only
-*proposes* candidate HLS-C — the existing verifier ladder (host equivalence → CSim →
-CSynth → CoSim) is still the equivalence gate, the golden `input.c` is never handed to
-the model, and any unavailable/unparsable response falls back to the conservative path.
+The LLM only *proposes* candidate HLS-C — the existing verifier ladder (host equivalence
+→ CSim → CSynth → CoSim) is still the equivalence gate, the golden `input.c` is never
+handed to the model, the LLM repair only ever rewrites `src/hls_top.cpp` (never the
+golden-oracle testbench), and any unavailable/unparsable response falls back to the
+conservative path. When `--use-llm` is requested but no backend resolves, the run prints a
+warning and continues deterministically (exit code unaffected).
+
+#### Backends
+
+The model is a pluggable backend (`--llm-backend`), so the agent does not depend on any
+one cloud API:
+
+- **`openai`** — any OpenAI Chat Completions-compatible endpoint, using only the standard
+  library (no extra dependency). This is how it runs on a **local model with no cloud
+  key**: point `--llm-base-url` at Ollama / LM Studio / llama.cpp / vLLM. The same backend
+  also reaches OpenAI-compatible cloud providers.
+- **`anthropic`** — the Anthropic Claude API (needs `pip install '.[llm]'` and
+  `ANTHROPIC_API_KEY`).
+- **`auto`** (default) — prefers a configured OpenAI-compatible endpoint (incl. local),
+  then Anthropic, then OpenAI cloud; falls back to deterministic if nothing is configured.
+
+Local model, no API key (e.g. `ollama pull qwen2.5-coder` then `ollama serve`):
 
 ```bash
-python3 -m pip install -e '.[llm]'   # installs the anthropic SDK
-export ANTHROPIC_API_KEY=sk-ant-...
-
 python -m c2hlsc_agent.cli convert \
   --config examples/vector_add/config.yaml \
   --out build/vector_add \
   --use-llm \
+  --llm-backend openai \
+  --llm-base-url http://localhost:11434/v1 \
+  --llm-model qwen2.5-coder \
   --no-run-vitis            # add --run-vitis on a machine with Vitis HLS
 ```
 
-`--use-llm` can also be set with `use_llm: true` / `llm_model: ...` in a config file.
-When `--use-llm` is requested but the `anthropic` package or `ANTHROPIC_API_KEY` is
-missing, the run prints a warning and continues deterministically (exit code unaffected).
-The LLM repair only ever rewrites `src/hls_top.cpp`; the generated golden-oracle testbench
-and the original `input.c` are never sent to the model or overwritten.
+Anthropic Claude API:
+
+```bash
+python3 -m pip install -e '.[llm]'
+export ANTHROPIC_API_KEY=sk-ant-...
+python -m c2hlsc_agent.cli convert --config examples/vector_add/config.yaml \
+  --out build/vector_add --use-llm --llm-backend anthropic --no-run-vitis
+```
+
+OpenAI-compatible cloud (OpenAI, Groq, Together, OpenRouter, …):
+
+```bash
+export OPENAI_API_KEY=...                 # and OPENAI_BASE_URL for non-OpenAI providers
+python -m c2hlsc_agent.cli convert --config examples/vector_add/config.yaml \
+  --out build/vector_add --use-llm --llm-backend openai --llm-model gpt-4o-mini --no-run-vitis
+```
+
+Backend selection also works from a config file (`use_llm: true`, `llm_backend: openai`,
+`llm_base_url: ...`, `llm_model: ...`) and from environment variables
+(`C2HLSC_LLM_BASE_URL` / `OPENAI_BASE_URL`, `C2HLSC_LLM_API_KEY` / `OPENAI_API_KEY`,
+`C2HLSC_LLM_MODEL`).
 
 ## HLS-LeVeri-Style Testbench Generator
 
@@ -351,7 +385,9 @@ Supported options:
 - `--max-iterations 1`
 - `--keep-going`
 - `--use-llm` / `--no-llm`
-- `--llm-model claude-opus-4-8`
+- `--llm-backend auto|none|anthropic|openai`
+- `--llm-base-url http://localhost:11434/v1`
+- `--llm-model qwen2.5-coder`
 - `--verbose`
 
 ## Config Format

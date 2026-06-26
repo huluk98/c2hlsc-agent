@@ -36,7 +36,9 @@ class AgentConfig:
     keep_going: bool = False
     run_vitis: bool = False
     use_llm: bool = False
-    llm_model: str = "claude-opus-4-8"
+    llm_backend: str = "auto"
+    llm_model: str | None = None
+    llm_base_url: str | None = None
 
 
 def _parse_scalar(value: str) -> Any:
@@ -174,7 +176,9 @@ def load_config(path: Path | None) -> AgentConfig:
         allow_performance_pragmas=bool(data.get("allow_performance_pragmas", False)),
         seed=int(data.get("seed", 1)),
         use_llm=bool(data.get("use_llm", False)),
-        llm_model=str(data.get("llm_model", "claude-opus-4-8")),
+        llm_backend=str(data.get("llm_backend", "auto")),
+        llm_model=(str(data["llm_model"]) if data.get("llm_model") is not None else None),
+        llm_base_url=(str(data["llm_base_url"]) if data.get("llm_base_url") is not None else None),
     )
 
 
@@ -206,6 +210,10 @@ def merge_cli_config(config: AgentConfig, args: Any) -> AgentConfig:
         config.use_llm = True
     elif getattr(args, "no_llm", False):
         config.use_llm = False
+    if getattr(args, "llm_backend", None):
+        config.llm_backend = args.llm_backend
     if getattr(args, "llm_model", None):
         config.llm_model = args.llm_model
+    if getattr(args, "llm_base_url", None):
+        config.llm_base_url = args.llm_base_url
     return config
