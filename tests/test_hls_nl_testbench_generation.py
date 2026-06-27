@@ -48,11 +48,52 @@ class HlsNlTestbenchGenerationTests(unittest.TestCase):
             """,
         }
         sig = gen.extract_function(record["hls_cpp"])
-        oracle_kind, tb = gen.render_testbench(record, sig, 0)
+        # Semantic self-checks are opt-in (--oracle semantic).
+        oracle_kind, tb = gen.render_testbench(record, sig, 0, "semantic")
         self.assertEqual(oracle_kind, "semantic")
         self.assertIn("Oracle kind: semantic", tb)
         self.assertIn("if (add != static_cast<ap_uint<32>>(a + b))", tb)
         self.assertIn("reset_n = static_cast<bool>(1)", tb)
+
+    def test_default_is_stimulus_driver_without_golden_assertions(self):
+        record = {
+            "file": "1_hls.txt",
+            "HLS_instruction": "**Design Task:** Simple Calculator\n",
+            "hls_cpp": """
+            #include <ap_int.h>
+            void simple_calculator(ap_uint<32> a, ap_uint<32> b,
+                                   ap_uint<32>& add, ap_uint<32>& sub) {
+              add = a + b;
+              sub = a - b;
+            }
+            """,
+        }
+        sig = gen.extract_function(record["hls_cpp"])
+        oracle_kind, tb = gen.render_testbench(record, sig, 0)  # default = driver
+        self.assertIn(oracle_kind, ("smoke", "property"))
+        self.assertNotIn("Mismatch", tb)
+        self.assertNotIn("static_cast<ap_uint<32>>(a + b)", tb)
+        self.assertIn("all", tb)  # success print exists, design is still exercised
+
+    def test_semantic_full_adder_oracle_is_width_correct(self):
+        # Multi-bit adder: carry-out is bit W (not the old hardcoded bit 1).
+        record = {
+            "file": "20_hls.txt",
+            "HLS_instruction": "**Design Task:** Full Adder\n",
+            "hls_cpp": """
+            #include <ap_int.h>
+            void full_adder(ap_uint<16> a, ap_uint<16> b, bool carry_in,
+                            ap_uint<16>& sum, bool& carry_out) {
+              ap_uint<17> t = a + b + carry_in;
+              sum = t.range(15, 0);
+              carry_out = t[16];
+            }
+            """,
+        }
+        sig = gen.extract_function(record["hls_cpp"])
+        _, tb = gen.render_testbench(record, sig, 20, "semantic")
+        self.assertIn(">> 16", tb)
+        self.assertNotIn(">> 1)", tb)
 
     def test_writes_design_bundle(self):
         record = {
@@ -70,7 +111,7 @@ class HlsNlTestbenchGenerationTests(unittest.TestCase):
         }
         sig = gen.extract_function(record["hls_cpp"])
         with tempfile.TemporaryDirectory() as tmp:
-            row = gen.write_design(Path(tmp), record, sig, 5, "xc7z020clg484-1", "10")
+            row = gen.write_design(Path(tmp), record, sig, 5, "xc7z020clg484-1", "10", "semantic")
             design_dir = Path(row["path"])
             self.assertEqual(row["oracle_kind"], "semantic")
             self.assertTrue((design_dir / "dut.cpp").exists())

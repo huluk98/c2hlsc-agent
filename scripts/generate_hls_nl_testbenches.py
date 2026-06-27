@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """Generate Vitis-oriented testbench scaffolds for HLS_NL JSON/JSONL records.
 
-The generator is intentionally conservative. It emits semantic self-checking
-testbenches only for recognized small patterns; otherwise it emits deterministic
-driver/smoke testbenches that are useful for CSim/CoSim stimulus but are not a
-functional-equivalence proof by themselves.
+By default the generator emits deterministic stimulus/driver testbenches: they
+exercise each design and let C/RTL co-simulation prove C<->RTL equivalence. They
+never assert a re-derived golden value, so a correct design is never failed in
+CSim. Pass --oracle semantic to additionally emit heuristic self-checks for a few
+recognized patterns (adders, comparators, mux, gray code, ...); those checks can
+false-fail designs whose behaviour legitimately differs from the heuristic, so
+they are opt-in only.
 """
 
 from __future__ import annotations
@@ -290,8 +293,37 @@ def mismatch_line(label: str, expected: str, actual: str) -> str:
     )
 
 
-def semantic_checks(sig: FunctionSig) -> tuple[str, str]:
+DRIVER_COMMENT = (
+    "    // Stimulus/driver testbench: deterministic stimulus exercises the design;\n"
+    "    // C/RTL co-simulation is the equivalence oracle. No re-derived golden value\n"
+    "    // is asserted, so a correct (but differently-implemented) design never fails CSim."
+)
+
+
+def bit_width(base_type: str) -> int:
+    """Best-effort bit width of an HLS scalar type (for width-correct golden math)."""
+    m = re.search(r"ap_u?int\s*<\s*(\d+)", base_type)
+    if m:
+        return int(m.group(1))
+    m = re.search(r"u?int(\d+)_t", base_type)
+    if m:
+        return int(m.group(1))
+    if "bool" in base_type:
+        return 1
+    return 32
+
+
+def semantic_checks(sig: FunctionSig, oracle_mode: str = "driver") -> tuple[str, str]:
     name = sig.name.lower()
+    if oracle_mode != "semantic":
+        # Default: stimulus/driver testbenches only. The real equivalence check is
+        # C/RTL co-simulation, so we never assert a re-derived golden value (which can
+        # wrongly fail a correct design whose behaviour differs from the heuristic).
+        if any(arg.is_stream for arg in sig.args) or re.search(
+            r"(counter|fifo|shift_register|flip_flop|edge|ram|memory)", name
+        ):
+            return "property", DRIVER_COMMENT
+        return "smoke", DRIVER_COMMENT
     ins = input_args(sig)
     outs = output_args(sig)
     out_names = {arg.name.lower(): arg for arg in outs}
@@ -336,11 +368,14 @@ def semantic_checks(sig: FunctionSig) -> tuple[str, str]:
         sum_out = find_arg(outs, {"sum", "s"})
         cout = find_arg(outs, {"cout", "carry_out", "c_out"})
         total = f"({print_expr(a.name)} + {print_expr(b.name)} + {print_expr(cin.name)})"
+        # Width-aware: the sum keeps W low bits, carry-out is bit W (not hardcoded 1-bit).
+        width = bit_width(sum_out.base_type) if sum_out else bit_width(a.base_type)
+        mask = (1 << width) - 1
         if sum_out:
-            expected = f"static_cast<{sum_out.base_type}>({total} & 1)"
+            expected = f"static_cast<{sum_out.base_type}>({total} & 0x{mask:X}ULL)"
             checks.append(f"    if ({sum_out.name} != {expected}) {{\n{mismatch_line(sum_out.name, expected, sum_out.name)}\n    }}")
         if cout:
-            expected = f"static_cast<{cout.base_type}>(({total} >> 1) & 1)"
+            expected = f"static_cast<{cout.base_type}>(({total} >> {width}) & 1)"
             checks.append(f"    if ({cout.name} != {expected}) {{\n{mismatch_line(cout.name, expected, cout.name)}\n    }}")
 
     if ("adder_subtractor" in name or "adder_sub" in name) and a and b:
@@ -393,8 +428,8 @@ def semantic_checks(sig: FunctionSig) -> tuple[str, str]:
     return "smoke", "    // Smoke/driver testbench: no semantic oracle was inferred for this task."
 
 
-def render_testbench(record: dict[str, Any], sig: FunctionSig, record_id: int) -> tuple[str, str]:
-    oracle_kind, checks = semantic_checks(sig)
+def render_testbench(record: dict[str, Any], sig: FunctionSig, record_id: int, oracle_mode: str = "driver") -> tuple[str, str]:
+    oracle_kind, checks = semantic_checks(sig, oracle_mode)
     declarations = "\n".join(declare_arg(arg, idx + 1) for idx, arg in enumerate(sig.args))
     ret_decl = ""
     ret_assign = ""
@@ -459,13 +494,13 @@ exit
 """
 
 
-def write_design(out_dir: Path, record: dict[str, Any], sig: FunctionSig, record_id: int, part: str, clock: str) -> dict[str, Any]:
+def write_design(out_dir: Path, record: dict[str, Any], sig: FunctionSig, record_id: int, part: str, clock: str, oracle_mode: str = "driver") -> dict[str, Any]:
     source_file = record_source_file(record)
     stem = identifier(Path(str(source_file or f"record_{record_id}")).stem)
     design_dir = out_dir / f"{record_id:05d}_{stem}_{sig.name}"
     design_dir.mkdir(parents=True, exist_ok=True)
     code = str(record.get("hls_cpp", "")).replace("\r\n", "\n").replace("\r", "\n").strip() + "\n"
-    oracle_kind, tb = render_testbench(record, sig, record_id)
+    oracle_kind, tb = render_testbench(record, sig, record_id, oracle_mode)
     (design_dir / "dut.cpp").write_text(code, encoding="utf-8")
     (design_dir / "tb.cpp").write_text(tb, encoding="utf-8")
     (design_dir / "run_hls.tcl").write_text(render_tcl(sig, part, clock), encoding="utf-8")
@@ -489,6 +524,13 @@ def main() -> int:
     parser.add_argument("--offset", type=int, default=0, help="Starting record offset")
     parser.add_argument("--part", default="xc7z020clg484-1")
     parser.add_argument("--clock", default="10")
+    parser.add_argument(
+        "--oracle",
+        choices=["driver", "semantic"],
+        default="driver",
+        help="driver: stimulus-only (cosim is the equivalence oracle, default); "
+        "semantic: also assert heuristic golden values during CSim (can false-fail).",
+    )
     args = parser.parse_args()
 
     data = load_records(args.input)
@@ -506,7 +548,7 @@ def main() -> int:
         if sig is None:
             skipped.append({"record_id": record_id, "source_file": record_source_file(record), "reason": "no_parseable_function_definition"})
             continue
-        row = write_design(args.out_dir, record, sig, record_id, args.part, args.clock)
+        row = write_design(args.out_dir, record, sig, record_id, args.part, args.clock, args.oracle)
         manifest.append(row)
         counts[row["oracle_kind"]] = counts.get(row["oracle_kind"], 0) + 1
 

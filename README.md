@@ -682,20 +682,50 @@ python -m c2hlsc_agent.cli convert \
   --no-run-vitis
 ```
 
-Generate Vitis-oriented testbench bundles from an `HLS_NL.json` dataset:
+Generate Vitis-oriented testbench bundles from an `HLS_NL.json`/JSONL dataset:
 
 ```bash
 python scripts/generate_hls_nl_testbenches.py \
-  --input /path/to/HLS_NL.json \
+  --input data/hls_nl/hls_nl_claude_generated.jsonl \
   --out-dir build/hls_nl_testbenches
 ```
 
-The generated bundles are labeled by oracle strength: `semantic` for recognized
-self-checking patterns, `property` for stateful/protocol drivers that need a
-contract audit, and `smoke` for deterministic CoSim stimulus only.
+By default (`--oracle driver`) each bundle is a deterministic **stimulus/driver**
+testbench: it exercises the design and lets C/RTL **co-simulation** prove that the
+synthesized RTL matches the C model. No re-derived golden value is asserted in CSim,
+so a correct design is never failed by a heuristic. Pass `--oracle semantic` to also
+emit heuristic self-checks for a few recognized patterns (adders, comparators, mux,
+gray code); those can false-fail designs whose behaviour differs from the heuristic,
+so they are opt-in only.
 
 Run unit tests:
 
 ```bash
-python -m unittest discover -s c2hlsc_agent/tests
+python -m unittest discover -s tests
 ```
+
+## HLS_NL Generated Corpus
+
+`data/hls_nl/hls_nl_claude_generated.jsonl` is a complete generated corpus: one
+synthesizable Vitis HLS-C implementation for **all 10,003** HLS_NL records (NL spec →
+HLS-C). Each line is `{record_id, top_function, design_title, hls_cpp, ...}` and is a
+drop-in `--input` for the batch runner.
+
+Materialize all cosim-ready projects (dut.cpp + tb.cpp + run_hls.tcl per record) on
+demand — the project tree is not committed, it regenerates in seconds:
+
+```bash
+# Generate the testbench/cosim projects (no Vitis required for this step)
+python scripts/run_hls_nl_vitis_batch.py \
+  --input data/hls_nl/hls_nl_claude_generated.jsonl \
+  --out-dir build/hls_nl_projects --generate-only
+
+# Run the full C/RTL co-simulation ladder on a machine with Vitis HLS
+VITIS_HLS_BIN=/path/to/vitis_hls python scripts/run_hls_nl_vitis_batch.py \
+  --input data/hls_nl/hls_nl_claude_generated.jsonl \
+  --out-dir build/hls_nl_cosim --run-full-cosim
+```
+
+`--generate-only` produces 10,003 projects with 0 skips; "cosim-ready" means each
+design parses and yields a project, not that CoSim has been run — that is the
+`--run-full-cosim` step on real Vitis.

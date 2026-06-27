@@ -153,7 +153,7 @@ def generate_designs(args: argparse.Namespace) -> tuple[list[dict[str, Any]], li
                 }
             )
             continue
-        row = write_design(args.out_dir, record, sig, record_id, args.part, args.clock)
+        row = write_design(args.out_dir, record, sig, record_id, args.part, args.clock, getattr(args, "oracle", "driver"))
         design_dir = Path(row["path"])
         (design_dir / "run_verilog.tcl").write_text(render_verilog_tcl(sig, args.part, args.clock), encoding="utf-8")
         (design_dir / "run_csim.tcl").write_text(render_csim_tcl(sig, args.part, args.clock), encoding="utf-8")
@@ -359,6 +359,7 @@ def main() -> int:
     parser.add_argument("--log-tail-lines", type=int, help="Vitis log tail lines stored per result; 0 disables")
     parser.add_argument("--generate-only", action="store_true", help="Only generate project folders; do not run Vitis")
     parser.add_argument("--run-full-cosim", action="store_true", help="Run CSim, CSynth, and CoSim instead of CSim+CSynth only")
+    parser.add_argument("--oracle", choices=["driver", "semantic"], default="driver", help="Testbench style: driver (stimulus-only, cosim is the equivalence oracle; default) or semantic (opt-in heuristic self-checks)")
     parser.add_argument("--stop-on-fail", action="store_true", help="Stop at the first failing Vitis record")
     args = finalize_args(parser, parser.parse_args())
 
