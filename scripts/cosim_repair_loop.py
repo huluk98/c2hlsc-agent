@@ -7,14 +7,20 @@ For each selected record:
      (default 300s = 5 min). CoSim passing == the synthesized RTL is functionally
      equivalent to the HLS-C under the deterministic testbench.
   2. If a phase fails or times out, read the earliest failing Vitis log and ask
-     Anthropic Opus 4.8 to regenerate the HLS-C from the original NL spec + the
-     failing source + the error evidence.
+     Opus 4.8 to regenerate the HLS-C from the original NL spec + the failing source
+     + the error evidence.
   3. Rewrite dut.cpp with the repaired code and rerun the cosim ladder to re-check
      functional equivalence. Repeat up to --max-iterations.
 
-Requires on the run host: vitis_hls (VITIS_HLS_BIN or on PATH), the `anthropic`
-package, and ANTHROPIC_API_KEY. Repaired sources are written to
-<out-dir>/repaired_corpus.jsonl; per-record outcomes to <out-dir>/results.jsonl.
+Repair backend (--repairer):
+  - claude-cli (default): use Claude Code via the `claude` CLI (subscription auth, no
+    API key). Set --claude-cmd "ssh you@your-mac claude" to drive Claude Code on a
+    remote Mac from the Vitis server.
+  - anthropic: use the Anthropic API (needs the `anthropic` package + ANTHROPIC_API_KEY).
+
+Requires on the run host: vitis_hls (VITIS_HLS_BIN or on PATH) and a reachable repair
+backend. Repaired sources are written to <out-dir>/repaired_corpus.jsonl; per-record
+outcomes to <out-dir>/results.jsonl.
 """
 
 from __future__ import annotations
@@ -22,9 +28,11 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import shlex
+import subprocess
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 # scripts/ is sys.path[0] when run as a file (sibling imports); add repo root for c2hlsc_agent.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -44,7 +52,32 @@ from run_hls_nl_vitis_batch import (  # noqa: E402
     resolve_vitis_hls,
     run_design,
 )
-from c2hlsc_agent.llm import AnthropicLLMClient, DEFAULT_ANTHROPIC_MODEL, extract_code_blocks  # noqa: E402
+from c2hlsc_agent.llm import extract_code_blocks  # noqa: E402
+
+Completer = Callable[[str, str], str]  # (system, user) -> raw model text
+
+
+def make_completer(args: argparse.Namespace) -> Completer:
+    """Build the repair backend: Claude Code (the `claude` CLI) or the Anthropic API."""
+    if args.repairer == "anthropic":
+        # Billed API path. Requires the `anthropic` package and ANTHROPIC_API_KEY.
+        from c2hlsc_agent.llm import AnthropicLLMClient
+        client = AnthropicLLMClient(model=args.model)
+        return lambda system, user: client.complete(system, user, max_tokens=6000)
+
+    # Claude Code path (subscription auth, no API key). `claude -p` reads the prompt and
+    # prints the answer. Set --claude-cmd "ssh you@mac claude" to drive Claude Code on a
+    # remote Mac from the Vitis server.
+    base = shlex.split(args.claude_cmd) + ["-p", "--model", args.claude_model]
+
+    def complete(system: str, user: str) -> str:
+        prompt = f"{system}\n\n{user}"
+        proc = subprocess.run(base, input=prompt, text=True, capture_output=True, timeout=args.repair_timeout)
+        if proc.returncode != 0:
+            raise RuntimeError(f"claude CLI failed (rc={proc.returncode}): {proc.stderr[-800:]}")
+        return proc.stdout
+
+    return complete
 
 
 REPAIR_SYSTEM = (
@@ -91,14 +124,14 @@ def failing_evidence(design_dir: Path, result: dict[str, Any]) -> str:
     return str(result.get("vitis_log_tail", ""))
 
 
-def repair(client: AnthropicLLMClient, record: dict[str, Any], hls_cpp: str, stage: str, evidence: str) -> str | None:
+def repair(complete: Completer, record: dict[str, Any], hls_cpp: str, stage: str, evidence: str) -> str | None:
     user = (
         f"Design spec:\n{record.get('HLS_instruction', '')}\n\n"
         f"Current implementation that FAILED Vitis '{stage}':\n```cpp\n{hls_cpp}\n```\n\n"
         f"Vitis {stage} error log (tail):\n{evidence}\n\n"
         "Return the corrected COMPLETE source in one ```cpp block."
     )
-    resp = client.complete(REPAIR_SYSTEM, user, max_tokens=6000)
+    resp = complete(REPAIR_SYSTEM, user)
     return pick_code(resp, record.get("top_function", ""))
 
 
@@ -131,18 +164,31 @@ def main() -> int:
     p.add_argument("--limit", type=int)
     p.add_argument("--part", default="xczu7ev-ffvc1156-2-e")
     p.add_argument("--clock", default="10")
-    p.add_argument("--model", default=DEFAULT_ANTHROPIC_MODEL)
     p.add_argument("--log-tail-lines", type=int, default=160)
+    # Repair backend.
+    p.add_argument("--repairer", choices=["claude-cli", "anthropic"], default="claude-cli",
+                   help="claude-cli: repair via Claude Code (the `claude` CLI, subscription auth, no API key; default). "
+                        "anthropic: repair via the Anthropic API (needs the `anthropic` package + ANTHROPIC_API_KEY).")
+    p.add_argument("--claude-cmd", default="claude",
+                   help="Base command for the claude-cli backend. Use e.g. \"ssh you@your-mac claude\" to drive "
+                        "Claude Code on a remote Mac from the Vitis server.")
+    p.add_argument("--claude-model", default="opus", help="Model passed to `claude --model` (default opus; pin with claude-opus-4-8)")
+    p.add_argument("--repair-timeout", type=int, default=900, help="Timeout (s) for one Claude repair call")
+    p.add_argument("--model", default="claude-opus-4-8", help="Model id for the anthropic backend")
     args = p.parse_args()
 
     vitis_hls = resolve_vitis_hls(None, generate_only=False)
-    client = AnthropicLLMClient(model=args.model)
+    complete = make_completer(args)
     args.out_dir.mkdir(parents=True, exist_ok=True)
     results_path = args.out_dir / "results.jsonl"
     repaired_path = args.out_dir / "repaired_corpus.jsonl"
     rf = results_path.open("w", encoding="utf-8")
     cf = repaired_path.open("w", encoding="utf-8")
 
+    repairer_label = (
+        f"Claude Code ({args.claude_cmd} --model {args.claude_model})"
+        if args.repairer == "claude-cli" else f"Anthropic API ({args.model})"
+    )
     targets = select(load_records(args.input), args)
     n_pass = n_fail = n_repaired = 0
     for record_id, record in targets:
@@ -166,13 +212,13 @@ def main() -> int:
                 break
             stage = result.get("failed_phase", "cosim")
             evidence = failing_evidence(Path(row["path"]), result)
-            new_code = repair(client, record, hls_cpp, stage, evidence)
+            new_code = repair(complete, record, hls_cpp, stage, evidence)
             if not new_code or new_code.strip() == hls_cpp.strip():
                 outcome["iterations"][-1]["repair"] = "no_change"
                 break
             hls_cpp = new_code
             outcome["repaired"] = True
-            print(f"[{record_id}] repaired with {args.model} after '{stage}' failure; re-running cosim", flush=True)
+            print(f"[{record_id}] repaired via {repairer_label} after '{stage}' failure; re-running cosim", flush=True)
 
         outcome["status"] = status
         if status == "pass":

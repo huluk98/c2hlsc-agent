@@ -729,3 +729,29 @@ VITIS_HLS_BIN=/path/to/vitis_hls python scripts/run_hls_nl_vitis_batch.py \
 `--generate-only` produces 10,003 projects with 0 skips; "cosim-ready" means each
 design parses and yields a project, not that CoSim has been run — that is the
 `--run-full-cosim` step on real Vitis.
+
+### Closed-loop cosim + Opus-4.8 repair
+
+`scripts/cosim_repair_loop.py` runs the cosim ladder per record with a per-phase
+timeout (default 300s = 5 min); on a failing/timed-out phase it feeds the earliest
+Vitis log + the NL spec to **Opus 4.8**, rewrites `dut.cpp`, and reruns cosim to
+re-check C<->RTL equivalence (up to `--max-iterations`).
+
+The repair backend is selectable. By default it uses **Claude Code** (the `claude`
+CLI, subscription auth — no API key); set `--claude-cmd` to call Claude Code on a
+remote Mac from the Vitis server:
+
+```bash
+# On the Vitis (Linux) server; repair calls back to your Mac's Claude Code over SSH:
+VITIS_HLS_BIN=/opt/Xilinx/Vitis_HLS/2023.2/bin/vitis_hls \
+python3 scripts/cosim_repair_loop.py \
+  --input data/hls_nl/hls_nl_claude_generated.jsonl \
+  --out-dir runs/cosim_repair --timeout-seconds 300 --max-iterations 2 \
+  --repairer claude-cli --claude-cmd "ssh you@your-mac claude" --claude-model opus
+```
+
+Use `--repairer anthropic` (with the `anthropic` package + `ANTHROPIC_API_KEY`) to
+repair via the billed Anthropic API instead. Scope a run with `--limit`, repeated
+`--record-id`, or `--only-failing <vitis_batch_results.jsonl>` (the non-pass rows
+from a prior `run_hls_nl_vitis_triage.sh` sweep). Outputs `results.jsonl` (per-record
+outcome) and `repaired_corpus.jsonl` (fixed sources).
