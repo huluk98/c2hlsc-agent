@@ -41,7 +41,6 @@ from generate_hls_nl_testbenches import (  # noqa: E402
     extract_function,
     load_records,
     record_id_for,
-    record_source_file,
     write_design,
 )
 from run_hls_nl_vitis_batch import (  # noqa: E402

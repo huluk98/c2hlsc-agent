@@ -28,7 +28,6 @@ class AgentConfig:
     clock: float = 10.0
     interface_mode: str = "default"
     allow_pragmas: bool = True
-    allow_performance_pragmas: bool = False
     cosim_tool: str | None = None
     rtl: str = "verilog"
     seed: int = 1
@@ -174,7 +173,10 @@ def load_config(path: Path | None) -> AgentConfig:
         clock=float(data.get("clock", data.get("clock_period", 10.0))),
         interface_mode=str(data.get("interface_mode", "default")),
         allow_pragmas=bool(data.get("allow_pragmas", True)),
-        allow_performance_pragmas=bool(data.get("allow_performance_pragmas", False)),
+        max_iterations=int(data.get("max_iterations", 1)),
+        auto_repair=bool(data.get("auto_repair", False)),
+        keep_going=bool(data.get("keep_going", False)),
+        run_vitis=bool(data.get("run_vitis", False)),
         seed=int(data.get("seed", 1)),
         use_llm=bool(data.get("use_llm", False)),
         llm_backend=str(data.get("llm_backend", "auto")),
@@ -204,7 +206,8 @@ def merge_cli_config(config: AgentConfig, args: Any) -> AgentConfig:
         config.max_iterations = int(args.max_iterations)
     if getattr(args, "auto_repair", False):
         config.auto_repair = True
-    config.keep_going = bool(getattr(args, "keep_going", False))
+    if getattr(args, "keep_going", False):
+        config.keep_going = True
     if getattr(args, "run_vitis", False):
         config.run_vitis = True
     if getattr(args, "no_run_vitis", False):

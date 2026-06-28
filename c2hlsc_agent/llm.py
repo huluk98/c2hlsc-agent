@@ -68,13 +68,17 @@ class AnthropicLLMClient:
             "system": system,
             "messages": [{"role": "user", "content": user}],
         }
+        bad_request = getattr(self._anthropic, "BadRequestError", None)
+        retry_errors: tuple[type[BaseException], ...] = (
+            (TypeError,) if bad_request is None else (TypeError, bad_request)
+        )
         try:
             response = self._client.messages.create(
                 **base,
                 thinking={"type": "adaptive"},
                 output_config={"effort": "high"},
             )
-        except (TypeError, getattr(self._anthropic, "BadRequestError", Exception)):
+        except retry_errors:
             # Older SDK (unknown kwargs -> TypeError) or a model that rejects the
             # adaptive-thinking / effort surface (-> BadRequestError). Retry plain.
             response = self._client.messages.create(**base)

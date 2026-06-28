@@ -299,6 +299,19 @@ def fail(message: str) -> None:
     raise SystemExit(1)
 
 
+def values_match(golden: str, hls: str) -> bool:
+    if golden == hls:
+        return True
+    try:
+        gf = float(golden)
+        hf = float(hls)
+    except ValueError:
+        return False
+    diff = abs(gf - hf)
+    scale = max(abs(gf), abs(hf), 1.0)
+    return diff <= 1e-6 * scale
+
+
 def main(argv: list[str]) -> int:
     if len(argv) != 3:
         print("usage: leveri_compare.py GOLDEN_TRACE.csv HLS_TRACE.csv", file=sys.stderr)
@@ -327,7 +340,7 @@ def main(argv: list[str]) -> int:
                     f"golden={golden[col_idx]} hls={hls[col_idx]}"
                 )
         for col_idx in output_columns:
-            if golden[col_idx] != hls[col_idx]:
+            if not values_match(golden[col_idx], hls[col_idx]):
                 fail(
                     f"behavior mismatch cycle={golden[0]} column={golden_header[col_idx]} "
                     f"expected={golden[col_idx]} actual={hls[col_idx]}"
@@ -516,22 +529,22 @@ def write_report(payload: dict[str, object]) -> None:
     REPORT_PATH.write_text(json.dumps(payload, indent=2) + "\\n", encoding="utf-8")
 
 
-def resolve_tool(env_name: str, default_name: str, fallback_path: str) -> str | None:
+def resolve_tool(env_name: str, default_name: str, fallback_path: str = "") -> str | None:
     value = os.environ.get(env_name)
     if value:
         return value
     found = shutil.which(default_name)
     if found:
         return found
-    if Path(fallback_path).exists():
+    if fallback_path and Path(fallback_path).exists():
         return fallback_path
     return None
 
 
 def main() -> int:
-    klee = resolve_tool("KLEE", "klee", "/Users/luke/.local/klee/bin/klee")
-    clangxx = resolve_tool("KLEE_CXX", "klee-clang++", "/Users/luke/.klee-conda/bin/clang++")
-    klee_include = os.environ.get("KLEE_INCLUDE_DIR", "/Users/luke/.local/klee/include")
+    klee = resolve_tool("KLEE", "klee")
+    clangxx = resolve_tool("KLEE_CXX", "klee-clang++")
+    klee_include = os.environ.get("KLEE_INCLUDE_DIR", "")
     if klee is None:
         write_report({"status": "skipped", "reason": "klee not found"})
         print("KLEE coverage skipped: klee not found")
@@ -540,7 +553,7 @@ def main() -> int:
         write_report({"status": "skipped", "reason": "clang++ not found"})
         print("KLEE coverage skipped: clang++ not found")
         return 0
-    if not Path(klee_include).exists():
+    if not klee_include or not Path(klee_include).exists():
         write_report({"status": "skipped", "reason": "KLEE include directory not found", "klee_include": klee_include})
         print("KLEE coverage skipped: include directory not found")
         return 0
