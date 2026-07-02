@@ -1,4 +1,4 @@
-# Runtime Python requirements for c2hlsc-agent on Python 3.11.
+# Runtime Python requirements for c2hlsc-agent (Python 3.9+).
 #
 # The core agent is intentionally standard-library heavy. PyYAML is the only
 # recommended runtime package so config files can use full YAML syntax instead

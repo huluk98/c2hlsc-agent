@@ -44,6 +44,59 @@ class AnalyzeTests(unittest.TestCase):
         self.assertEqual(directions["a"], "input")
         self.assertEqual(directions["out"], "output")
 
+    def test_pointer_direction_not_fooled_by_equality_comparison(self):
+        # Regression: an array used only in an `==` comparison must stay an input.
+        # Previously the write-detection regex matched the first `=` of `==`.
+        path = self._write(
+            """
+            void cmp(const int a[8], const int b[8], int out[8]) {
+              for (int i = 0; i < 8; ++i) {
+                if (a[i] == b[i]) out[i] = 1; else out[i] = 0;
+              }
+            }
+            """
+        )
+        cfg = AgentConfig(
+            top="cmp",
+            arguments={
+                "a": ArgumentConfig(length=8),
+                "b": ArgumentConfig(length=8),
+                "out": ArgumentConfig(length=8),
+            },
+        )
+        result = analyze_source(path, "cmp", cfg)
+        directions = {arg.name: arg.direction for arg in result.function.args}
+        self.assertEqual(directions["a"], "input")
+        self.assertEqual(directions["b"], "input")
+        self.assertEqual(directions["out"], "output")
+
+    def test_restrict_qualifier_is_stripped_from_type(self):
+        # Regression: the C `restrict` keyword must not leak into the C++ type,
+        # which would produce invalid declarations in the generated testbench.
+        path = self._write(
+            """
+            void scale(const int *restrict src, int *restrict dst, int n) {
+              for (int i = 0; i < n; ++i) dst[i] = src[i] * 2;
+            }
+            """
+        )
+        cfg = AgentConfig(
+            top="scale",
+            arguments={"src": ArgumentConfig(length=8), "dst": ArgumentConfig(length=8)},
+        )
+        result = analyze_source(path, "scale", cfg)
+        types = {arg.name: arg.c_type for arg in result.function.args}
+        self.assertNotIn("restrict", types["src"])
+        self.assertNotIn("restrict", types["dst"])
+        self.assertEqual(types["src"], "const int")
+        self.assertEqual(types["dst"], "int")
+        # The generated signature/definition are built from arg.raw, so it must be
+        # sanitized too — otherwise the emitted hls_top.hpp/.cpp are invalid C++.
+        raws = {arg.name: arg.raw for arg in result.function.args}
+        self.assertNotIn("restrict", raws["src"])
+        self.assertNotIn("restrict", raws["dst"])
+        self.assertNotIn("restrict", result.function.signature)
+
     def test_unsupported_construct_diagnostics(self):
         path = self._write(
             """

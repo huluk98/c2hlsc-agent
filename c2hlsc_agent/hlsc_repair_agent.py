@@ -4,6 +4,7 @@ import difflib
 import hashlib
 import json
 import re
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -201,7 +202,12 @@ def _llm_repair(
     try:
         response = llm.complete(system, user)
         new_text = extract_full_file(response, must_contain=f"{top}(")
-    except Exception:
+    except Exception as exc:
+        print(
+            f"c2hlsc repair: LLM patch attempt failed ({type(exc).__name__}: {exc}); "
+            "keeping the deterministic result.",
+            file=sys.stderr,
+        )
         return []
     if not new_text or new_text.strip() == current.strip():
         return []

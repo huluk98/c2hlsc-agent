@@ -69,7 +69,42 @@ def run_vitis(project_dir: Path, run_requested: bool) -> dict[str, PhaseResult]:
         phases["cosim"] = run_command(["vitis_hls", "-f", "run_cosim.tcl"], project_dir, "cosim", timeout=600)
     except subprocess.TimeoutExpired as exc:
         phases["cosim"] = PhaseResult("cosim", "fail", summary=f"Vitis CoSim timed out: {exc}")
+    else:
+        phases["cosim"] = _gate_cosim_on_log(phases["cosim"])
     return phases
+
+
+_COSIM_FAILURE_MARKERS = (
+    "co-simulation finished: fail",
+    "cosim design failed",
+    "co-simulation failed",
+    "aborting cosim",
+)
+
+
+def _gate_cosim_on_log(result: PhaseResult) -> PhaseResult:
+    """Vitis can exit 0 while the CoSim log reports a mismatch. Downgrade pass->fail when
+    the log carries an explicit co-simulation failure marker, so a zero exit code cannot
+    silently defeat the C/RTL equivalence gate."""
+    if result.status != "pass":
+        return result
+    haystack = f"{result.stdout}\n{result.stderr}".lower()
+    if result.log_path and result.log_path.exists():
+        try:
+            haystack += "\n" + result.log_path.read_text(encoding="utf-8", errors="replace").lower()
+        except OSError:
+            pass
+    if any(marker in haystack for marker in _COSIM_FAILURE_MARKERS):
+        return PhaseResult(
+            result.name,
+            "fail",
+            result.returncode,
+            result.stdout,
+            result.stderr,
+            result.log_path,
+            summary="Vitis exited 0 but the CoSim log reports a co-simulation failure",
+        )
+    return result
 
 
 def verify_project(project_dir: Path, run_vitis_requested: bool, verbose: bool = False) -> VerificationState:

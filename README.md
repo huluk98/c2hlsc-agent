@@ -332,17 +332,11 @@ with a `skipped` report so the generated project remains portable.
 
 ## Install
 
-From this repository:
+From the repository root:
 
 ```bash
-python3 -m pip install -e c2hlsc_agent
-```
-
-Or, from the standalone GitHub repo root:
-
-```bash
-python3.11 -m pip install -r requirements.txt
-python3.11 -m pip install -e .
+python3 -m pip install -r requirements.txt
+python3 -m pip install -e .
 ```
 
 No commercial parser is required. The analyzer uses a robust regex fallback. Optional
@@ -529,7 +523,7 @@ Vitis execution is opt-in:
 
 ```bash
 python -m c2hlsc_agent.cli convert \
-  --config c2hlsc_agent/examples/vector_add/config.yaml \
+  --config examples/vector_add/config.yaml \
   --out build/vector_add \
   --run-vitis
 ```
@@ -568,7 +562,6 @@ num_tests: 100
 seed: 1
 interface_mode: ap_memory
 allow_pragmas: true
-allow_performance_pragmas: false
 arguments:
   a:
     direction: input
@@ -594,7 +587,10 @@ For each conversion, the output directory contains:
 - `src/hls_top.hpp`
 - `src/hls_top.cpp`
 - `tb/testbench.cpp`
-- `run_hls.tcl`
+- `tb/leveri_golden_tb.cpp`, `tb/leveri_hls_tb.cpp`, `tb/leveri_compare.py`,
+  `tb/run_gcov.py`, `tb/klee_driver.cpp`, `tb/run_klee.py`, `tb/leveri_manifest.json`
+  (the HLS-LeVeri shift-left verification bundle)
+- `run_hls.tcl` plus the split `run_csim.tcl`, `run_csynth.tcl`, `run_cosim.tcl`
 - `Makefile`
 - `run_all.sh`
 - `conversion_report.md`
@@ -659,7 +655,7 @@ This first implementation is intentionally conservative:
 - Unsupported constructs such as dynamic allocation, recursion, non-deterministic or
   runtime-only standard library calls, file I/O in the top, variable-length arrays, and
   unsafe pointer arithmetic are reported instead of silently converted.
-- Performance pragmas are not added unless configured and explained in the report.
+- The deterministic generator never adds performance pragmas (pipeline/unroll/dataflow/array_partition); only the optional LLM path may introduce them, and it explains them in its report.
 
 Poor HLS performance is reported but is not considered a functional failure.
 
@@ -667,17 +663,17 @@ Poor HLS performance is reported but is not considered a functional failure.
 
 ```bash
 python -m c2hlsc_agent.cli convert \
-  --config c2hlsc_agent/examples/vector_add/config.yaml \
+  --config examples/vector_add/config.yaml \
   --out /tmp/c2hlsc_vector_add \
   --no-run-vitis
 
 python -m c2hlsc_agent.cli convert \
-  --config c2hlsc_agent/examples/simple_fir/config.yaml \
+  --config examples/simple_fir/config.yaml \
   --out /tmp/c2hlsc_fir \
   --no-run-vitis
 
 python -m c2hlsc_agent.cli convert \
-  --config c2hlsc_agent/examples/bit_ops/config.yaml \
+  --config examples/bit_ops/config.yaml \
   --out /tmp/c2hlsc_bit_ops \
   --no-run-vitis
 ```

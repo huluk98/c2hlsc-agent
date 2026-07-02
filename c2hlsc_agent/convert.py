@@ -105,6 +105,7 @@ def generate_hls_sources(
         return conservative
 
     model = getattr(llm, "model", "?")
+    llm_error: str | None = None
     try:
         original_source = analysis.function.source_path.read_text(encoding="utf-8")
         response = llm.complete(
@@ -112,13 +113,15 @@ def generate_hls_sources(
             build_generator_user_prompt(analysis, original_source),
         )
         source = extract_hls_source(response, analysis.function.name, original_source)
-    except Exception:
+    except Exception as exc:
         source = None
+        llm_error = f"{type(exc).__name__}: {exc}"
 
     if not source:
+        reason = llm_error or "model returned no usable translation unit"
         conservative.transformations.append(
-            f"LLM HLS-C generation requested (model={model}) but unavailable or unparsable; "
-            "fell back to the conservative top-function copy."
+            f"LLM HLS-C generation requested (model={model}) but unavailable or unparsable "
+            f"[{reason}]; fell back to the conservative top-function copy."
         )
         return conservative
 

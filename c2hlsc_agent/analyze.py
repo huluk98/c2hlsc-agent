@@ -100,6 +100,10 @@ def _split_params(params: str) -> list[str]:
 
 def _parse_arg(raw: str, metadata: ArgumentConfig | None = None) -> FunctionArg:
     raw = raw.strip()
+    # `restrict` is a C99 keyword that is not valid C++. Drop it from the parameter text
+    # so the generated header/definition signatures (built from FunctionArg.raw) compile.
+    raw = re.sub(r"\b(?:restrict|__restrict|__restrict__)\b", "", raw)
+    raw = re.sub(r"\s+", " ", raw).strip()
     array_dims = re.findall(r"\[([^\]]*)\]", raw)
     raw_no_arrays = re.sub(r"\[[^\]]*\]", "", raw).strip()
     pointer_depth = raw_no_arrays.count("*")
@@ -107,7 +111,8 @@ def _parse_arg(raw: str, metadata: ArgumentConfig | None = None) -> FunctionArg:
     if not tokens:
         raise ValueError(f"cannot parse argument: {raw}")
     name = tokens[-1]
-    c_type = " ".join(tokens[:-1]).replace(" *", "").replace("*", "").strip()
+    type_tokens = [t for t in tokens[:-1] if t not in {"*", "restrict", "__restrict", "__restrict__"}]
+    c_type = " ".join(type_tokens).strip()
     c_type = re.sub(r"\s+", " ", c_type)
     is_const = "const" in c_type.split()
     if metadata is None:
@@ -165,7 +170,7 @@ def _infer_pointer_directions(function: FunctionInfo, config: AgentConfig) -> No
         if arg.name in config.arguments and config.arguments[arg.name].direction:
             continue
         name = re.escape(arg.name)
-        write_pattern = rf"(?:\*\s*{name}|{name}\s*\[[^\]]+\])\s*(?:=|\+=|-=|\*=|/=|%=|&=|\|=|\^=|<<=|>>=|\+\+|--)"
+        write_pattern = rf"(?:\*\s*{name}|{name}\s*\[[^\]]+\])\s*(?:=(?!=)|\+=|-=|\*=|/=|%=|&=|\|=|\^=|<<=|>>=|\+\+|--)"
         writes = bool(re.search(write_pattern, body))
         body_without_lhs_writes = re.sub(write_pattern, "", body)
         reads = bool(re.search(rf"(?:\*\s*{name}|{name}\s*\[[^\]]+\]|{name}\s*\+)", body_without_lhs_writes))

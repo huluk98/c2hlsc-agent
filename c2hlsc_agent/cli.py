@@ -51,7 +51,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     convert.add_argument("--llm-model", help="model id for --use-llm (default per backend)")
     convert.add_argument("--seed", type=int, help="random seed")
-    convert.add_argument("--max-iterations", type=int, default=1, help="max verification iterations; repaired reruns require --auto-repair")
+    convert.add_argument("--max-iterations", type=int, help="max verification iterations (default 1); repaired reruns require --auto-repair")
     convert.add_argument("--auto-repair", action="store_true", help="apply local mechanical repairs automatically between verification attempts")
     convert.add_argument("--keep-going", action="store_true", help="emit project even when static diagnostics contain errors")
     convert.add_argument("--verbose", action="store_true", help="print command output")
@@ -100,6 +100,7 @@ def run_convert(args: argparse.Namespace) -> int:
     iterations = max(1, config.max_iterations)
     state = None
     completed_iterations = 0
+    seen_signatures = {_project_signature(out_dir)}
     for iteration in range(iterations):
         completed_iterations = iteration + 1
         state = verify_project(out_dir, config.run_vitis, verbose=args.verbose)
@@ -118,12 +119,29 @@ def run_convert(args: argparse.Namespace) -> int:
             print(f"Repair iteration {completed_iterations}: {repair.summary}")
         if not repair.changed:
             break
+        signature = _project_signature(out_dir)
+        if signature in seen_signatures:
+            if args.verbose:
+                print("Repair reproduced a previously seen project state; stopping to avoid oscillation.")
+            break
+        seen_signatures.add(signature)
     assert state is not None
     write_reports(project, analysis, generated, config, state, completed_iterations, repair_history)
     status = final_status(state, config.run_vitis, analysis.diagnostics.has_errors)
     if args.verbose:
         print(f"Report: {out_dir / 'conversion_report.md'}")
     return 0 if status == "pass" else 1
+
+
+def _project_signature(project_dir: Path) -> str:
+    import hashlib
+
+    digest = hashlib.sha256()
+    for rel in ("src/hls_top.cpp", "src/hls_top.hpp"):
+        path = project_dir / rel
+        if path.exists():
+            digest.update(path.read_bytes())
+    return digest.hexdigest()
 
 
 def _load_project_top(project_dir: Path) -> str | None:
@@ -153,12 +171,15 @@ def _external_failure_state(stage: str, evidence: str, run_vitis: bool):
     phases = ["software_equivalence"]
     if run_vitis:
         phases.extend(["csim", "csynth", "cosim"])
+    if stage not in phases:
+        # Never silently drop the operator-declared failing stage.
+        phases.append(stage)
     for phase in phases:
         if phase == stage:
             state.add_phase(PhaseResult(phase, "fail", stdout=evidence, summary="external evidence supplied"))
             break
         state.add_phase(PhaseResult(phase, "pass", summary="assumed pass before external failing stage"))
-    for phase in phases[phases.index(stage) + 1 :] if stage in phases else []:
+    for phase in phases[phases.index(stage) + 1 :]:
         state.add_phase(PhaseResult(phase, "blocked", summary=f"{stage} failed"))
     return state
 
