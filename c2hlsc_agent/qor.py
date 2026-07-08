@@ -1,0 +1,337 @@
+"""QoR (Quality of Results) metrics: parsing, deltas, objective scoring, and reports.
+
+Sources, in priority order:
+
+- **Vitis csynth report** ``c2hlsc_project/solution1/syn/report/csynth.xml`` — latency,
+  initiation interval, resource use (BRAM/DSP/FF/LUT/URAM), and the estimated clock.
+  The remote-Vitis pull already brings this back to the local project.
+- **Local PPA flow** (optional) — yosys ``stat`` area report and an OpenSTA timing/power
+  report, as produced by the ``syn/run_ppa.sh`` recipe (Nangate45). Parsed when present
+  so the QoR report can carry ASIC-style area/slack/power next to the FPGA estimates.
+
+The renderers emit the delta table three ways: JSON (machines), Markdown (humans), and a
+booktabs LaTeX table (papers).
+"""
+
+from __future__ import annotations
+
+import re
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass, field
+from pathlib import Path
+
+CSYNTH_XML_RELPATH = Path("c2hlsc_project/solution1/syn/report/csynth.xml")
+
+# Rough single-number FPGA area proxy: DSP and BRAM are scarce relative to LUT/FF.
+_AREA_WEIGHTS = {"lut": 1.0, "ff": 0.5, "dsp": 100.0, "bram": 100.0, "uram": 300.0}
+
+
+@dataclass
+class QoRMetrics:
+    """One design point. All fields optional so partial reports still compare."""
+
+    target_clock_ns: float | None = None
+    estimated_clock_ns: float | None = None
+    latency_best: int | None = None
+    latency_worst: int | None = None
+    interval_min: int | None = None
+    interval_max: int | None = None
+    bram: int | None = None
+    dsp: int | None = None
+    ff: int | None = None
+    lut: int | None = None
+    uram: int | None = None
+    available: dict[str, int] = field(default_factory=dict)
+    # optional local ASIC-style PPA (yosys + OpenSTA)
+    yosys_cells: int | None = None
+    yosys_area_um2: float | None = None
+    sta_worst_slack_max_ns: float | None = None
+    sta_worst_slack_min_ns: float | None = None
+    sta_total_power_w: float | None = None
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "target_clock_ns": self.target_clock_ns,
+            "estimated_clock_ns": self.estimated_clock_ns,
+            "latency_best": self.latency_best,
+            "latency_worst": self.latency_worst,
+            "interval_min": self.interval_min,
+            "interval_max": self.interval_max,
+            "bram": self.bram,
+            "dsp": self.dsp,
+            "ff": self.ff,
+            "lut": self.lut,
+            "uram": self.uram,
+            "available": dict(self.available),
+            "yosys_cells": self.yosys_cells,
+            "yosys_area_um2": self.yosys_area_um2,
+            "sta_worst_slack_max_ns": self.sta_worst_slack_max_ns,
+            "sta_worst_slack_min_ns": self.sta_worst_slack_min_ns,
+            "sta_total_power_w": self.sta_total_power_w,
+        }
+
+    @property
+    def area_proxy(self) -> float | None:
+        parts = []
+        for name, weight in _AREA_WEIGHTS.items():
+            value = getattr(self, name)
+            if value is not None:
+                parts.append(weight * value)
+        return sum(parts) if parts else None
+
+    @property
+    def timing_met(self) -> bool | None:
+        if self.estimated_clock_ns is None or self.target_clock_ns is None:
+            return None
+        return self.estimated_clock_ns <= self.target_clock_ns
+
+
+def find_csynth_xml(project_dir: Path) -> Path | None:
+    path = project_dir / CSYNTH_XML_RELPATH
+    if path.exists():
+        return path
+    # Vitis layouts can vary slightly; fall back to a bounded search.
+    hits = sorted((project_dir / "c2hlsc_project").glob("*/syn/report/csynth.xml"))
+    return hits[0] if hits else None
+
+
+def _xml_text(root: ET.Element, *paths: str) -> str | None:
+    for path in paths:
+        node = root.find(path)
+        if node is not None and node.text and node.text.strip():
+            return node.text.strip()
+    return None
+
+
+def _to_int(text: str | None) -> int | None:
+    try:
+        return int(float(text)) if text is not None else None
+    except ValueError:
+        return None
+
+
+def _to_float(text: str | None) -> float | None:
+    try:
+        return float(text) if text is not None else None
+    except ValueError:
+        return None
+
+
+def parse_csynth_xml(path: Path) -> QoRMetrics:
+    """Parse a Vitis HLS ``csynth.xml`` synthesis report into :class:`QoRMetrics`.
+
+    Raises ``RuntimeError`` (not ``xml.etree`` internals) on a malformed report so
+    callers can degrade gracefully instead of crashing mid-optimization.
+    """
+
+    try:
+        root = ET.fromstring(path.read_text(encoding="utf-8", errors="replace"))
+    except ET.ParseError as exc:
+        raise RuntimeError(f"malformed Vitis synthesis report {path}: {exc}") from exc
+    perf = "PerformanceEstimates"
+    metrics = QoRMetrics(
+        target_clock_ns=_to_float(_xml_text(root, f"{perf}/SummaryOfTimingAnalysis/TargetClockPeriod")),
+        estimated_clock_ns=_to_float(_xml_text(root, f"{perf}/SummaryOfTimingAnalysis/EstimatedClockPeriod")),
+        latency_best=_to_int(_xml_text(root, f"{perf}/SummaryOfOverallLatency/Best-caseLatency")),
+        latency_worst=_to_int(_xml_text(root, f"{perf}/SummaryOfOverallLatency/Worst-caseLatency")),
+        interval_min=_to_int(_xml_text(root, f"{perf}/SummaryOfOverallLatency/Interval-min")),
+        interval_max=_to_int(_xml_text(root, f"{perf}/SummaryOfOverallLatency/Interval-max")),
+    )
+    resources = root.find("AreaEstimates/Resources")
+    if resources is not None:
+        metrics.bram = _to_int(_xml_text(resources, "BRAM_18K"))
+        metrics.dsp = _to_int(_xml_text(resources, "DSP", "DSP48E"))
+        metrics.ff = _to_int(_xml_text(resources, "FF"))
+        metrics.lut = _to_int(_xml_text(resources, "LUT"))
+        metrics.uram = _to_int(_xml_text(resources, "URAM"))
+    available = root.find("AreaEstimates/AvailableResources")
+    if available is not None:
+        for child in available:
+            value = _to_int(child.text)
+            if value is not None:
+                metrics.available[child.tag] = value
+    return metrics
+
+
+def parse_yosys_area(path: Path, metrics: QoRMetrics | None = None) -> QoRMetrics:
+    """Parse a yosys ``stat`` area report (chip area + cell count) into ``metrics``."""
+
+    metrics = metrics or QoRMetrics()
+    text = path.read_text(encoding="utf-8", errors="replace")
+    area = re.search(r"Chip area for (?:top )?module '[^']*':\s*([0-9.]+)", text)
+    if area:
+        metrics.yosys_area_um2 = float(area.group(1))
+    # Classic format ("Number of cells: N") and the modern column-table total row
+    # ("     759  958.398 cells"), as emitted by yosys 0.6x `stat`.
+    cells = re.search(r"Number of cells:\s*(\d+)", text)
+    if cells is None:
+        cells = re.search(r"^\s*(\d+)\s+[0-9.]+\s+cells\s*$", text, re.M)
+    if cells:
+        metrics.yosys_cells = int(cells.group(1))
+    return metrics
+
+
+def parse_sta_report(path: Path, metrics: QoRMetrics | None = None) -> QoRMetrics:
+    """Parse an OpenSTA report (worst slack + total power) into ``metrics``."""
+
+    metrics = metrics or QoRMetrics()
+    text = path.read_text(encoding="utf-8", errors="replace")
+    slack_max = re.search(r"worst slack max\s+(-?[0-9.]+)", text)
+    if slack_max:
+        metrics.sta_worst_slack_max_ns = float(slack_max.group(1))
+    slack_min = re.search(r"worst slack min\s+(-?[0-9.]+)", text)
+    if slack_min:
+        metrics.sta_worst_slack_min_ns = float(slack_min.group(1))
+    # report_power table: the Total row's Total-power column (watts, sci notation).
+    # Deliberately NO free-text fallback: a bare "power 1nW" line in OpenSTA output is
+    # the report_units declaration (a unit, not a measurement) and must not be parsed.
+    total_row = re.search(r"^Total\s+.*?([0-9.]+e[+-]?\d+)\s+100\.?\d*%", text, re.M)
+    if total_row:
+        metrics.sta_total_power_w = float(total_row.group(1))
+    return metrics
+
+
+def collect_local_ppa(project_dir: Path, metrics: QoRMetrics) -> QoRMetrics:
+    """Best-effort enrichment from the local yosys/OpenSTA flow, when its reports exist."""
+
+    yosys_rpt = project_dir / "syn" / "yosys_area.rpt"
+    if yosys_rpt.exists():
+        parse_yosys_area(yosys_rpt, metrics)
+    sta_rpt = project_dir / "syn" / "sta_report.txt"
+    if sta_rpt.exists():
+        parse_sta_report(sta_rpt, metrics)
+    return metrics
+
+
+# --------------------------------------------------------------------------- #
+# Deltas and objective scoring
+# --------------------------------------------------------------------------- #
+
+_DELTA_FIELDS = (
+    "latency_worst",
+    "latency_best",
+    "interval_max",
+    "interval_min",
+    "estimated_clock_ns",
+    "lut",
+    "ff",
+    "dsp",
+    "bram",
+    "uram",
+    "yosys_area_um2",
+    "sta_worst_slack_max_ns",
+    "sta_total_power_w",
+)
+
+
+def qor_delta(baseline: QoRMetrics, candidate: QoRMetrics) -> dict[str, dict[str, object]]:
+    """Per-metric ``{baseline, candidate, delta, pct}`` for every comparable field."""
+
+    delta: dict[str, dict[str, object]] = {}
+    for name in _DELTA_FIELDS:
+        base = getattr(baseline, name)
+        cand = getattr(candidate, name)
+        if base is None or cand is None:
+            continue
+        diff = cand - base
+        pct = (diff / base * 100.0) if base else None
+        delta[name] = {"baseline": base, "candidate": cand, "delta": diff, "pct": pct}
+    return delta
+
+
+OBJECTIVES = ("latency", "area", "balanced")
+
+
+def objective_score(metrics: QoRMetrics, objective: str, baseline: QoRMetrics | None = None) -> float | None:
+    """Scalar score, LOWER is better. ``None`` when the needed metrics are missing.
+
+    - ``latency``: worst-case latency (fallback: max initiation interval).
+    - ``area``: weighted FPGA resource proxy (LUT + FF/2 + 100*DSP + 100*BRAM + 300*URAM).
+    - ``balanced``: geometric-mean-style product of latency and area ratios vs the
+      baseline (requires a baseline; equals 1.0 for the baseline itself).
+    """
+
+    if objective == "latency":
+        value = metrics.latency_worst if metrics.latency_worst is not None else metrics.interval_max
+        return float(value) if value is not None else None
+    if objective == "area":
+        return metrics.area_proxy
+    if objective == "balanced":
+        if baseline is None:
+            return 1.0
+        lat = objective_score(metrics, "latency")
+        base_lat = objective_score(baseline, "latency")
+        area = metrics.area_proxy
+        base_area = baseline.area_proxy
+        if None in (lat, base_lat, area, base_area) or 0 in (base_lat, base_area):
+            return None
+        return (lat / base_lat) * (area / base_area)
+    raise ValueError(f"unknown objective {objective!r} (expected one of {OBJECTIVES})")
+
+
+# --------------------------------------------------------------------------- #
+# Report rendering
+# --------------------------------------------------------------------------- #
+
+_ROW_LABELS = {
+    "latency_worst": ("Latency (worst, cycles)", "{:d}"),
+    "latency_best": ("Latency (best, cycles)", "{:d}"),
+    "interval_max": ("Initiation interval (max)", "{:d}"),
+    "estimated_clock_ns": ("Estimated clock (ns)", "{:.2f}"),
+    "lut": ("LUT", "{:d}"),
+    "ff": ("FF", "{:d}"),
+    "dsp": ("DSP", "{:d}"),
+    "bram": ("BRAM\\_18K", "{:d}"),
+    "uram": ("URAM", "{:d}"),
+    "yosys_area_um2": ("Std-cell area ($\\mu m^2$)", "{:.1f}"),
+    "sta_worst_slack_max_ns": ("Worst setup slack (ns)", "{:.2f}"),
+    "sta_total_power_w": ("Total power (W)", "{:.3e}"),
+}
+
+
+def _fmt(fmt: str, value: object) -> str:
+    if value is None:
+        return "--"
+    if fmt == "{:d}":
+        return f"{int(value)}"
+    return fmt.format(value)
+
+
+def render_latex_table(delta: dict[str, dict[str, object]], caption: str, label: str = "tab:qor") -> str:
+    """A paper-ready booktabs baseline-vs-optimized QoR table."""
+
+    lines = [
+        "\\begin{table}[t]",
+        "  \\centering",
+        f"  \\caption{{{caption}}}",
+        f"  \\label{{{label}}}",
+        "  \\begin{tabular}{lrrr}",
+        "    \\toprule",
+        "    Metric & Baseline & Optimized & $\\Delta$ (\\%) \\\\",
+        "    \\midrule",
+    ]
+    for name, (row_label, fmt) in _ROW_LABELS.items():
+        if name not in delta:
+            continue
+        row = delta[name]
+        pct = row["pct"]
+        pct_text = "--" if pct is None else f"{pct:+.1f}"
+        lines.append(
+            f"    {row_label} & {_fmt(fmt, row['baseline'])} & {_fmt(fmt, row['candidate'])} & {pct_text} \\\\"
+        )
+    lines += ["    \\bottomrule", "  \\end{tabular}", "\\end{table}", ""]
+    return "\n".join(lines)
+
+
+def render_markdown(delta: dict[str, dict[str, object]], title: str) -> str:
+    lines = [f"# {title}", "", "| Metric | Baseline | Optimized | Delta (%) |", "|---|---|---|---|"]
+    for name, (row_label, fmt) in _ROW_LABELS.items():
+        if name not in delta:
+            continue
+        row = delta[name]
+        pct = row["pct"]
+        pct_text = "--" if pct is None else f"{pct:+.1f}"
+        plain_label = row_label.replace("\\_", "_").replace("$\\mu m^2$", "um^2")
+        lines.append(f"| {plain_label} | {_fmt(fmt, row['baseline'])} | {_fmt(fmt, row['candidate'])} | {pct_text} |")
+    lines.append("")
+    return "\n".join(lines)

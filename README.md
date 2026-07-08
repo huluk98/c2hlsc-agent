@@ -484,6 +484,38 @@ a `skipped` report and exits successfully, so a generated project stays runnable
 Vitis or a simulator installed. A PASS is bounded, stimulus-driven RTL evidence under the
 declared interface contract — it does not replace the full Vitis CoSim gate.
 
+## QoR Optimization (`optimize` — rtl_optimizer_agent)
+
+Once a project passes the full ladder, `optimize` improves its Quality of Results while
+keeping equivalence locked — the live implementation of the declared
+`rtl_optimizer_agent`:
+
+```bash
+python -m c2hlsc_agent.cli optimize --project build/vector_add \
+  --objective latency --iterations 4 \
+  --vitis-ssh luke@linux-box          # Vitis phases remote, everything else local
+```
+
+The loop: (1) baseline QoR is read from the project's Vitis synthesis report
+(`c2hlsc_project/solution1/syn/report/csynth.xml` — the remote pull brings it back), or
+one csim+csynth run establishes it; (2) candidates are proposed — a deterministic
+`PIPELINE II=1` on innermost loops, then LLM candidates grounded in the report, the
+objective, and the already-tried history; (3) each candidate is gated in an isolated
+scratch project under `<project>/.qor/`: local host equivalence first (seconds), then
+csim+csynth to score its own `csynth.xml`; timing-regressing candidates are excluded;
+(4) the best strictly-improving candidate is promoted and re-verified through the FULL
+ladder (host equivalence → CSim → CSynth → CoSim) before acceptance — on failure the
+original source is restored (kept at `src/hls_top.cpp.pre_qor` on success).
+
+Objectives: `latency` (worst-case cycles), `area` (weighted LUT/FF/DSP/BRAM/URAM proxy),
+`balanced` (latency×area product vs the baseline).
+
+Outputs, per run: `qor_report.json` (baseline, every candidate's metrics/status, delta),
+`qor_report.md`, and `qor_table.tex` — a booktabs baseline-vs-optimized table ready to
+`\input` into a paper. With `--ppa-script syn/run_ppa.sh` the local yosys/OpenSTA flow
+runs after acceptance and its std-cell area, worst slack, and total power join the
+report (ASIC-style PPA next to the FPGA estimates, as in `build/cnn_3x3`).
+
 ## Install
 
 From the repository root:

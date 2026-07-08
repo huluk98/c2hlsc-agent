@@ -464,6 +464,77 @@ Return the full corrected `{target_rel}` in one ```cpp block. Change as little a
     return REPAIR_SYSTEM_PROMPT, user
 
 
+QOR_OPTIMIZER_SYSTEM_PROMPT = """You are rtl_optimizer_agent in an equivalence-first C-to-HLS flow.
+
+The design already PASSES the full verification ladder (host equivalence -> CSim ->
+CSynth -> CoSim). Your job is post-equivalence QoR optimization ONLY: improve the given
+objective (latency / area / balanced) using the Vitis synthesis report as evidence,
+while preserving exact functional equivalence.
+
+Rules:
+- Keep the EXACT top-function signature; do not change observable outputs, argument
+  meanings, or declared array lengths. The golden-C testbench re-verifies every candidate.
+- Prefer pragma-level changes (PIPELINE, UNROLL, ARRAY_PARTITION, DATAFLOW, INLINE,
+  DEPENDENCE, LATENCY, BIND_STORAGE/BIND_OP) tied to a specific loop/array and the
+  specific bottleneck visible in the report. Small equivalence-preserving refactors
+  (loop interchange, local buffering) are allowed when a pragma alone cannot help.
+- Every pragma must be justified: add a short // comment on the line above each change
+  explaining the expected effect on the objective.
+- Respect the resource budget: do not exceed the available resources in the report, and
+  do not trade a small latency win for an estimated clock that misses the target period.
+- Do NOT repeat a strategy listed as already tried; propose a genuinely different point
+  in the design space.
+- Return the COMPLETE optimized translation unit in a single ```cpp fenced block (it must
+  #include "hls_top.hpp" and define the top function), and nothing else of substance.
+"""
+
+
+def build_qor_prompt(
+    analysis: AnalysisResult,
+    current_source: str,
+    metrics_text: str,
+    objective: str,
+    history: list[dict[str, object]] | None = None,
+    nl_spec: str | None = None,
+    attempt: int = 0,
+) -> tuple[str, str]:
+    """Prompt for one QoR-optimization candidate, grounded in the csynth report."""
+
+    fn = analysis.function
+    history_lines: list[str] = []
+    for item in history or []:
+        history_lines.append(
+            f"- candidate {item.get('index')}: {item.get('kind')} -> {item.get('status')}"
+            + (f", score {item.get('score')}" if item.get("score") is not None else "")
+            + (f" ({item.get('note')})" if item.get("note") else "")
+        )
+    history_text = (
+        "\nAlready-tried candidates (do NOT resubmit these strategies):\n" + "\n".join(history_lines) + "\n"
+        if history_lines
+        else ""
+    )
+    if attempt:
+        history_text += (
+            f"\nThis is independent optimization attempt #{attempt + 1}: explore a different "
+            "point in the design space than the attempts above.\n"
+        )
+    user = f"""Objective: minimize {objective}.
+Must-preserve top-function signature: `{fn.signature}`
+{_nl_spec_section(nl_spec)}
+Current Vitis synthesis report (baseline for this attempt):
+```
+{metrics_text}
+```
+{history_text}
+Current `src/hls_top.cpp` (functionally verified):
+```cpp
+{current_source.rstrip()}
+```
+
+Return ONE optimized complete `src/hls_top.cpp` in a single ```cpp block."""
+    return QOR_OPTIMIZER_SYSTEM_PROMPT, user
+
+
 NL_REFERENCE_SYSTEM_PROMPT = """You are the reference-model author in an equivalence-first C-to-HLS flow.
 
 From a natural-language hardware/algorithm specification you write ONE plain, portable

@@ -62,7 +62,21 @@ def _run_vitis_phase(project_dir: Path, phase: str, remote: RemoteVitis | None) 
         return _timeout_result(project_dir, phase, exc, f"Vitis {phase}")
 
 
-def run_vitis(project_dir: Path, run_requested: bool, remote: RemoteVitis | None = None) -> dict[str, PhaseResult]:
+def run_vitis(
+    project_dir: Path,
+    run_requested: bool,
+    remote: RemoteVitis | None = None,
+    upto: str = "cosim",
+) -> dict[str, PhaseResult]:
+    """Run the Vitis ladder, optionally stopping early.
+
+    ``upto`` limits the ladder ("csim" | "csynth" | "cosim"): the QoR optimizer scores
+    candidates at ``upto="csynth"`` (the synthesis report is the score) without paying
+    for a CoSim per candidate; only the accepted winner runs the full ladder.
+    """
+
+    if upto not in ("csim", "csynth", "cosim"):
+        raise ValueError(f"upto must be csim|csynth|cosim, got {upto!r}")
     phases = {
         "csim": PhaseResult("csim", "skipped"),
         "csynth": PhaseResult("csynth", "skipped"),
@@ -101,10 +115,14 @@ def run_vitis(project_dir: Path, run_requested: bool, remote: RemoteVitis | None
             phases["csynth"] = PhaseResult("csynth", "blocked", summary=message)
             phases["cosim"] = PhaseResult("cosim", "blocked", summary=message)
             return phases
+        if upto == "csim":
+            return phases
 
         phases["csynth"] = _run_vitis_phase(project_dir, "csynth", remote)
         if phases["csynth"].status != "pass":
             phases["cosim"] = PhaseResult("cosim", "blocked", summary="csynth failed")
+            return phases
+        if upto == "csynth":
             return phases
 
         phases["cosim"] = _run_vitis_phase(project_dir, "cosim", remote)

@@ -131,6 +131,8 @@ class RemoteVitis:
                 "--exclude",
                 ".candidates/",
                 "--exclude",
+                ".qor/",
+                "--exclude",
                 "c2hlsc_project/",
                 # Never ship the local runner-written phase logs (software_equivalence.log,
                 # csim.log, ...): the remote regenerates its own, and re-pulling these stale
