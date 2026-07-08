@@ -11,6 +11,7 @@ from .config import AgentConfig
 from .convert import GeneratedSource
 from .leveri_testgen import generate_leveri_testbenches
 from .testgen import generate_testbench
+from .verilog_testgen import generate_verilog_testbenches
 
 
 @dataclass
@@ -82,8 +83,10 @@ CXXFLAGS ?= -std=c++17 -Wall -Wextra -I src {flags}
 TB_EXE ?= c2hlsc_tb
 LEVERI_GOLDEN_EXE ?= leveri_golden_tb
 LEVERI_HLS_EXE ?= leveri_hls_tb
+RTL_VECTORS_EXE ?= rtl_vectors_tb
 
-.PHONY: all test leveri-test gcov-coverage klee-coverage coverage clean vitis
+.PHONY: all test leveri-test gcov-coverage klee-coverage coverage \\
+        rtl-vectors rtl-testbench rtl-cosim clean vitis
 
 all: test
 
@@ -112,13 +115,29 @@ klee-coverage:
 
 coverage: gcov-coverage klee-coverage
 
+# Standalone RTL (Verilog) testbench flow. Produces golden expected vectors from the
+# original C, renders a self-checking testbench, and (post-synthesis) simulates the RTL.
+$(RTL_VECTORS_EXE): tb/rtl_vectors_tb.cpp input.c
+\t$(CXX) $(CXXFLAGS) tb/rtl_vectors_tb.cpp -o $(RTL_VECTORS_EXE)
+
+rtl-vectors: $(RTL_VECTORS_EXE)
+\tmkdir -p rtl_vectors
+\t./$(RTL_VECTORS_EXE)
+
+rtl-testbench:
+\tpython3 tb/gen_rtl_tb.py --from-contract
+
+rtl-cosim:
+\tpython3 tb/run_rtl_sim.py
+
 vitis:
 \tvitis_hls -f run_hls.tcl
 
 clean:
-\trm -f $(TB_EXE) $(LEVERI_GOLDEN_EXE) $(LEVERI_HLS_EXE)
+\trm -f $(TB_EXE) $(LEVERI_GOLDEN_EXE) $(LEVERI_HLS_EXE) $(RTL_VECTORS_EXE)
 \trm -f leveri_golden_trace.csv leveri_hls_trace.csv
-\trm -rf coverage
+\trm -rf coverage rtl_vectors
+\trm -f tb/*_tb.sv
 \trm -f *.gcda *.gcno *.gcov
 \trm -rf c2hlsc_project
 """
@@ -141,6 +160,7 @@ def write_project(out_dir: Path, analysis: AnalysisResult, generated: GeneratedS
     (out_dir / "src").mkdir(exist_ok=True)
     (out_dir / "tb").mkdir(exist_ok=True)
     leveri_bundle = generate_leveri_testbenches(analysis, config)
+    verilog_bundle = generate_verilog_testbenches(analysis, config)
     shutil.copyfile(analysis.function.source_path, out_dir / "input.c")
     files = [
         out_dir / "input.c",
@@ -154,6 +174,10 @@ def write_project(out_dir: Path, analysis: AnalysisResult, generated: GeneratedS
         out_dir / "tb" / "klee_driver.cpp",
         out_dir / "tb" / "run_klee.py",
         out_dir / "tb" / "leveri_manifest.json",
+        out_dir / "tb" / "rtl_vectors_tb.cpp",
+        out_dir / "tb" / "gen_rtl_tb.py",
+        out_dir / "tb" / "run_rtl_sim.py",
+        out_dir / "tb" / "rtl_tb_manifest.json",
         out_dir / "run_hls.tcl",
         out_dir / "run_csim.tcl",
         out_dir / "run_csynth.tcl",
@@ -171,6 +195,10 @@ def write_project(out_dir: Path, analysis: AnalysisResult, generated: GeneratedS
     (out_dir / "tb" / "klee_driver.cpp").write_text(leveri_bundle.klee_driver, encoding="utf-8")
     (out_dir / "tb" / "run_klee.py").write_text(leveri_bundle.klee_script, encoding="utf-8")
     (out_dir / "tb" / "leveri_manifest.json").write_text(leveri_bundle.manifest_json, encoding="utf-8")
+    (out_dir / "tb" / "rtl_vectors_tb.cpp").write_text(verilog_bundle.vectors_tb, encoding="utf-8")
+    (out_dir / "tb" / "gen_rtl_tb.py").write_text(verilog_bundle.gen_script, encoding="utf-8")
+    (out_dir / "tb" / "run_rtl_sim.py").write_text(verilog_bundle.run_script, encoding="utf-8")
+    (out_dir / "tb" / "rtl_tb_manifest.json").write_text(verilog_bundle.manifest_json, encoding="utf-8")
     (out_dir / "run_hls.tcl").write_text(render_run_hls(analysis, config), encoding="utf-8")
     (out_dir / "run_csim.tcl").write_text(render_run_csim(analysis, config), encoding="utf-8")
     (out_dir / "run_csynth.tcl").write_text(render_run_csynth(), encoding="utf-8")
@@ -181,7 +209,7 @@ def write_project(out_dir: Path, analysis: AnalysisResult, generated: GeneratedS
     run_all.chmod(run_all.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     leveri_compare = out_dir / "tb" / "leveri_compare.py"
     leveri_compare.chmod(leveri_compare.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-    for script_name in ("run_gcov.py", "run_klee.py"):
+    for script_name in ("run_gcov.py", "run_klee.py", "gen_rtl_tb.py", "run_rtl_sim.py"):
         script = out_dir / "tb" / script_name
         script.chmod(script.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     return ProjectFiles(out_dir, files)

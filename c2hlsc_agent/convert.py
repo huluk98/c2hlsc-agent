@@ -111,7 +111,12 @@ def _llm_candidate(
             )
         response = llm.complete(HLSC_GENERATOR_SYSTEM_PROMPT, user)
         source = extract_hls_source(response, analysis.function.name, original_source)
-    except Exception:
+    except Exception as exc:
+        # Surface the concrete backend failure (main's diagnostic improvement). This note
+        # only survives when every candidate fails and the conservative copy is returned.
+        conservative.transformations.append(
+            f"LLM generation attempt {attempt + 1} failed [{type(exc).__name__}: {exc}]."
+        )
         return None
     if not source:
         return None
@@ -151,6 +156,7 @@ def generate_hls_sources(
 
     candidate = _llm_candidate(analysis, config, llm, conservative)
     if candidate is None:
+        # _llm_candidate records the specific failure reason (from main) on conservative.
         conservative.transformations.append(
             f"LLM HLS-C generation requested (model={getattr(llm, 'model', '?')}) but unavailable or "
             "unparsable; fell back to the conservative top-function copy."

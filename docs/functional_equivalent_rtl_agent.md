@@ -156,8 +156,10 @@ write report and audit memory
 
 ## Near-Term Implementation Gaps
 
-- Add a real repair backend for `hlsc_repair_agent`; the current package classifies the
-  owner/action but does not yet patch failed candidates.
+- `hlsc_repair_agent` now applies deterministic mechanical repairs (missing includes,
+  C++ `restrict` compatibility, helper-source inclusion, interface-pragma stripping) and
+  can escalate to an optional LLM patch of `src/hls_top.cpp`. The next step is richer,
+  evidence-localized repairs driven by PMLC mismatch analysis.
 - Coverage collection now has generated `gcov` and optional KLEE hooks; the next step is to feed uncovered branches and KLEE counterexamples back into stimulus refinement.
 - Add PMLC instrumentation for CSim/CoSim mismatches.
 - Add an optimizer queue that snapshots candidates and rolls back rejected QoR changes.

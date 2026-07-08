@@ -6,13 +6,12 @@ build-backend = "setuptools.build_meta"
 name = "c2hlsc-agent"
 version = "0.1.0"
 description = "Conservative local agent for converting C top functions to Vitis HLS C/C++ projects with equivalence checks."
-requires-python = ">=3.10"
+requires-python = ">=3.9"
 authors = [{ name = "Local Codex" }]
 dependencies = []
 
 [project.optional-dependencies]
 yaml = ["PyYAML>=6"]
-templates = ["Jinja2>=3"]
 llm = ["anthropic>=0.40"]
 
 [project.scripts]
@@ -20,6 +19,3 @@ c2hlsc-agent = "c2hlsc_agent.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
-
-[tool.setuptools.package-data]
-c2hlsc_agent = ["../templates/*.j2"]

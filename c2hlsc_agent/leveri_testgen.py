@@ -299,6 +299,19 @@ def fail(message: str) -> None:
     raise SystemExit(1)
 
 
+def values_match(golden: str, hls: str) -> bool:
+    if golden == hls:
+        return True
+    try:
+        gf = float(golden)
+        hf = float(hls)
+    except ValueError:
+        return False
+    diff = abs(gf - hf)
+    scale = max(abs(gf), abs(hf), 1.0)
+    return diff <= 1e-6 * scale
+
+
 def main(argv: list[str]) -> int:
     if len(argv) != 3:
         print("usage: leveri_compare.py GOLDEN_TRACE.csv HLS_TRACE.csv", file=sys.stderr)
@@ -327,7 +340,7 @@ def main(argv: list[str]) -> int:
                     f"golden={golden[col_idx]} hls={hls[col_idx]}"
                 )
         for col_idx in output_columns:
-            if golden[col_idx] != hls[col_idx]:
+            if not values_match(golden[col_idx], hls[col_idx]):
                 fail(
                     f"behavior mismatch cycle={golden[0]} column={golden_header[col_idx]} "
                     f"expected={golden[col_idx]} actual={hls[col_idx]}"

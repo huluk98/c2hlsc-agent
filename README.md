@@ -432,19 +432,65 @@ make coverage
 `coverage/klee_report.json`; when KLEE is not installed, the script exits successfully
 with a `skipped` report so the generated project remains portable.
 
-## Install
+## Standalone RTL (Verilog) Testbench
 
-From the repo root:
+CSim and the LeVeri traces exercise the C/HLS-C models; Vitis C/RTL CoSim drives the
+synthesized RTL through its own auto-generated wrapper. In addition to those, every
+generated project now ships a **standalone, self-checking Verilog/SystemVerilog
+testbench** that drives the *synthesized RTL directly* — independent of Vitis cosim — and
+still keeps the original C in the oracle path. This is owned by
+`shift_left_testbench_agent` and lives in `c2hlsc_agent/verilog_testgen.py` as the
+`hls_rtl_cosim_selfcheck_v1` policy.
+
+For every generated project, AUTO RTL writes:
+
+- `tb/rtl_vectors_tb.cpp`: runs the macro-renamed **golden C** top over the same
+  directed+random stimulus schedule as the host/CSim testbenches and dumps hex `.mem`
+  vectors (inputs, golden expected outputs, per-test active compare length, and the
+  golden return value) under `rtl_vectors/`
+- `tb/gen_rtl_tb.py`: renders the self-checking testbench `tb/<top>_tb.sv`. With
+  `--from-rtl <top.v>` it reads the true port names, widths, reset polarity
+  (`ap_rst`/`ap_rst_n`), and single/dual-port memory shape from the synthesized netlist;
+  with `--from-contract` it falls back to the interface contract in
+  `tb/rtl_tb_manifest.json`
+- `tb/run_rtl_sim.py`: builds the golden vectors, generates the testbench, locates the
+  synthesized RTL, and simulates it with AMD `xsim` (`xvlog`/`xelab`/`xsim`) or Icarus
+  Verilog (`iverilog`/`vvp`), writing `coverage/rtl_tb_report.json`
+- `tb/rtl_tb_manifest.json`: the interface contract / port map the generator consumes
+
+The testbench models the default Vitis HLS RTL contract: `ap_ctrl_hs` block-level control
+(`ap_clk`/`ap_rst`/`ap_start`/`ap_done`/`ap_idle`/`ap_ready`), `ap_memory` arrays with a
+registered one-cycle read latency, `ap_none` scalars, and `ap_return`. It compares only
+the declared **active** output range (for length-scalar designs such as `n`), so a
+correct design is never failed on inactive output elements, and floating-point outputs
+are compared advisory-only (warn, not fail).
+
+Run it (after synthesis, on a machine with a simulator):
 
 ```bash
-python3 -m pip install -e .
+make rtl-cosim        # golden vectors -> generate <top>_tb.sv -> simulate the RTL
 ```
 
-Or, with pinned runtime requirements:
+Or step by step:
 
 ```bash
-python3.11 -m pip install -r requirements.txt
-python3.11 -m pip install -e .
+make rtl-vectors      # build golden expected vectors from the original C
+make rtl-testbench    # render tb/<top>_tb.sv from the interface contract
+python3 tb/run_rtl_sim.py
+```
+
+The runner is portable: when the synthesized RTL or an RTL simulator is missing it writes
+a `skipped` report and exits successfully, so a generated project stays runnable without
+Vitis or a simulator installed. A PASS is bounded, stimulus-driven RTL evidence under the
+declared interface contract — it does not replace the full Vitis CoSim gate.
+
+## Install
+
+From the repository root:
+
+```bash
+python3 -m pip install -r requirements.txt
+python3 -m pip install -e .
 ```
 
 No commercial parser is required. The analyzer uses a robust regex fallback. Optional
@@ -667,7 +713,6 @@ num_tests: 100
 seed: 1
 interface_mode: ap_memory
 allow_pragmas: true
-allow_performance_pragmas: false
 arguments:
   a:
     direction: input
@@ -693,7 +738,12 @@ For each conversion, the output directory contains:
 - `src/hls_top.hpp`
 - `src/hls_top.cpp`
 - `tb/testbench.cpp`
-- `run_hls.tcl`
+- `tb/leveri_golden_tb.cpp`, `tb/leveri_hls_tb.cpp`, `tb/leveri_compare.py`,
+  `tb/run_gcov.py`, `tb/klee_driver.cpp`, `tb/run_klee.py`, `tb/leveri_manifest.json`
+  (the HLS-LeVeri shift-left verification bundle)
+- `tb/rtl_vectors_tb.cpp`, `tb/gen_rtl_tb.py`, `tb/run_rtl_sim.py`,
+  `tb/rtl_tb_manifest.json` (the standalone RTL/Verilog testbench bundle)
+- `run_hls.tcl` plus the split `run_csim.tcl`, `run_csynth.tcl`, `run_cosim.tcl`
 - `Makefile`
 - `run_all.sh`
 - `conversion_report.md`
@@ -758,7 +808,7 @@ This first implementation is intentionally conservative:
 - Unsupported constructs such as dynamic allocation, recursion, non-deterministic or
   runtime-only standard library calls, file I/O in the top, variable-length arrays, and
   unsafe pointer arithmetic are reported instead of silently converted.
-- Performance pragmas are not added unless configured and explained in the report.
+- The deterministic generator never adds performance pragmas (pipeline/unroll/dataflow/array_partition); only the optional LLM path may introduce them, and it explains them in its report.
 
 Poor HLS performance is reported but is not considered a functional failure.
 

@@ -108,6 +108,7 @@ def run_vitis(project_dir: Path, run_requested: bool, remote: RemoteVitis | None
             return phases
 
         phases["cosim"] = _run_vitis_phase(project_dir, "cosim", remote)
+        phases["cosim"] = _gate_cosim_on_log(phases["cosim"])
         return phases
     finally:
         if remote is not None:
@@ -115,6 +116,40 @@ def run_vitis(project_dir: Path, run_requested: bool, remote: RemoteVitis | None
                 remote.pull(project_dir)
             except (subprocess.TimeoutExpired, OSError):
                 pass  # best-effort artifact pull; phase logs are already local
+
+
+_COSIM_FAILURE_MARKERS = (
+    "co-simulation finished: fail",
+    "cosim design failed",
+    "co-simulation failed",
+    "aborting cosim",
+)
+
+
+def _gate_cosim_on_log(result: PhaseResult) -> PhaseResult:
+    """Vitis can exit 0 while the CoSim log reports a mismatch. Downgrade pass->fail when
+    the log carries an explicit co-simulation failure marker, so a zero exit code cannot
+    silently defeat the C/RTL equivalence gate. Works for the remote path too: the local
+    <phase>.log holds the ssh console output, which carries the co-simulation verdict."""
+    if result.status != "pass":
+        return result
+    haystack = f"{result.stdout}\n{result.stderr}".lower()
+    if result.log_path and result.log_path.exists():
+        try:
+            haystack += "\n" + result.log_path.read_text(encoding="utf-8", errors="replace").lower()
+        except OSError:
+            pass
+    if any(marker in haystack for marker in _COSIM_FAILURE_MARKERS):
+        return PhaseResult(
+            result.name,
+            "fail",
+            result.returncode,
+            result.stdout,
+            result.stderr,
+            result.log_path,
+            summary="Vitis exited 0 but the CoSim log reports a co-simulation failure",
+        )
+    return result
 
 
 def verify_project(

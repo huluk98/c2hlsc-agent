@@ -7,7 +7,6 @@ num_tests: 64
 seed: 7
 interface_mode: ap_memory
 allow_pragmas: true
-allow_performance_pragmas: false
 arguments:
   a:
     direction: input
