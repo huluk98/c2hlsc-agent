@@ -1,15 +1,18 @@
 """LLM client and prompt/parse helpers for the AUTO RTL generator and repair agents.
 
 The model is a *pluggable backend*, so the agent never depends on one specific cloud
-API. Three backends are supported:
+API. Four backends are supported:
 
-- ``none``      -- no model; the agents run the conservative deterministic paths.
-- ``openai``    -- any OpenAI Chat Completions-compatible endpoint, using only the
+- ``none``       -- no model; the agents run the conservative deterministic paths.
+- ``claude-cli`` -- the local Claude Code CLI (``claude -p``). Subscription auth, no
+  API key, no extra dependency. This is the preferred default when the ``claude``
+  binary is on PATH.
+- ``openai``     -- any OpenAI Chat Completions-compatible endpoint, using only the
   standard library (no extra dependency). This is how a **local** model runs with no
   cloud key: point ``llm_base_url`` at Ollama / LM Studio / llama.cpp / vLLM (e.g.
   ``http://localhost:11434/v1``). The same backend also reaches OpenAI-compatible cloud
   providers.
-- ``anthropic`` -- the Anthropic Messages API (lazily imported ``anthropic`` SDK).
+- ``anthropic``  -- the Anthropic Messages API (lazily imported ``anthropic`` SDK).
 
 Everything stays deterministic and offline by default: if ``--use-llm`` is not requested,
 or no backend resolves, the agents fall back to the conservative mechanical paths. The
@@ -22,6 +25,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
+import subprocess
 import urllib.error
 import urllib.request
 from typing import Protocol
@@ -33,9 +38,13 @@ DEFAULT_ANTHROPIC_MODEL = "claude-opus-4-8"
 DEFAULT_LLM_MODEL = DEFAULT_ANTHROPIC_MODEL  # backward-compatible alias
 DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
+DEFAULT_CLI_MODEL = "opus"
 _DEFAULT_MAX_TOKENS = 8000
-_EVIDENCE_LIMIT = 1600
+# Evidence is tail-sliced: the failure signature in a Vitis log is at the END, after the
+# tool banner. Matches PhaseResult.to_dict's [-4000:] report truncation.
+_EVIDENCE_LIMIT = 4000
 _HTTP_TIMEOUT = 600  # local models can be slow
+_CLI_TIMEOUT = 900  # claude CLI runs with thinking; give it room
 
 
 class LLMClient(Protocol):
@@ -122,6 +131,41 @@ class OpenAICompatibleLLMClient:
         return _openai_text(body)
 
 
+class ClaudeCLIClient:
+    """Drive the local Claude Code CLI (``claude -p``) as a completion backend.
+
+    Uses subscription auth (whatever ``claude`` is logged in as), so no API key is
+    required and calls are not billed per token. ``cli_cmd`` may be a multi-word command
+    (e.g. ``"ssh you@mac claude"``) so the CLI can live on another machine, though the
+    intended setup keeps every LLM call local and ships only Vitis over SSH.
+    """
+
+    def __init__(
+        self,
+        model: str = DEFAULT_CLI_MODEL,
+        cli_cmd: str = "claude",
+        timeout: int = _CLI_TIMEOUT,
+    ) -> None:
+        import shlex
+
+        self._base = shlex.split(cli_cmd) + ["-p", "--model", model]
+        self.model = model
+        self._timeout = timeout
+
+    def complete(self, system: str, user: str, *, max_tokens: int = _DEFAULT_MAX_TOKENS) -> str:
+        del max_tokens  # the CLI manages its own output budget
+        proc = subprocess.run(
+            self._base,
+            input=f"{system}\n\n{user}",
+            text=True,
+            capture_output=True,
+            timeout=self._timeout,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(f"claude CLI failed (rc={proc.returncode}): {proc.stderr[-800:]}")
+        return proc.stdout
+
+
 def _text_from_response(response: object) -> str:
     parts: list[str] = []
     for block in getattr(response, "content", None) or []:
@@ -162,18 +206,47 @@ def _is_local_url(base_url: str) -> bool:
     return any(host in lowered for host in ("localhost", "127.0.0.1", "0.0.0.0", "::1", "host.docker.internal"))
 
 
-def resolve_backend(config: object) -> str:
-    """Resolve the concrete backend name: ``'none'``, ``'anthropic'`` or ``'openai'``.
+def _cli_argv0(config: object) -> str | None:
+    """First token of ``llm_cli_cmd`` (shlex-parsed, matching ClaudeCLIClient), or None.
 
-    Honours an explicit ``llm_backend``; otherwise ``auto`` prefers a configured
-    OpenAI-compatible endpoint (covers local models), then Anthropic, then OpenAI cloud.
+    Uses shlex.split so a quoted space-containing executable path resolves the same way
+    the client will actually invoke it; returns None for an empty/whitespace-only value.
+    """
+
+    import shlex
+
+    try:
+        tokens = shlex.split(getattr(config, "llm_cli_cmd", None) or "claude")
+    except ValueError:
+        return None
+    return tokens[0] if tokens else None
+
+
+def _cli_available(config: object) -> bool:
+    argv0 = _cli_argv0(config)
+    return bool(argv0) and shutil.which(argv0) is not None
+
+
+def _explicit_base_url(config: object) -> bool:
+    return bool(getattr(config, "llm_base_url", None) or _env("C2HLSC_LLM_BASE_URL", "OPENAI_BASE_URL"))
+
+
+def resolve_backend(config: object) -> str:
+    """Resolve the concrete backend: ``'none'``, ``'claude-cli'``, ``'anthropic'`` or ``'openai'``.
+
+    Honours an explicit ``llm_backend``; otherwise ``auto`` respects an explicitly
+    configured OpenAI-compatible endpoint first (the user pointed us at a specific model),
+    then prefers the local Claude Code CLI (subscription auth, no per-token billing), then
+    Anthropic, then OpenAI cloud.
     """
 
     requested = (getattr(config, "llm_backend", "auto") or "auto").lower()
-    if requested in {"anthropic", "openai", "none"}:
+    if requested in {"claude-cli", "anthropic", "openai", "none"}:
         return requested
-    if getattr(config, "llm_base_url", None) or _env("C2HLSC_LLM_BASE_URL", "OPENAI_BASE_URL"):
-        return "openai"
+    if _explicit_base_url(config):
+        return "openai"  # an explicitly configured endpoint is an explicit choice; honour it
+    if _cli_available(config):
+        return "claude-cli"
     if _anthropic_installed() and _env("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"):
         return "anthropic"
     if _env("OPENAI_API_KEY"):
@@ -197,10 +270,14 @@ def missing_llm_reason(config: object) -> str | None:
     backend = resolve_backend(config)
     if backend == "none":
         return (
-            "no LLM backend resolved: point --llm-backend openai at a local model "
+            "no LLM backend resolved: install the Claude Code CLI ('claude' on PATH, "
+            "subscription auth), point --llm-backend openai at a local model "
             "(e.g. --llm-base-url http://localhost:11434/v1 for Ollama), or install "
             "'anthropic' and set ANTHROPIC_API_KEY"
         )
+    if backend == "claude-cli" and not _cli_available(config):
+        cli_cmd = _cli_argv0(config) or (getattr(config, "llm_cli_cmd", None) or "claude")
+        return f"the Claude Code CLI {cli_cmd!r} is not on PATH"
     if backend == "anthropic":
         if not _anthropic_installed():
             return "the 'anthropic' package is not installed (pip install 'c2hlsc-agent[llm]')"
@@ -224,6 +301,12 @@ def build_llm_client(config: object) -> LLMClient | None:
     if not getattr(config, "use_llm", False):
         return None
     backend = resolve_backend(config)
+    if backend == "claude-cli":
+        if not _cli_available(config):
+            return None
+        model = getattr(config, "llm_model", None) or DEFAULT_CLI_MODEL
+        cli_cmd = getattr(config, "llm_cli_cmd", None) or "claude"
+        return ClaudeCLIClient(model=model, cli_cmd=cli_cmd)
     if backend == "anthropic":
         if not _anthropic_installed() or not _env("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"):
             return None
@@ -231,8 +314,13 @@ def build_llm_client(config: object) -> LLMClient | None:
         return AnthropicLLMClient(model=model)
     if backend == "openai":
         base_url = _openai_base_url(config)
-        model = getattr(config, "llm_model", None) or _env("C2HLSC_LLM_MODEL") or DEFAULT_OPENAI_MODEL
         api_key = _env("C2HLSC_LLM_API_KEY", "OPENAI_API_KEY")
+        # A non-local endpoint with no key is doomed to 401; return None so the caller
+        # takes the deterministic fallback and surfaces missing_llm_reason (mirrors the
+        # anthropic branch), instead of building a client that fails on first call.
+        if not _is_local_url(base_url) and not api_key:
+            return None
+        model = getattr(config, "llm_model", None) or _env("C2HLSC_LLM_MODEL") or DEFAULT_OPENAI_MODEL
         return OpenAICompatibleLLMClient(base_url=base_url, model=model, api_key=api_key)
     return None
 
@@ -260,10 +348,26 @@ def _diagnostic_lines(analysis: AnalysisResult) -> str:
     return "\n".join(lines) or "  - none"
 
 
-def build_generator_user_prompt(analysis: AnalysisResult, original_source: str) -> str:
+def _nl_spec_section(nl_spec: str | None) -> str:
+    if not nl_spec:
+        return ""
+    return f"""
+Design intent from the user (natural language). Honour it wherever it does not conflict
+with functional equivalence to the original C:
+\"\"\"
+{nl_spec.strip()}
+\"\"\"
+"""
+
+
+def build_generator_user_prompt(
+    analysis: AnalysisResult,
+    original_source: str,
+    nl_spec: str | None = None,
+) -> str:
     fn = analysis.function
     return f"""{render_hlsc_generator_task(original_source)}
-
+{_nl_spec_section(nl_spec)}
 Top function: `{fn.name}`  (signature: `{fn.signature}`)
 Argument contract (preserve exactly):
 {_argument_lines(analysis)}
@@ -297,6 +401,32 @@ Rules:
 """
 
 
+def _history_section(history: list[object] | None) -> str:
+    """Summarize prior repair attempts so the model does not repeat failed strategies."""
+
+    if not history:
+        return ""
+    lines: list[str] = []
+    for outcome in history[-3:]:
+        stage = getattr(outcome, "stage", "?")
+        family = getattr(outcome, "family", "?")
+        status = getattr(outcome, "status", "?")
+        summary = getattr(outcome, "summary", "")
+        lines.append(f"- iteration {getattr(outcome, 'iteration', '?')} [{stage}/{family}] {status}: {summary}")
+        for change in getattr(outcome, "changes", ()) or ():
+            diff = getattr(change, "diff", "")
+            diff_lines = [l for l in diff.splitlines() if l.startswith(("+", "-")) and not l.startswith(("+++", "---"))]
+            if diff_lines:
+                excerpt = "\n".join(diff_lines[:30])
+                lines.append(f"  changed {getattr(change, 'path', '?')}:\n```\n{excerpt}\n```")
+    return f"""
+Previous repair attempts on this candidate (the failure persisted afterwards).
+Do NOT resubmit any of these changes or revert to a previously tried version;
+try a genuinely different fix:
+{chr(10).join(lines)}
+"""
+
+
 def build_repair_prompt(
     analysis: AnalysisResult,
     decision: object,
@@ -304,16 +434,19 @@ def build_repair_prompt(
     evidence: str,
     target_rel: str,
     current_text: str,
+    history: list[object] | None = None,
+    nl_spec: str | None = None,
 ) -> tuple[str, str]:
     fn = analysis.function
-    excerpt = (evidence or "").strip()[:_EVIDENCE_LIMIT] or "(no captured evidence)"
+    # Tail slice: Vitis logs put the failure at the end, after the tool banner.
+    excerpt = (evidence or "").strip()[-_EVIDENCE_LIMIT:] or "(no captured evidence)"
     user = f"""Failing stage: {phase}
 Failure family: {getattr(decision, 'family', 'unknown')}
 Repair intent: {getattr(decision, 'next_action', '')}
 Repair scope: {getattr(decision, 'repair_scope', '')}
 Must-preserve top-function signature: `{fn.signature}`
-
-Earliest-failure evidence (truncated):
+{_nl_spec_section(nl_spec)}{_history_section(history)}
+Earliest-failure evidence (tail of the log):
 ```
 {excerpt}
 ```
@@ -325,6 +458,52 @@ Current `{target_rel}` to repair:
 
 Return the full corrected `{target_rel}` in one ```cpp block. Change as little as possible."""
     return REPAIR_SYSTEM_PROMPT, user
+
+
+NL_REFERENCE_SYSTEM_PROMPT = """You are the reference-model author in an equivalence-first C-to-HLS flow.
+
+From a natural-language hardware/algorithm specification you write ONE plain, portable
+C99 file that becomes the GOLDEN REFERENCE ORACLE: an automatically generated testbench
+will compare an HLS implementation against it element-by-element, and Vitis CSim/CoSim
+will re-run it. Correctness and analyzability matter more than performance.
+
+Rules:
+- Define exactly one externally visible function with the EXACT name the user gives; any
+  helpers must be `static`.
+- Plain C only: no dynamic memory, no recursion, no file or console I/O, no OS calls,
+  no HLS pragmas, no ap_int/ap_fixed types.
+- Every loop bound must be a compile-time constant. Bake array sizes into the code with a
+  `#define` (e.g. `#define N 256`) and index only within `[0, N)`.
+- DO NOT take a runtime element-count/length parameter (no `int n` that bounds a loop):
+  the automated testbench passes a random value for such a scalar, which would read past a
+  fixed-size buffer. If the spec mentions a count, encode it as a compile-time constant and
+  make every array parameter exactly that fixed size.
+- Keep the signature simple and synthesizable: scalars, fixed-size arrays via pointers,
+  and a scalar (or void) return.
+- State every assumption you make (especially the chosen array sizes) as a // comment at
+  the top of the file.
+- Return ONLY the complete C file in a single ```c fenced block.
+"""
+
+
+def build_nl_reference_prompt(nl_spec: str, top_name: str) -> tuple[str, str]:
+    user = f"""Natural-language specification:
+\"\"\"
+{nl_spec.strip()}
+\"\"\"
+
+Write the golden C reference implementation. The externally visible function MUST be
+named exactly `{top_name}`. Return one complete C file in a single ```c block."""
+    return NL_REFERENCE_SYSTEM_PROMPT, user
+
+
+def extract_reference_c(text: str, top_name: str) -> str | None:
+    """Extract the golden reference C file from an NL-reference response."""
+
+    code = extract_full_file(text, must_contain=f"{top_name}(")
+    if not code or not is_plausible_translation_unit(code, top_name):
+        return None
+    return code
 
 
 # --------------------------------------------------------------------------- #

@@ -125,7 +125,10 @@ if seed_arg:
     for line in seed.read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
-        row = json.loads(line)
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue  # torn final line from an interrupted sweep
         if row.get("status") in DONE_STATUSES:
             done_ids.add(int(row["record_id"]))
 
@@ -200,7 +203,10 @@ for item in (seed_arg, new_arg):
     for line in path.read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
-        row = json.loads(line)
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue  # torn final line from an interrupted sweep
         rows_by_id[int(row["record_id"])] = row
 
 out.parent.mkdir(parents=True, exist_ok=True)
@@ -224,7 +230,12 @@ limit = int(sys.argv[5]) if sys.argv[5] else None
 
 passed_ids = set()
 for line in results.read_text(encoding="utf-8").splitlines():
-    row = json.loads(line)
+    if not line.strip():
+        continue
+    try:
+        row = json.loads(line)
+    except json.JSONDecodeError:
+        continue  # torn final line from an interrupted sweep
     if row.get("status") == "pass":
         passed_ids.add(int(row["record_id"]))
 
@@ -267,7 +278,10 @@ if seed_arg:
     for line in seed.read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
-        row = json.loads(line)
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue  # torn final line from an interrupted sweep
         if row.get("status") in DONE_STATUSES:
             done_ids.add(int(row["record_id"]))
 
@@ -340,7 +354,10 @@ for item in (seed_arg, new_arg):
     for line in path.read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
-        row = json.loads(line)
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
+            continue  # torn final line from an interrupted sweep
         rows_by_id[int(row["record_id"])] = row
 
 out.parent.mkdir(parents=True, exist_ok=True)
@@ -368,7 +385,12 @@ def summarize(path: Path):
     rows = []
     if path.exists():
         for line in path.read_text(encoding="utf-8").splitlines():
-            row = json.loads(line)
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue  # torn final line from an interrupted sweep
             rows.append(row)
             status[row.get("status", "unknown")] += 1
             failed_phase[row.get("failed_phase", "pass_or_unset")] += 1

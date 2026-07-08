@@ -302,9 +302,12 @@ class LlmHelperTests(unittest.TestCase):
         self.assertEqual(missing_llm_reason(AgentConfig(use_llm=False)), "LLM not requested (pass --use-llm)")
 
     def test_build_llm_client_none_without_credentials(self):
-        # With no backend configured and no credentials/base-url in the env, auto resolves
-        # to 'none' and the client is None even if use_llm is requested.
-        with mock.patch.dict("os.environ", {}, clear=False):
+        # With no claude CLI on PATH, no backend configured, and no credentials/base-url
+        # in the env, auto resolves to 'none' and the client is None even if use_llm is
+        # requested.
+        with mock.patch.dict("os.environ", {}, clear=False), mock.patch.object(
+            llm_module.shutil, "which", return_value=None
+        ):
             import os
 
             for var in (
@@ -336,10 +339,12 @@ class LlmHelperTests(unittest.TestCase):
         self.assertIsNone(missing_llm_reason(config))
 
     def test_resolve_backend_auto_prefers_base_url(self):
-        self.assertEqual(
-            resolve_backend(AgentConfig(use_llm=True, llm_base_url="http://localhost:11434/v1")),
-            "openai",
-        )
+        # Without the claude CLI on PATH, auto falls back to a configured base URL.
+        with mock.patch.object(llm_module.shutil, "which", return_value=None):
+            self.assertEqual(
+                resolve_backend(AgentConfig(use_llm=True, llm_base_url="http://localhost:11434/v1")),
+                "openai",
+            )
         self.assertEqual(resolve_backend(AgentConfig(use_llm=True, llm_backend="none")), "none")
 
     def test_openai_client_builds_request_and_parses_content(self):

@@ -1,0 +1,13 @@
+name: c2hlsc-agent
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip>=24
+  - pyyaml>=6
+  - make
+  - cmake
+  - ninja
+  - git
+  - rsync
+  - pkg-config

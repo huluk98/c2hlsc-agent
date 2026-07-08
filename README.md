@@ -52,8 +52,16 @@ python3 scripts/run_hls_nl_vitis_batch.py \
   --out-dir runs/hls_nl_csynth_triage \
   --limit 9900 \
   --timeout-seconds 300 \
-  --log-tail-lines 120
+  --log-tail-lines 120 \
+  --workers 4
 ```
+
+`--workers N` runs N Vitis invocations concurrently (default 1, the old serial
+behavior). Every record gets its own project directory, so parallel runs cannot
+collide; budget roughly 2-6 GB RAM per worker when choosing N. Each finished record
+is appended to `vitis_batch_results.jsonl` immediately, so a crashed or interrupted
+sweep keeps everything completed so far — rerun the same command with `--resume` to
+skip the already-recorded record_ids and finish the rest.
 
 Summarize outcomes:
 
@@ -67,7 +75,12 @@ path = Path("runs/hls_nl_csynth_triage/vitis_batch_results.jsonl")
 status = collections.Counter()
 failed_phase = collections.Counter()
 for line in path.read_text(encoding="utf-8").splitlines():
-    row = json.loads(line)
+    if not line.strip():
+        continue
+    try:
+        row = json.loads(line)
+    except json.JSONDecodeError:
+        continue  # torn final line from an interrupted sweep
     status[row.get("status", "unknown")] += 1
     failed_phase[row.get("failed_phase", "pass_or_unset")] += 1
 print("status_counts:", dict(status))
@@ -88,7 +101,12 @@ out = Path("runs/hls_nl_csynth_pass.jsonl")
 
 passed_ids = set()
 for line in results.read_text(encoding="utf-8").splitlines():
-    row = json.loads(line)
+    if not line.strip():
+        continue
+    try:
+        row = json.loads(line)
+    except json.JSONDecodeError:
+        continue  # torn final line from an interrupted sweep
     if row.get("status") == "pass":
         passed_ids.add(int(row["record_id"]))
 
@@ -117,15 +135,16 @@ python3 scripts/run_hls_nl_vitis_batch.py \
   --out-dir runs/hls_nl_cosim_triage \
   --run-full-cosim \
   --timeout-seconds 300 \
-  --log-tail-lines 160
+  --log-tail-lines 160 \
+  --workers 4
 ```
 
 Rerun the summary command against
 `runs/hls_nl_cosim_triage/vitis_batch_results.jsonl` to separate CoSim passes,
 failures, and timeouts.
 
-For very large runs, split by chunk in separate terminals or jobs, using a different
-`--out-dir` per chunk:
+`--workers` covers most machines; to spread a run across several machines or jobs,
+split by chunk with a different `--out-dir` per chunk:
 
 ```bash
 python3 scripts/run_hls_nl_vitis_batch.py \
@@ -242,14 +261,25 @@ warning and continues deterministically (exit code unaffected).
 The model is a pluggable backend (`--llm-backend`), so the agent does not depend on any
 one cloud API:
 
+- **`claude-cli`** — the local Claude Code CLI (`claude -p`). Subscription auth: no API
+  key, no per-token billing, no extra dependency. Model via `--llm-model` (default
+  `opus`); a custom command via `--llm-cli-cmd` (may be multi-word).
 - **`openai`** — any OpenAI Chat Completions-compatible endpoint, using only the standard
   library (no extra dependency). This is how it runs on a **local model with no cloud
   key**: point `--llm-base-url` at Ollama / LM Studio / llama.cpp / vLLM. The same backend
   also reaches OpenAI-compatible cloud providers.
 - **`anthropic`** — the Anthropic Claude API (needs `pip install '.[llm]'` and
   `ANTHROPIC_API_KEY`).
-- **`auto`** (default) — prefers a configured OpenAI-compatible endpoint (incl. local),
-  then Anthropic, then OpenAI cloud; falls back to deterministic if nothing is configured.
+- **`auto`** (default) — prefers the local Claude Code CLI when `claude` is on PATH, then
+  a configured OpenAI-compatible endpoint (incl. local), then Anthropic, then OpenAI
+  cloud; falls back to deterministic if nothing is configured.
+
+Claude Code CLI (the default when installed — subscription auth, everything local):
+
+```bash
+python -m c2hlsc_agent.cli convert --config examples/vector_add/config.yaml \
+  --out build/vector_add --use-llm --no-run-vitis
+```
 
 Local model, no API key (e.g. `ollama pull qwen2.5-coder` then `ollama serve`):
 
@@ -285,6 +315,78 @@ Backend selection also works from a config file (`use_llm: true`, `llm_backend: 
 `llm_base_url: ...`, `llm_model: ...`) and from environment variables
 (`C2HLSC_LLM_BASE_URL` / `OPENAI_BASE_URL`, `C2HLSC_LLM_API_KEY` / `OPENAI_API_KEY`,
 `C2HLSC_LLM_MODEL`).
+
+### Natural-language input (`--spec` / `--spec-file`)
+
+The generator accepts three input modalities:
+
+- **C only** — the classic path: `--input file.c --top fn`.
+- **C + NL** — add `--spec "..."` (or `--spec-file design.md`) next to `--input`: the
+  design intent is embedded in the generator prompt (and in later repair prompts) so the
+  model optimizes toward what you asked for, while the golden-C testbench still enforces
+  equivalence with the original C.
+- **NL only** — give `--spec`/`--spec-file` *without* `--input` (still requires `--top`
+  and an LLM). The model first writes a plain-C golden reference (`nl_reference.c`,
+  copied to `input.c`) from the spec, and the entire equivalence-first machinery —
+  golden-oracle testbench, host equivalence, CSim → CSynth → CoSim, repair — then runs
+  exactly as in the C-input modes.
+
+```bash
+# NL-only: spec -> golden C reference -> HLS-C -> Vitis-ready project
+python -m c2hlsc_agent.cli convert \
+  --spec "8-tap moving-average FIR over int16 samples; coefficients are all 1/8; \
+process N=256 samples from in[] to out[]" \
+  --top fir_avg8 --out build/fir_avg8 --use-llm
+```
+
+### Best-of-N generation (`--candidates N`)
+
+With `--candidates N` (N > 1) the generator asks the model for N independent candidates
+(each prompted toward a different pragma/refactoring strategy), writes each into a scratch
+project under `<out>/.candidates/`, and scores them with the **local** host-equivalence
+testbench — seconds on the Mac. Only the winner is promoted to `<out>` and sent through
+Vitis, so no Vitis time is spent on losing candidates. Scores land in
+`<out>/candidate_scores.json`. A candidate that passes host equivalence wins immediately;
+otherwise the one with the fewest mismatches is taken and the repair loop drives it home.
+
+### Remote Vitis over SSH (`--vitis-ssh`)
+
+Keep everything on the Mac — analysis, generation, testbenches, host equivalence,
+classification, and every LLM call — and ship **only** the `vitis_hls` phases to a Linux
+box:
+
+```bash
+python -m c2hlsc_agent.cli convert \
+  --input examples/vector_add/input.c --top vector_add --out build/vector_add \
+  --use-llm --auto-repair --max-iterations 3 \
+  --vitis-ssh luke@linux-box            # implies --run-vitis
+```
+
+Per verification pass the project directory is rsynced to
+`<--vitis-remote-dir, default ~/c2hlsc_runs>/<project-name>` on the host, each phase runs
+as `ssh <host> 'cd <dir> && timeout <t> vitis_hls -f run_<phase>.tcl'` with the log
+captured locally exactly like a local run (so classification and repair evidence work
+unchanged), and the synthesized RTL (`syn/`), cosim reports, and Vitis logs are rsynced
+back afterwards. `vitis_hls` is located on the remote via `--vitis-setup
+'source /tools/Xilinx/Vitis/2024.2/settings64.sh'`, `--vitis-bin /path/to/vitis_hls`, or
+an automatic probe of the common Xilinx install locations. The host can also come from
+`C2HLSC_VITIS_SSH` or the config file (`vitis_ssh_host`, `vitis_remote_dir`,
+`vitis_setup`, `vitis_bin`). Requirements: ssh key auth + rsync on both sides; no Python,
+conda, or repo checkout is needed on the Linux box.
+
+This makes the integrated `--auto-repair --use-llm` loop fully closed on the Mac: detect
+the earliest failing Vitis stage remotely, classify locally, repair locally with the
+Claude CLI, re-run the full ladder — no manual log ferrying (the `repair` subcommand
+remains available for air-gapped setups).
+
+### Repair memory and oscillation guard
+
+Every repair is already recorded in `repair_audit.json`; the LLM repair prompt now
+includes the last attempts (stage, family, outcome, diff excerpt) with an instruction not
+to repeat them, and evidence excerpts are **tail**-sliced so the model sees the actual
+error at the end of a Vitis log rather than the tool banner. A proposed patch whose
+content hash matches any previously visited source state (an A→B→A cycle) is rejected as
+`oscillation_rejected`, which stops the loop instead of burning Vitis runs on a cycle.
 
 ## HLS-LeVeri-Style Testbench Generator
 
@@ -332,13 +434,13 @@ with a `skipped` report so the generated project remains portable.
 
 ## Install
 
-From this repository:
+From the repo root:
 
 ```bash
-python3 -m pip install -e c2hlsc_agent
+python3 -m pip install -e .
 ```
 
-Or, from the standalone GitHub repo root:
+Or, with pinned runtime requirements:
 
 ```bash
 python3.11 -m pip install -r requirements.txt
@@ -357,14 +459,12 @@ Xilinx Vitis must already be installed and licensed on that machine.
 Create/update the environment:
 
 ```bash
-cd c2hlsc_agent
 bash scripts/setup_linux_conda.sh
 ```
 
 Run Vitis locally on that Linux machine:
 
 ```bash
-cd c2hlsc_agent
 VITIS_HLS_ROOT="/opt/Xilinx/Vitis_HLS/2024.2" \
   bash scripts/run_vitis_linux.sh \
   --config examples/vector_add/config.yaml \
@@ -488,7 +588,6 @@ evidence files. Failed rows are not copied as projects; they are listed in
 For the first CoSim check, use the small JSON config and shell wrapper:
 
 ```bash
-cd c2hlsc_agent
 VITIS_HLS_BIN="/path/to/Vitis_HLS/2024.2/bin/vitis_hls" \
   bash scripts/run_hls_nl_cosim_smoke.sh
 ```
@@ -507,7 +606,7 @@ Run on a remote Linux host from this machine:
 REMOTE=user@linux-host \
 REMOTE_DIR=~/c2hlsc_agent \
 VITIS_SETTINGS_REMOTE=/opt/Xilinx/Vitis/2022.1/settings64.sh \
-  bash c2hlsc_agent/scripts/run_remote_vitis.sh \
+  bash scripts/run_remote_vitis.sh \
   --config examples/vector_add/config.yaml \
   --out build/vector_add
 ```
@@ -529,7 +628,7 @@ Vitis execution is opt-in:
 
 ```bash
 python -m c2hlsc_agent.cli convert \
-  --config c2hlsc_agent/examples/vector_add/config.yaml \
+  --config examples/vector_add/config.yaml \
   --out build/vector_add \
   --run-vitis
 ```
@@ -667,17 +766,17 @@ Poor HLS performance is reported but is not considered a functional failure.
 
 ```bash
 python -m c2hlsc_agent.cli convert \
-  --config c2hlsc_agent/examples/vector_add/config.yaml \
+  --config examples/vector_add/config.yaml \
   --out /tmp/c2hlsc_vector_add \
   --no-run-vitis
 
 python -m c2hlsc_agent.cli convert \
-  --config c2hlsc_agent/examples/simple_fir/config.yaml \
+  --config examples/simple_fir/config.yaml \
   --out /tmp/c2hlsc_fir \
   --no-run-vitis
 
 python -m c2hlsc_agent.cli convert \
-  --config c2hlsc_agent/examples/bit_ops/config.yaml \
+  --config examples/bit_ops/config.yaml \
   --out /tmp/c2hlsc_bit_ops \
   --no-run-vitis
 ```
@@ -747,6 +846,7 @@ VITIS_HLS_BIN=/opt/Xilinx/Vitis_HLS/2023.2/bin/vitis_hls \
 python3 scripts/cosim_repair_loop.py \
   --input data/hls_nl/hls_nl_claude_generated.jsonl \
   --out-dir runs/cosim_repair --timeout-seconds 300 --max-iterations 2 \
+  --workers 4 \
   --repairer claude-cli --claude-cmd "ssh you@your-mac claude" --claude-model opus
 ```
 
@@ -755,3 +855,9 @@ repair via the billed Anthropic API instead. Scope a run with `--limit`, repeate
 `--record-id`, or `--only-failing <vitis_batch_results.jsonl>` (the non-pass rows
 from a prior `run_hls_nl_vitis_triage.sh` sweep). Outputs `results.jsonl` (per-record
 outcome) and `repaired_corpus.jsonl` (fixed sources).
+
+`--workers N` repairs N records concurrently (default 1): while one record waits on
+its Claude repair call, another record's Vitis ladder keeps the machine busy. Both
+output files are appended and flushed per record, so an interrupted run keeps all
+finished records — rerun with `--resume` to skip record_ids already in
+`results.jsonl` instead of overwriting it and starting over.

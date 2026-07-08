@@ -145,7 +145,7 @@ def _phase_text(state: VerificationState, phase: str) -> str:
 
 def classify_log_family(phase: str, text: str) -> str:
     lowered = text.lower()
-    if "vitis_hls not found" in lowered:
+    if "vitis_hls not found" in lowered or "remote vitis unavailable" in lowered:
         return "toolchain_unavailable"
     if re.search(r"\b(timeout|timed out|deadlock|stdout-silence)\b", lowered):
         return "timeout_or_deadlock"

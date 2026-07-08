@@ -27,10 +27,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shlex
 import subprocess
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Callable
 
@@ -49,6 +52,7 @@ from run_hls_nl_vitis_batch import (  # noqa: E402
     render_csim_tcl,
     render_csynth_tcl,
     render_verilog_tcl,
+    repair_trailing_newline,
     resolve_vitis_hls,
     run_design,
 )
@@ -135,13 +139,81 @@ def repair(complete: Completer, record: dict[str, Any], hls_cpp: str, stage: str
     return pick_code(resp, record.get("top_function", ""))
 
 
+def load_result_rows(results_path: Path) -> list[dict[str, Any]]:
+    """Valid rows from a previous (possibly interrupted) run, last per record_id."""
+    if not results_path.exists():
+        return []
+    by_id: dict[int, dict[str, Any]] = {}
+    with results_path.open(encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(row, dict):
+                continue
+            try:
+                by_id[int(row["record_id"])] = row
+            except (KeyError, TypeError, ValueError):
+                continue
+    return list(by_id.values())
+
+
+def load_done_ids(results_path: Path) -> set[int]:
+    """record_ids finished in a previous run.
+
+    status=error rows (host-side failures such as an unreachable repair backend,
+    not cosim verdicts) do not count as done, so --resume retries them.
+    """
+    return {int(row["record_id"]) for row in load_result_rows(results_path) if row.get("status") != "error"}
+
+
+def reconcile_corpus(corpus_path: Path) -> None:
+    """Rewrite repaired_corpus.jsonl keeping the last valid row per record_id.
+
+    A crash can leave a torn row, and a record retried after a crash between
+    the corpus and results writes appends a second row for the same id — which
+    the batch runner's duplicate-record_id guard would then reject.
+    """
+    if not corpus_path.exists():
+        return
+    by_id: dict[Any, str] = {}
+    with corpus_path.open(encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(row, dict) and "record_id" in row:
+                by_id[row["record_id"]] = line
+    tmp = corpus_path.with_name(f"{corpus_path.name}.{os.getpid()}.tmp")
+    tmp.write_text("".join(line + "\n" for line in by_id.values()), encoding="utf-8")
+    os.replace(tmp, corpus_path)
+
+
 def select(records: list[dict[str, Any]], args: argparse.Namespace) -> list[tuple[int, dict[str, Any]]]:
     if args.only_failing:
         wanted: set[int] = set()
         for line in Path(args.only_failing).read_text(encoding="utf-8").splitlines():
-            row = json.loads(line)
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                # Torn final line from an interrupted incremental sweep.
+                continue
             if str(row.get("status")) not in ("pass",):
-                wanted.add(int(row["record_id"]))
+                try:
+                    wanted.add(int(row["record_id"]))
+                except (KeyError, TypeError, ValueError):
+                    continue
         return [(record_id_for(r, i), r) for i, r in enumerate(records) if record_id_for(r, i) in wanted]
     if args.record_id:
         wanted = set(args.record_id)
@@ -162,6 +234,11 @@ def main() -> int:
     p.add_argument("--only-failing", type=Path, help="A vitis_batch_results.jsonl; repair only its non-pass record_ids")
     p.add_argument("--offset", type=int, default=0)
     p.add_argument("--limit", type=int)
+    p.add_argument("--workers", type=int, default=1,
+                   help="Concurrent records (default 1). Each worker runs its own Vitis ladder and repair call, "
+                        "so one record's Claude repair overlaps another's cosim; ~2-6GB RAM per Vitis run.")
+    p.add_argument("--resume", action="store_true",
+                   help="Skip record_ids already present in <out-dir>/results.jsonl and append instead of overwriting")
     p.add_argument("--part", default="xczu7ev-ffvc1156-2-e")
     p.add_argument("--clock", default="10")
     p.add_argument("--log-tail-lines", type=int, default=160)
@@ -182,24 +259,83 @@ def main() -> int:
     args.out_dir.mkdir(parents=True, exist_ok=True)
     results_path = args.out_dir / "results.jsonl"
     repaired_path = args.out_dir / "repaired_corpus.jsonl"
-    rf = results_path.open("w", encoding="utf-8")
-    cf = repaired_path.open("w", encoding="utf-8")
+
+    targets = select(load_records(args.input), args)
+    id_counts: dict[int, int] = {}
+    for record_id, _ in targets:
+        id_counts[record_id] = id_counts.get(record_id, 0) + 1
+    duplicates = sorted(record_id for record_id, n in id_counts.items() if n > 1)
+    if duplicates:
+        raise SystemExit(f"duplicate record_id values in input: {duplicates[:10]}")
+    skipped_done = 0
+    counts = {"pass": 0, "fail": 0, "repaired": 0}
+    if args.resume:
+        done_ids = load_done_ids(results_path)
+        skipped_done = sum(1 for record_id, _ in targets if record_id in done_ids)
+        targets = [(record_id, record) for record_id, record in targets if record_id not in done_ids]
+        print(f"resume: {skipped_done} records already done, {len(targets)} to run", flush=True)
+        repair_trailing_newline(results_path)
+        reconcile_corpus(repaired_path)
+        # Seed counters from prior rows so the summary and exit code describe
+        # the whole results file, not just this invocation's records.
+        for row in load_result_rows(results_path):
+            status = row.get("status")
+            if status == "pass":
+                counts["pass"] += 1
+                if row.get("repaired"):
+                    counts["repaired"] += 1
+            elif status not in ("skipped", "error"):
+                counts["fail"] += 1
+    mode = "a" if args.resume else "w"
+    rf = results_path.open(mode, encoding="utf-8")
+    cf = repaired_path.open(mode, encoding="utf-8")
+    write_lock = threading.Lock()
+    stop_event = threading.Event()
 
     repairer_label = (
         f"Claude Code ({args.claude_cmd} --model {args.claude_model})"
         if args.repairer == "claude-cli" else f"Anthropic API ({args.model})"
     )
-    targets = select(load_records(args.input), args)
-    n_pass = n_fail = n_repaired = 0
-    for record_id, record in targets:
+
+    def emit(outcome_row: dict[str, Any], corpus_row: dict[str, Any] | None) -> None:
+        # Written and flushed per record so an interrupted run keeps everything
+        # finished so far and --resume can continue from it. The corpus row goes
+        # first: the results row is the --resume done-marker, so done-ness must
+        # imply the repaired source is already on disk. (A crash between the two
+        # leaves an extra corpus row; reconcile_corpus dedupes it on resume.)
+        with write_lock:
+            if corpus_row is not None:
+                cf.write(json.dumps(corpus_row) + "\n")
+                cf.flush()
+            rf.write(json.dumps(outcome_row) + "\n")
+            rf.flush()
+            status = outcome_row.get("status")
+            if status == "pass":
+                counts["pass"] += 1
+                if outcome_row.get("repaired"):
+                    counts["repaired"] += 1
+            elif status != "skipped":
+                counts["fail"] += 1
+
+    def process_record(record_id: int, record: dict[str, Any]) -> None:
+        try:
+            _process_record(record_id, record)
+        except Exception as exc:  # noqa: BLE001 - a flaky repair backend must not kill the sweep
+            print(f"[{record_id}] error: {type(exc).__name__}: {exc}", flush=True)
+            emit({"record_id": record_id, "status": "error", "error": f"{type(exc).__name__}: {exc}"}, None)
+
+    def _process_record(record_id: int, record: dict[str, Any]) -> None:
         sig = extract_function(str(record.get("hls_cpp", "")))
         if sig is None:
-            rf.write(json.dumps({"record_id": record_id, "status": "skipped", "reason": "unparseable"}) + "\n")
-            continue
+            emit({"record_id": record_id, "status": "skipped", "reason": "unparseable"}, None)
+            return
         hls_cpp = str(record.get("hls_cpp", ""))
         outcome = {"record_id": record_id, "top_function": sig.name, "iterations": [], "repaired": False}
         status = "fail"
         for attempt in range(args.max_iterations + 1):
+            if stop_event.is_set():
+                # Interrupted: emit nothing so --resume retries this record.
+                return
             record["hls_cpp"] = hls_cpp
             row = write_project(args.out_dir, record, sig, record_id, args.part, args.clock)
             result = run_design(vitis_hls, row, args.timeout_seconds, run_full_cosim=True, log_tail_lines=args.log_tail_lines)
@@ -221,24 +357,37 @@ def main() -> int:
             print(f"[{record_id}] repaired via {repairer_label} after '{stage}' failure; re-running cosim", flush=True)
 
         outcome["status"] = status
-        if status == "pass":
-            n_pass += 1
-            if outcome["repaired"]:
-                n_repaired += 1
-        else:
-            n_fail += 1
         record["hls_cpp"] = hls_cpp
-        rf.write(json.dumps(outcome) + "\n")
-        rf.flush()
-        cf.write(json.dumps({"record_id": record_id, "top_function": sig.name, "hls_cpp": hls_cpp, "cosim_status": status}) + "\n")
-        cf.flush()
+        emit(outcome, {"record_id": record_id, "top_function": sig.name, "hls_cpp": hls_cpp, "cosim_status": status})
+
+    # Records are independent (each gets its own design dir keyed by record_id),
+    # so with --workers > 1 one record's Claude repair call overlaps another
+    # record's Vitis ladder instead of leaving the machine idle.
+    if args.workers <= 1:
+        for record_id, record in targets:
+            process_record(record_id, record)
+    else:
+        with ThreadPoolExecutor(max_workers=args.workers) as pool:
+            futures = [pool.submit(process_record, record_id, record) for record_id, record in targets]
+            try:
+                for future in as_completed(futures):
+                    future.result()
+            except BaseException:
+                # Ctrl-C etc.: cancel queued records; in-flight ones stop at
+                # their next attempt boundary. Finished rows are on disk for
+                # --resume.
+                stop_event.set()
+                for future in futures:
+                    future.cancel()
+                raise
 
     rf.close()
     cf.close()
-    summary = {"targets": len(targets), "pass": n_pass, "fail": n_fail, "passed_after_repair": n_repaired,
+    summary = {"targets": len(targets), "already_done": skipped_done, "workers": args.workers,
+               "pass": counts["pass"], "fail": counts["fail"], "passed_after_repair": counts["repaired"],
                "results": str(results_path), "repaired_corpus": str(repaired_path)}
     print(json.dumps(summary, indent=2))
-    return 0 if n_fail == 0 else 1
+    return 0 if counts["fail"] == 0 else 1
 
 
 if __name__ == "__main__":

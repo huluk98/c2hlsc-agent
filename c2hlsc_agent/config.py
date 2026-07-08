@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import json
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -40,6 +41,13 @@ class AgentConfig:
     llm_backend: str = "auto"
     llm_model: str | None = None
     llm_base_url: str | None = None
+    llm_cli_cmd: str = "claude"
+    llm_candidates: int = 1
+    nl_spec: str | None = None
+    vitis_ssh_host: str | None = None
+    vitis_remote_dir: str = "~/c2hlsc_runs"
+    vitis_setup: str | None = None
+    vitis_bin: str = "vitis_hls"
 
 
 def _parse_scalar(value: str) -> Any:
@@ -64,6 +72,27 @@ def _parse_scalar(value: str) -> Any:
         return value
 
 
+def _strip_inline_comment(line: str) -> str:
+    """Drop a ``#`` comment, honouring quotes and requiring whitespace before ``#``.
+
+    A ``#`` inside a quoted scalar (e.g. ``nl_spec: "count the # of set bits"``) is part
+    of the value, and a ``#`` not preceded by whitespace is too; only an unquoted ``#`` at
+    line-start or after whitespace begins a comment. The naive ``split('#')`` corrupted
+    both cases — a common trap for free-text values like ``nl_spec``.
+    """
+
+    quote: str | None = None
+    for idx, char in enumerate(line):
+        if quote is not None:
+            if char == quote:
+                quote = None
+        elif char in "'\"":
+            quote = char
+        elif char == "#" and (idx == 0 or line[idx - 1] in " \t"):
+            return line[:idx]
+    return line
+
+
 def _minimal_yaml(text: str) -> dict[str, Any]:
     root: dict[str, Any] = {}
     stack: list[tuple[int, Any]] = [(-1, root)]
@@ -72,7 +101,7 @@ def _minimal_yaml(text: str) -> dict[str, Any]:
     for raw_line in text.splitlines():
         if not raw_line.strip() or raw_line.lstrip().startswith("#"):
             continue
-        line = raw_line.split("#", 1)[0].rstrip()
+        line = _strip_inline_comment(raw_line).rstrip()
         indent = len(line) - len(line.lstrip(" "))
         content = line.strip()
 
@@ -180,6 +209,13 @@ def load_config(path: Path | None) -> AgentConfig:
         llm_backend=str(data.get("llm_backend", "auto")),
         llm_model=(str(data["llm_model"]) if data.get("llm_model") is not None else None),
         llm_base_url=(str(data["llm_base_url"]) if data.get("llm_base_url") is not None else None),
+        llm_cli_cmd=str(data.get("llm_cli_cmd", "claude")),
+        llm_candidates=int(data.get("llm_candidates", 1)),
+        nl_spec=(str(data["nl_spec"]) if data.get("nl_spec") else None),
+        vitis_ssh_host=(str(data["vitis_ssh_host"]) if data.get("vitis_ssh_host") else None),
+        vitis_remote_dir=str(data.get("vitis_remote_dir", "~/c2hlsc_runs")),
+        vitis_setup=(str(data["vitis_setup"]) if data.get("vitis_setup") else None),
+        vitis_bin=str(data.get("vitis_bin", "vitis_hls")),
     )
 
 
@@ -219,4 +255,27 @@ def merge_cli_config(config: AgentConfig, args: Any) -> AgentConfig:
         config.llm_model = args.llm_model
     if getattr(args, "llm_base_url", None):
         config.llm_base_url = args.llm_base_url
+    if getattr(args, "llm_cli_cmd", None):
+        config.llm_cli_cmd = args.llm_cli_cmd
+    if getattr(args, "candidates", None) is not None:
+        config.llm_candidates = max(1, int(args.candidates))
+    spec_inline = getattr(args, "spec", None)
+    spec_file = getattr(args, "spec_file", None)
+    if spec_file:
+        config.nl_spec = Path(spec_file).expanduser().read_text(encoding="utf-8").strip()
+    elif spec_inline:
+        config.nl_spec = spec_inline.strip()
+    if getattr(args, "vitis_ssh", None):
+        config.vitis_ssh_host = args.vitis_ssh
+    if getattr(args, "vitis_remote_dir", None):
+        config.vitis_remote_dir = args.vitis_remote_dir
+    if getattr(args, "vitis_setup", None):
+        config.vitis_setup = args.vitis_setup
+    if getattr(args, "vitis_bin", None):
+        config.vitis_bin = args.vitis_bin
+    # Fold in the env var here (not only in RemoteVitis.from_config) so the
+    # "remote host implies --run-vitis" rule below applies to it too.
+    config.vitis_ssh_host = config.vitis_ssh_host or os.environ.get("C2HLSC_VITIS_SSH")
+    if config.vitis_ssh_host and not getattr(args, "no_run_vitis", False):
+        config.run_vitis = True
     return config
