@@ -69,6 +69,7 @@ def multi_agent_procedures() -> tuple[AgentProcedure, ...]:
             outputs=(
                 "host testbench",
                 "paired golden/HLS trace testbenches",
+                "standalone RTL self-checking testbench",
                 "directed/random stimuli",
                 "gcov/KLEE coverage artifacts",
                 "coverage plan",
