@@ -106,6 +106,34 @@ def build_parser() -> argparse.ArgumentParser:
     repair.add_argument("--config", help="YAML/JSON config file used for the original conversion")
     repair.add_argument("--iteration", type=int, default=1, help="repair iteration number recorded in the audit")
     _add_llm_arguments(repair)
+    optimize = sub.add_parser(
+        "optimize",
+        help="post-equivalence QoR (PPA) optimization of a verified project (rtl_optimizer_agent)",
+    )
+    optimize.add_argument("--project", required=True, help="existing generated project directory that passes verification")
+    optimize.add_argument("--top", help="top function name; defaults to conversion_report.json top when available")
+    optimize.add_argument("--input", help="original input C file; defaults to PROJECT/input.c")
+    optimize.add_argument("--config", help="YAML/JSON config file used for the original conversion")
+    optimize.add_argument(
+        "--objective",
+        choices=["latency", "area", "balanced"],
+        default="latency",
+        help="what to minimize; 'balanced' minimizes the latency*area product relative to the baseline",
+    )
+    optimize.add_argument("--iterations", type=int, default=4, help="number of LLM optimization candidates (default 4)")
+    optimize.add_argument(
+        "--no-cosim-winner",
+        action="store_true",
+        help="accept the winner after host equivalence only (skip the full Vitis re-ladder); NOT recommended",
+    )
+    optimize.add_argument(
+        "--ppa-script",
+        help="script run in the project dir after acceptance (e.g. syn/run_ppa.sh); its "
+        "yosys_area.rpt / sta_report.txt enrich the QoR report with area/slack/power",
+    )
+    optimize.add_argument("--verbose", action="store_true", help="print per-candidate progress")
+    _add_remote_vitis_arguments(optimize)
+    _add_llm_arguments(optimize)
     return parser
 
 
@@ -340,6 +368,65 @@ def run_repair(args: argparse.Namespace) -> int:
     return 0 if repair.changed else 1
 
 
+def run_optimize(args: argparse.Namespace) -> int:
+    from .qor_optimizer import optimize_project
+
+    project_dir = Path(args.project).resolve()
+    if not (project_dir / "src" / "hls_top.cpp").exists():
+        raise SystemExit(f"{project_dir} does not look like a generated project (no src/hls_top.cpp)")
+    config = merge_cli_config(load_config(Path(args.config).resolve() if args.config else None), args)
+    if not config.input_files:
+        config.input_files = [(project_dir / "input.c").resolve()]
+    if not config.input_files[0].exists():
+        raise SystemExit("--input is required because PROJECT/input.c does not exist")
+    if not config.top:
+        config.top = _load_project_top(project_dir)
+    if not config.top:
+        raise SystemExit("--top is required because conversion_report.json does not record a top function")
+    # QoR optimization is LLM-centric; enable the LLM path unless explicitly refused.
+    if not getattr(args, "no_llm", False):
+        config.use_llm = True
+    llm = build_llm_client(config)
+    if config.use_llm and llm is None:
+        print(
+            f"LLM path unavailable: {missing_llm_reason(config)}; only the deterministic "
+            "pipeline-pragma candidate will be tried.",
+            file=sys.stderr,
+        )
+    remote = RemoteVitis.from_config(config)
+    if remote is not None and args.verbose:
+        print(f"Vitis phases will run on {remote.host}; everything else runs locally.")
+    analysis = analyze_source(config.input_files[0], config.top, config)
+    try:
+        outcome = optimize_project(
+            project_dir,
+            analysis,
+            config,
+            llm,
+            remote,
+            objective=args.objective,
+            iterations=args.iterations,
+            cosim_winner=not args.no_cosim_winner,
+            ppa_script=args.ppa_script,
+            verbose=args.verbose,
+        )
+    except RuntimeError as exc:
+        raise SystemExit(f"QoR optimization could not run: {exc}")
+    print(outcome.summary)
+    print(f"QoR report: {project_dir / 'qor_report.json'} (+ .md" + (" + qor_table.tex)" if outcome.delta else ")"))
+    if outcome.rolled_back:
+        # The winner failed the acceptance ladder — the project was restored, but the
+        # run needs attention; distinguish it from a clean accept/no-improvement.
+        return 1
+    if not outcome.accepted and outcome.candidates and not any(
+        c.status in ("scored", "timing_regressed") for c in outcome.candidates
+    ):
+        # Every candidate died before scoring (toolchain outage, all-unparsable, all
+        # equivalence failures): not a QoR verdict, so don't exit 0 as if it were.
+        return 1
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -347,6 +434,8 @@ def main(argv: list[str] | None = None) -> int:
         return run_convert(args)
     if args.command == "repair":
         return run_repair(args)
+    if args.command == "optimize":
+        return run_optimize(args)
     parser.error(f"unknown command {args.command}")
     return 2
 
