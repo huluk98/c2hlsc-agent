@@ -529,22 +529,40 @@ def write_report(payload: dict[str, object]) -> None:
     REPORT_PATH.write_text(json.dumps(payload, indent=2) + "\\n", encoding="utf-8")
 
 
-def resolve_tool(env_name: str, default_name: str, fallback_path: str = "") -> str | None:
+def resolve_tool(env_name: str, *candidate_names: str) -> str | None:
+    # Honor an explicit override, otherwise search PATH for any candidate name.
+    # No machine-specific fallback path so this runs on any machine.
     value = os.environ.get(env_name)
     if value:
         return value
-    found = shutil.which(default_name)
-    if found:
-        return found
-    if fallback_path and Path(fallback_path).exists():
-        return fallback_path
+    for name in candidate_names:
+        found = shutil.which(name)
+        if found:
+            return found
+    return None
+
+
+def default_klee_include(klee_path: str | None) -> str | None:
+    # KLEE's headers (klee/klee.h) live under the install prefix that also holds
+    # bin/klee, so derive the include dir from the resolved binary instead of a
+    # hard-coded path. Falls back to None when it cannot be located.
+    candidates = []
+    if klee_path:
+        prefix = Path(klee_path).resolve().parent.parent
+        candidates.append(prefix / "include")
+    for candidate in candidates:
+        if (candidate / "klee" / "klee.h").exists():
+            return str(candidate)
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
     return None
 
 
 def main() -> int:
     klee = resolve_tool("KLEE", "klee")
-    clangxx = resolve_tool("KLEE_CXX", "klee-clang++")
-    klee_include = os.environ.get("KLEE_INCLUDE_DIR", "")
+    clangxx = resolve_tool("KLEE_CXX", "klee-clang++", "clang++")
+    klee_include = os.environ.get("KLEE_INCLUDE_DIR") or default_klee_include(klee)
     if klee is None:
         write_report({"status": "skipped", "reason": "klee not found"})
         print("KLEE coverage skipped: klee not found")
@@ -553,7 +571,7 @@ def main() -> int:
         write_report({"status": "skipped", "reason": "clang++ not found"})
         print("KLEE coverage skipped: clang++ not found")
         return 0
-    if not klee_include or not Path(klee_include).exists():
+    if klee_include is None or not Path(klee_include).exists():
         write_report({"status": "skipped", "reason": "KLEE include directory not found", "klee_include": klee_include})
         print("KLEE coverage skipped: include directory not found")
         return 0

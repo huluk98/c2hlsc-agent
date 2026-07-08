@@ -18,7 +18,7 @@ from .llm import LLMClient, build_repair_prompt, extract_full_file, is_plausible
 
 REPAIR_AGENT_NAME = "hlsc_repair_agent"
 REPAIR_AUDIT_FILENAME = "repair_audit.json"
-_EVIDENCE_LIMIT = 1600
+_EVIDENCE_LIMIT = 4000
 
 
 @dataclass(frozen=True)
@@ -125,6 +125,7 @@ def repair_project(
     phase = earliest_failing_phase(state, config.run_vitis)
     decision = classify_failure(state, config.run_vitis, analysis.diagnostics.has_errors)
     evidence = _phase_evidence(state, phase)
+    history = load_repair_audit(project_dir)
     changes: list[RepairFileChange] = []
 
     if phase is None or decision.status == "pass":
@@ -142,13 +143,21 @@ def repair_project(
             status = "applied"
             summary = f"Applied {len(changes)} auditable mechanical repair(s); rerun verification from software equivalence."
         elif llm is not None and getattr(config, "use_llm", False):
-            llm_changes = _llm_repair(project_dir, analysis, decision, phase, evidence, llm)
+            llm_changes, oscillated = _llm_repair(
+                project_dir, analysis, decision, phase, evidence, llm, config=config, history=history
+            )
             changes.extend(llm_changes)
             if llm_changes:
                 status = "applied_llm"
                 summary = (
                     f"Applied LLM repair to {', '.join(c.path for c in llm_changes)}; "
                     "rerun verification from software equivalence."
+                )
+            elif oscillated:
+                status = "oscillation_rejected"
+                summary = (
+                    "LLM repair proposed a previously tried candidate (oscillation guard); "
+                    "stopping instead of cycling."
                 )
             else:
                 status = "no_change"
@@ -167,12 +176,23 @@ def repair_project(
         summary=summary,
         target_files=target_files,
         changes=tuple(changes),
-        evidence_excerpt=evidence.strip()[:_EVIDENCE_LIMIT],
+        evidence_excerpt=evidence.strip()[-_EVIDENCE_LIMIT:],
         next_action=decision.next_action,
         repair_scope=decision.repair_scope,
     )
     _append_audit(project_dir, outcome)
     return outcome
+
+
+def _known_candidate_hashes(history: list[RepairOutcome], current: str) -> set[str]:
+    """Every source state already visited (before/after of prior changes + current)."""
+
+    seen = {_sha256(current)}
+    for outcome in history:
+        for change in outcome.changes:
+            seen.add(change.before_sha256)
+            seen.add(change.after_sha256)
+    return seen
 
 
 def _llm_repair(
@@ -182,23 +202,37 @@ def _llm_repair(
     phase: str,
     evidence: str,
     llm: LLMClient,
-) -> list[RepairFileChange]:
+    config: object | None = None,
+    history: list[RepairOutcome] | None = None,
+) -> tuple[list[RepairFileChange], bool]:
     """Escalate to an LLM for a minimal patch to the generated HLS-C.
 
     Only ``src/hls_top.cpp`` is ever rewritten. The host-equivalence testbench and the
     golden ``input.c`` oracle are never handed to the model and never overwritten, so the
     verifier ladder stays the equivalence gate even when the model is wrong. The candidate
     patch is structurally validated before it is accepted, so a prose/log response cannot
-    be written as source.
+    be written as source. Prior attempts from the audit ledger are summarized in the
+    prompt, and a candidate whose hash matches ANY previously visited source state is
+    rejected (A->B->A oscillation guard). Returns ``(changes, oscillation_rejected)``.
     """
 
     path = project_dir / "src" / "hls_top.cpp"
     if not path.exists():
-        return []
+        return [], False
     current = path.read_text(encoding="utf-8")
     top = analysis.function.name
+    history = history or []
 
-    system, user = build_repair_prompt(analysis, decision, phase, evidence, "src/hls_top.cpp", current)
+    system, user = build_repair_prompt(
+        analysis,
+        decision,
+        phase,
+        evidence,
+        "src/hls_top.cpp",
+        current,
+        history=history,
+        nl_spec=getattr(config, "nl_spec", None) if config is not None else None,
+    )
     try:
         response = llm.complete(system, user)
         new_text = extract_full_file(response, must_contain=f"{top}(")
@@ -208,11 +242,13 @@ def _llm_repair(
             "keeping the deterministic result.",
             file=sys.stderr,
         )
-        return []
+        return [], False
     if not new_text or new_text.strip() == current.strip():
-        return []
+        return [], False
     if not is_plausible_translation_unit(new_text, top):
-        return []
+        return [], False
+    if _sha256(new_text) in _known_candidate_hashes(history, current):
+        return [], True
 
     change = _rewrite_file(
         project_dir,
@@ -220,7 +256,7 @@ def _llm_repair(
         f"llm repair (model={getattr(llm, 'model', '?')}, family={getattr(decision, 'family', '?')}) for {phase} stage",
         new_text,
     )
-    return [change] if change else []
+    return ([change] if change else []), False
 
 
 def _phase_evidence(state: VerificationState, phase: str | None) -> str:

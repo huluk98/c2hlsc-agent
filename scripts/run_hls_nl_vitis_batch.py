@@ -4,15 +4,18 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import signal
 import shutil
 import subprocess
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from generate_hls_nl_testbenches import (
     FunctionSig,
@@ -162,6 +165,15 @@ def generate_designs(args: argparse.Namespace) -> tuple[list[dict[str, Any]], li
         row["status"] = "generated"
         row["verilog_tcl"] = str(design_dir / "run_verilog.tcl")
         designs.append(row)
+
+    counts: dict[Any, int] = {}
+    for design in designs:
+        counts[design["record_id"]] = counts.get(design["record_id"], 0) + 1
+    duplicates = sorted(record_id for record_id, n in counts.items() if n > 1)
+    if duplicates:
+        # Duplicate ids share one design dir (silent overwrite when serial, a
+        # data race with --workers) and break --resume bookkeeping.
+        raise SystemExit(f"duplicate record_id values in input: {duplicates[:10]}")
     return designs, skipped
 
 
@@ -276,15 +288,162 @@ def run_design(vitis_hls: str, design: dict[str, Any], timeout: int, run_full_co
     return result
 
 
+def _atomic_write(path: Path, text: str) -> None:
+    # PID-unique tmp name: two runs sharing an out-dir must not race on it.
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def repair_trailing_newline(path: Path) -> None:
+    """A run killed mid-write can leave a torn final line with no newline;
+    appending straight after it would merge the next row into the torn one."""
+    if not path.exists() or path.stat().st_size == 0:
+        return
+    with path.open("rb+") as f:
+        f.seek(-1, os.SEEK_END)
+        if f.read(1) != b"\n":
+            f.write(b"\n")
+
+
 def write_report(out_dir: Path, report: dict[str, Any]) -> None:
-    (out_dir / "vitis_batch_report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
-    with (out_dir / "vitis_batch_results.jsonl").open("w", encoding="utf-8") as f:
-        for row in report["results"]:
-            f.write(json.dumps(row, sort_keys=True) + "\n")
-    (out_dir / "vitis_verilog_report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
-    with (out_dir / "vitis_verilog_results.jsonl").open("w", encoding="utf-8") as f:
-        for row in report["results"]:
-            f.write(json.dumps(row, sort_keys=True) + "\n")
+    report_json = json.dumps(report, indent=2)
+    results_jsonl = "".join(json.dumps(row, sort_keys=True) + "\n" for row in report["results"])
+    # Atomic replace so an interrupt here cannot clobber the incrementally
+    # appended results file with a truncated one.
+    _atomic_write(out_dir / "vitis_batch_report.json", report_json)
+    _atomic_write(out_dir / "vitis_batch_results.jsonl", results_jsonl)
+    _atomic_write(out_dir / "vitis_verilog_report.json", report_json)
+    _atomic_write(out_dir / "vitis_verilog_results.jsonl", results_jsonl)
+
+
+# Statuses that represent a finished Vitis verdict. Anything else
+# (error, generated_only, ...) is not "done" and must be retried on --resume.
+EXECUTED_STATUSES = {"pass", "fail", "timeout", "fail_no_verilog"}
+
+
+def normalize_record_id(value: Any) -> Any:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return value
+
+
+def load_prior_results(results_path: Path) -> list[dict[str, Any]]:
+    """Executed-verdict rows from an interrupted/previous sweep.
+
+    Tolerates a torn final line. Rows whose status is not a Vitis verdict
+    (host-side status=error, --generate-only's generated_only) are dropped so
+    --resume retries those records instead of treating them as done.
+    """
+    if not results_path.exists():
+        return []
+    by_id: dict[Any, dict[str, Any]] = {}
+    with results_path.open(encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(row, dict) and "record_id" in row:
+                by_id[normalize_record_id(row["record_id"])] = row
+    return [row for row in by_id.values() if row.get("status") in EXECUTED_STATUSES]
+
+
+def run_design_row(vitis_hls: str, design: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
+    try:
+        return run_design(vitis_hls, design, args.timeout_seconds, args.run_full_cosim, args.log_tail_lines)
+    except Exception as exc:  # noqa: BLE001 - one bad record must not kill a multi-day sweep
+        return {**design, "status": "error", "error": f"{type(exc).__name__}: {exc}"}
+
+
+def input_digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def check_resume_compatibility(out_dir: Path, args: argparse.Namespace, current_digest: str) -> None:
+    """Refuse --resume when the prior sweep ran a different input or mode.
+
+    Matching on record_id alone would silently report the prior run's rows as
+    verdicts for a different corpus. Best-effort: the prior report only exists
+    if that run reached write_report.
+    """
+    report_path = out_dir / "vitis_batch_report.json"
+    if not report_path.exists():
+        return
+    try:
+        summary = json.loads(report_path.read_text(encoding="utf-8")).get("summary", {})
+    except (json.JSONDecodeError, OSError):
+        return
+    mode = "full_cosim" if args.run_full_cosim else "verilog_csynth"
+    checks = (
+        ("input", str(args.input)),
+        ("mode", mode),
+        ("input_sha256", current_digest),
+    )
+    for key, current in checks:
+        prior = summary.get(key)
+        if prior is not None and prior != current:
+            raise SystemExit(
+                f"--resume {key} mismatch: prior run in {out_dir} used {key}={prior!r}, "
+                f"this run uses {current!r}. Rerun without --resume or use a fresh --out-dir."
+            )
+
+
+def execute_designs(
+    vitis_hls: str,
+    designs: list[dict[str, Any]],
+    args: argparse.Namespace,
+    record_result: Callable[[dict[str, Any]], None],
+) -> None:
+    """Run designs through run_design, in parallel when --workers > 1.
+
+    record_result is invoked exactly once per executed design, serialized by a
+    lock here so callers can append/write without their own locking. With
+    --stop-on-fail, a non-pass result stops scheduling; already-running designs
+    still finish and are recorded.
+    """
+    if args.workers <= 1:
+        for design in designs:
+            row = run_design_row(vitis_hls, design, args)
+            record_result(row)
+            if args.stop_on_fail and row["status"] != "pass":
+                break
+        return
+
+    stop = threading.Event()
+    lock = threading.Lock()
+
+    def run_one(design: dict[str, Any]) -> dict[str, Any] | None:
+        if stop.is_set():
+            return None
+        return run_design_row(vitis_hls, design, args)
+
+    with ThreadPoolExecutor(max_workers=args.workers) as pool:
+        futures = [pool.submit(run_one, design) for design in designs]
+        try:
+            for future in as_completed(futures):
+                row = future.result()
+                if row is None:
+                    continue
+                with lock:
+                    record_result(row)
+                if args.stop_on_fail and row["status"] != "pass":
+                    stop.set()
+        except BaseException:
+            # Ctrl-C etc.: don't drain the queue — cancel everything not yet
+            # started; already-recorded rows are on disk for --resume.
+            stop.set()
+            for future in futures:
+                future.cancel()
+            raise
 
 
 def _config_path(value: Any) -> Path | None:
@@ -310,6 +469,7 @@ def load_config(args: argparse.Namespace) -> argparse.Namespace:
         "vitis_hls_bin": "vitis_hls_bin",
         "timeout_seconds": "timeout_seconds",
         "log_tail_lines": "log_tail_lines",
+        "workers": "workers",
     }
     for key, attr in value_fields.items():
         if getattr(args, attr) is None and key in raw:
@@ -322,6 +482,7 @@ def load_config(args: argparse.Namespace) -> argparse.Namespace:
         ("generate_only", "generate_only"),
         ("run_full_cosim", "run_full_cosim"),
         ("stop_on_fail", "stop_on_fail"),
+        ("resume", "resume"),
     ):
         if not getattr(args, attr) and key in raw:
             setattr(args, attr, bool(raw[key]))
@@ -340,6 +501,7 @@ def finalize_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> 
     args.clock = args.clock or "10"
     args.timeout_seconds = 900 if args.timeout_seconds is None else args.timeout_seconds
     args.log_tail_lines = 80 if args.log_tail_lines is None else args.log_tail_lines
+    args.workers = 1 if args.workers is None else max(1, args.workers)
     return args
 
 
@@ -357,6 +519,8 @@ def main() -> int:
     parser.add_argument("--vitis-hls-bin", help="Full path to vitis_hls; may contain spaces")
     parser.add_argument("--timeout-seconds", type=int, help="Per-record Vitis timeout")
     parser.add_argument("--log-tail-lines", type=int, help="Vitis log tail lines stored per result; 0 disables")
+    parser.add_argument("--workers", type=int, help="Concurrent Vitis runs (default 1; each worker needs ~2-6GB RAM)")
+    parser.add_argument("--resume", action="store_true", help="Skip record_ids already present in the out-dir vitis_batch_results.jsonl and append new rows to it")
     parser.add_argument("--generate-only", action="store_true", help="Only generate project folders; do not run Vitis")
     parser.add_argument("--run-full-cosim", action="store_true", help="Run CSim, CSynth, and CoSim instead of CSim+CSynth only")
     parser.add_argument("--oracle", choices=["driver", "semantic"], default="driver", help="Testbench style: driver (stimulus-only, cosim is the equivalence oracle; default) or semantic (opt-in heuristic self-checks)")
@@ -368,7 +532,26 @@ def main() -> int:
     results: list[dict[str, Any]] = []
     status_counts: dict[str, int] = {}
 
+    results_path = args.out_dir / "vitis_batch_results.jsonl"
+    corpus_digest = input_digest(args.input)
+    prior_results: list[dict[str, Any]] = []
+    pending = designs
+    if args.resume and not args.generate_only:
+        check_resume_compatibility(args.out_dir, args, corpus_digest)
+        prior_results = load_prior_results(results_path)
+        done_ids = {normalize_record_id(row["record_id"]) for row in prior_results}
+        pending = [design for design in designs if normalize_record_id(design["record_id"]) not in done_ids]
+        results.extend(prior_results)
+        for row in prior_results:
+            status_counts[row.get("status", "unknown")] = status_counts.get(row.get("status", "unknown"), 0) + 1
+        print(f"resume: {len(prior_results)} records already done, {len(pending)} to run")
+
     if args.generate_only:
+        if load_prior_results(results_path):
+            raise SystemExit(
+                f"{results_path} contains executed sweep results; refusing to overwrite "
+                "them with generate-only rows. Use a fresh --out-dir."
+            )
         for design in designs:
             row = dict(design)
             row["status"] = "generated_only"
@@ -376,17 +559,28 @@ def main() -> int:
             status_counts[row["status"]] = status_counts.get(row["status"], 0) + 1
     else:
         assert vitis_hls is not None
-        for design in designs:
-            row = run_design(vitis_hls, design, args.timeout_seconds, args.run_full_cosim, args.log_tail_lines)
-            results.append(row)
-            status_counts[row["status"]] = status_counts.get(row["status"], 0) + 1
-            print(
-                f"[{row['status']}] record={row['record_id']} top={row['top']} "
-                f"verilog_files={len(row.get('verilog_files', []))} "
-                f"cosim_artifacts={len(row.get('cosim_artifacts', []))}"
-            )
-            if args.stop_on_fail and row["status"] != "pass":
-                break
+        # Append each row as it completes so an interrupted sweep loses at most
+        # the in-flight records and can be continued with --resume.
+        if args.resume:
+            repair_trailing_newline(results_path)
+        elif results_path.exists() and results_path.stat().st_size:
+            # Keep the previous sweep's rows recoverable: truncating here would
+            # destroy them if this fresh run crashes before its first record.
+            os.replace(results_path, results_path.with_name(results_path.name + ".prev"))
+        with results_path.open("a" if args.resume else "w", encoding="utf-8") as results_file:
+
+            def record_result(row: dict[str, Any]) -> None:
+                results.append(row)
+                status_counts[row["status"]] = status_counts.get(row["status"], 0) + 1
+                results_file.write(json.dumps(row, sort_keys=True) + "\n")
+                results_file.flush()
+                print(
+                    f"[{row['status']}] record={row['record_id']} top={row['top']} "
+                    f"verilog_files={len(row.get('verilog_files', []))} "
+                    f"cosim_artifacts={len(row.get('cosim_artifacts', []))}"
+                )
+
+            execute_designs(vitis_hls, pending, args, record_result)
 
     for row in skipped:
         status_counts[row["status"]] = status_counts.get(row["status"], 0) + 1
@@ -401,6 +595,9 @@ def main() -> int:
             "clock": args.clock,
             "vitis_hls": vitis_hls,
             "mode": "full_cosim" if args.run_full_cosim else "verilog_csynth",
+            "input_sha256": corpus_digest,
+            "workers": args.workers,
+            "resumed": len(prior_results),
             "generated": len(designs),
             "skipped": len(skipped),
             "status_counts": status_counts,

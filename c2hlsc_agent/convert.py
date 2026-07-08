@@ -5,7 +5,13 @@ from dataclasses import dataclass, field
 from .analyze import AnalysisResult, FunctionArg
 from .config import AgentConfig
 from .hlsc_generator import HLSC_GENERATOR_PROMPT_ID, HLSC_GENERATOR_SYSTEM_PROMPT
-from .llm import LLMClient, build_generator_user_prompt, extract_hls_source
+from .llm import (
+    LLMClient,
+    build_generator_user_prompt,
+    build_nl_reference_prompt,
+    extract_hls_source,
+    extract_reference_c,
+)
 
 
 @dataclass
@@ -85,6 +91,49 @@ def _generate_conservative_sources(analysis: AnalysisResult, config: AgentConfig
     )
 
 
+def _llm_candidate(
+    analysis: AnalysisResult,
+    config: AgentConfig,
+    llm: LLMClient,
+    conservative: GeneratedSource,
+    attempt: int = 0,
+) -> GeneratedSource | None:
+    """One LLM generation attempt, or ``None`` when unavailable/unparsable."""
+
+    model = getattr(llm, "model", "?")
+    try:
+        original_source = analysis.function.source_path.read_text(encoding="utf-8")
+        user = build_generator_user_prompt(analysis, original_source, nl_spec=getattr(config, "nl_spec", None))
+        if attempt:
+            user += (
+                f"\nThis is independent candidate #{attempt + 1}: take a different pragma/refactoring "
+                "strategy than the most obvious one, while preserving equivalence."
+            )
+        response = llm.complete(HLSC_GENERATOR_SYSTEM_PROMPT, user)
+        source = extract_hls_source(response, analysis.function.name, original_source)
+    except Exception as exc:
+        # Surface the concrete backend failure (main's diagnostic improvement). This note
+        # only survives when every candidate fails and the conservative copy is returned.
+        conservative.transformations.append(
+            f"LLM generation attempt {attempt + 1} failed [{type(exc).__name__}: {exc}]."
+        )
+        return None
+    if not source:
+        return None
+    return GeneratedSource(
+        header=conservative.header,
+        source=source,
+        transformations=[
+            f"LLM HLS-C generator (model={model}, policy={HLSC_GENERATOR_PROMPT_ID}, candidate={attempt + 1}) "
+            "produced a synthesizable translation unit."
+            + (" User NL design intent was included in the prompt." if getattr(config, "nl_spec", None) else ""),
+            "Verifier-gated: output is checked by host equivalence and Vitis CSim/CSynth/CoSim; "
+            "failures trigger repair or fall back to the conservative copy.",
+        ],
+        interface_pragmas=[],
+    )
+
+
 def generate_hls_sources(
     analysis: AnalysisResult,
     config: AgentConfig,
@@ -97,42 +146,66 @@ def generate_hls_sources(
     synthesizable translation unit and uses it in place of the verbatim copy. The
     conservative deterministic source is always built first and used as the fallback if
     the LLM is unavailable or its output cannot be parsed, so behaviour stays safe and
-    the verifier remains the equivalence gate.
+    the verifier remains the equivalence gate. ``config.nl_spec`` (user natural-language
+    design intent) is included in the generator prompt when present.
     """
 
     conservative = _generate_conservative_sources(analysis, config)
     if llm is None or not getattr(config, "use_llm", False):
         return conservative
 
-    model = getattr(llm, "model", "?")
-    llm_error: str | None = None
-    try:
-        original_source = analysis.function.source_path.read_text(encoding="utf-8")
-        response = llm.complete(
-            HLSC_GENERATOR_SYSTEM_PROMPT,
-            build_generator_user_prompt(analysis, original_source),
-        )
-        source = extract_hls_source(response, analysis.function.name, original_source)
-    except Exception as exc:
-        source = None
-        llm_error = f"{type(exc).__name__}: {exc}"
-
-    if not source:
-        reason = llm_error or "model returned no usable translation unit"
+    candidate = _llm_candidate(analysis, config, llm, conservative)
+    if candidate is None:
+        # _llm_candidate records the specific failure reason (from main) on conservative.
         conservative.transformations.append(
-            f"LLM HLS-C generation requested (model={model}) but unavailable or unparsable "
-            f"[{reason}]; fell back to the conservative top-function copy."
+            f"LLM HLS-C generation requested (model={getattr(llm, 'model', '?')}) but unavailable or "
+            "unparsable; fell back to the conservative top-function copy."
         )
         return conservative
+    return candidate
 
-    return GeneratedSource(
-        header=conservative.header,
-        source=source,
-        transformations=[
-            f"LLM HLS-C generator (model={model}, policy={HLSC_GENERATOR_PROMPT_ID}) produced a "
-            "synthesizable translation unit.",
-            "Verifier-gated: output is checked by host equivalence and Vitis CSim/CSynth/CoSim; "
-            "failures trigger repair or fall back to the conservative copy.",
-        ],
-        interface_pragmas=[],
-    )
+
+def generate_hls_source_candidates(
+    analysis: AnalysisResult,
+    config: AgentConfig,
+    llm: LLMClient,
+    count: int,
+) -> list[GeneratedSource]:
+    """Generate up to ``count`` independent LLM candidates (structural-gate filtered)."""
+
+    conservative = _generate_conservative_sources(analysis, config)
+    candidates: list[GeneratedSource] = []
+    seen: set[str] = set()
+    for attempt in range(max(1, count)):
+        candidate = _llm_candidate(analysis, config, llm, conservative, attempt=attempt)
+        if candidate is None:
+            continue
+        key = "".join(candidate.source.split())
+        if key in seen:
+            continue
+        seen.add(key)
+        candidates.append(candidate)
+    return candidates
+
+
+class ReferenceGenerationError(RuntimeError):
+    """The LLM backend call for the NL golden reference failed (not just unparsable)."""
+
+
+def generate_reference_c(nl_spec: str, top_name: str, llm: LLMClient) -> str | None:
+    """NL-only mode: generate the plain-C golden reference implementation.
+
+    The result becomes ``input.c`` — the equivalence oracle the generated testbench and
+    the whole verifier ladder compare against — so the rest of the pipeline runs exactly
+    as in the C-input modes. Returns ``None`` when the model answered but the output is
+    unparsable; raises :class:`ReferenceGenerationError` when the backend CALL itself
+    failed (CLI error, timeout, auth/HTTP error) so the caller can report the real cause
+    instead of blaming the model's answer.
+    """
+
+    system, user = build_nl_reference_prompt(nl_spec, top_name)
+    try:
+        response = llm.complete(system, user)
+    except Exception as exc:  # noqa: BLE001 — surface the backend failure with context
+        raise ReferenceGenerationError(str(exc)) from exc
+    return extract_reference_c(response, top_name)

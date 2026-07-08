@@ -5,9 +5,11 @@ import subprocess
 from pathlib import Path
 
 from .equivalence import PhaseResult, VerificationState, parse_mismatches, run_command
+from .remote import RemoteVitis
 
 
 PHASE_ORDER = ("software_equivalence", "csim", "csynth", "cosim")
+PHASE_TIMEOUTS = {"csim": 600, "csynth": 1200, "cosim": 600}
 
 
 def earliest_failing_phase(state: VerificationState, run_vitis_requested: bool) -> str | None:
@@ -20,19 +22,47 @@ def earliest_failing_phase(state: VerificationState, run_vitis_requested: bool) 
     return None
 
 
+def _timeout_result(project_dir: Path, phase: str, exc: subprocess.TimeoutExpired, label: str) -> PhaseResult:
+    """Build a timeout PhaseResult that keeps the partial evidence.
+
+    ``run_command`` writes the partial log to ``<phase>.log`` before raising, so the
+    repair agent still gets the log tail instead of a bare one-line summary.
+    """
+
+    log_path = project_dir / f"{phase}.log"
+    return PhaseResult(
+        phase,
+        "fail",
+        stdout=str(exc.output or ""),
+        stderr=str(exc.stderr or ""),
+        log_path=log_path if log_path.exists() else None,
+        summary=f"{label} timed out after {exc.timeout}s",
+    )
+
+
 def run_software_equivalence(project_dir: Path, verbose: bool = False) -> PhaseResult:
     try:
         result = run_command(["make", "test"], project_dir, "software_equivalence", timeout=120)
     except FileNotFoundError:
         return PhaseResult("software_equivalence", "fail", summary="make not found")
     except subprocess.TimeoutExpired as exc:
-        return PhaseResult("software_equivalence", "fail", summary=f"host equivalence timed out: {exc}")
+        return _timeout_result(project_dir, "software_equivalence", exc, "host equivalence")
     if verbose and result.stdout:
         print(result.stdout)
     return result
 
 
-def run_vitis(project_dir: Path, run_requested: bool) -> dict[str, PhaseResult]:
+def _run_vitis_phase(project_dir: Path, phase: str, remote: RemoteVitis | None) -> PhaseResult:
+    timeout = PHASE_TIMEOUTS[phase]
+    try:
+        if remote is not None:
+            return remote.run_phase(project_dir, phase, timeout)
+        return run_command(["vitis_hls", "-f", f"run_{phase}.tcl"], project_dir, phase, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        return _timeout_result(project_dir, phase, exc, f"Vitis {phase}")
+
+
+def run_vitis(project_dir: Path, run_requested: bool, remote: RemoteVitis | None = None) -> dict[str, PhaseResult]:
     phases = {
         "csim": PhaseResult("csim", "skipped"),
         "csynth": PhaseResult("csynth", "skipped"),
@@ -40,38 +70,52 @@ def run_vitis(project_dir: Path, run_requested: bool) -> dict[str, PhaseResult]:
     }
     if not run_requested:
         return phases
-    if shutil.which("vitis_hls") is None:
-        message = "vitis_hls not found on PATH"
+
+    if remote is not None:
+        try:
+            push = remote.push(project_dir)
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            push = PhaseResult("vitis_push", "fail", summary=f"project sync to {remote.host} failed: {exc}")
+        if push.status != "pass":
+            # Infrastructure failure, not a code defect: mark it "remote vitis unavailable"
+            # so classify_failure treats it as toolchain_unavailable (blocked) and the
+            # auto-repair loop does NOT mutate correct source over a transient network fault.
+            message = f"remote vitis unavailable: project sync to {remote.host} failed: {push.summary or push.stderr.strip()[-400:]}"
+            return {
+                "csim": PhaseResult("csim", "fail", summary=message),
+                "csynth": PhaseResult("csynth", "blocked", summary=message),
+                "cosim": PhaseResult("cosim", "blocked", summary=message),
+            }
+    elif shutil.which("vitis_hls") is None:
+        message = "vitis_hls not found on PATH (use --vitis-ssh to run Vitis on a remote Linux host)"
         return {
             "csim": PhaseResult("csim", "fail", summary=message),
             "csynth": PhaseResult("csynth", "blocked", summary=message),
             "cosim": PhaseResult("cosim", "blocked", summary=message),
         }
-    try:
-        phases["csim"] = run_command(["vitis_hls", "-f", "run_csim.tcl"], project_dir, "csim", timeout=600)
-    except subprocess.TimeoutExpired as exc:
-        phases["csim"] = PhaseResult("csim", "fail", summary=f"Vitis CSim timed out: {exc}")
-    if phases["csim"].status != "pass":
-        message = "csim failed"
-        phases["csynth"] = PhaseResult("csynth", "blocked", summary=message)
-        phases["cosim"] = PhaseResult("cosim", "blocked", summary=message)
-        return phases
 
     try:
-        phases["csynth"] = run_command(["vitis_hls", "-f", "run_csynth.tcl"], project_dir, "csynth", timeout=1200)
-    except subprocess.TimeoutExpired as exc:
-        phases["csynth"] = PhaseResult("csynth", "fail", summary=f"Vitis synthesis timed out: {exc}")
-    if phases["csynth"].status != "pass":
-        phases["cosim"] = PhaseResult("cosim", "blocked", summary="csynth failed")
-        return phases
+        phases["csim"] = _run_vitis_phase(project_dir, "csim", remote)
+        if phases["csim"].status != "pass":
+            message = "csim failed"
+            phases["csynth"] = PhaseResult("csynth", "blocked", summary=message)
+            phases["cosim"] = PhaseResult("cosim", "blocked", summary=message)
+            return phases
 
-    try:
-        phases["cosim"] = run_command(["vitis_hls", "-f", "run_cosim.tcl"], project_dir, "cosim", timeout=600)
-    except subprocess.TimeoutExpired as exc:
-        phases["cosim"] = PhaseResult("cosim", "fail", summary=f"Vitis CoSim timed out: {exc}")
-    else:
+        phases["csynth"] = _run_vitis_phase(project_dir, "csynth", remote)
+        if phases["csynth"].status != "pass":
+            phases["cosim"] = PhaseResult("cosim", "blocked", summary="csynth failed")
+            return phases
+
+        phases["cosim"] = _run_vitis_phase(project_dir, "cosim", remote)
         phases["cosim"] = _gate_cosim_on_log(phases["cosim"])
-    return phases
+        return phases
+    finally:
+        if remote is not None:
+            try:
+                remote.pull(project_dir)
+            except (subprocess.TimeoutExpired, OSError):
+                pass  # best-effort artifact pull; phase logs are already local
 
 
 _COSIM_FAILURE_MARKERS = (
@@ -85,7 +129,8 @@ _COSIM_FAILURE_MARKERS = (
 def _gate_cosim_on_log(result: PhaseResult) -> PhaseResult:
     """Vitis can exit 0 while the CoSim log reports a mismatch. Downgrade pass->fail when
     the log carries an explicit co-simulation failure marker, so a zero exit code cannot
-    silently defeat the C/RTL equivalence gate."""
+    silently defeat the C/RTL equivalence gate. Works for the remote path too: the local
+    <phase>.log holds the ssh console output, which carries the co-simulation verdict."""
     if result.status != "pass":
         return result
     haystack = f"{result.stdout}\n{result.stderr}".lower()
@@ -107,7 +152,12 @@ def _gate_cosim_on_log(result: PhaseResult) -> PhaseResult:
     return result
 
 
-def verify_project(project_dir: Path, run_vitis_requested: bool, verbose: bool = False) -> VerificationState:
+def verify_project(
+    project_dir: Path,
+    run_vitis_requested: bool,
+    verbose: bool = False,
+    remote: RemoteVitis | None = None,
+) -> VerificationState:
     state = VerificationState()
     software = run_software_equivalence(project_dir, verbose=verbose)
     state.add_phase(software)
@@ -117,6 +167,6 @@ def verify_project(project_dir: Path, run_vitis_requested: bool, verbose: bool =
         state.add_phase(PhaseResult("csynth", "blocked", summary="software equivalence failed"))
         state.add_phase(PhaseResult("cosim", "blocked", summary="software equivalence failed"))
         return state
-    for result in run_vitis(project_dir, run_vitis_requested).values():
+    for result in run_vitis(project_dir, run_vitis_requested, remote=remote).values():
         state.add_phase(result)
     return state
