@@ -512,7 +512,208 @@ class OptimizerReviewFixTests(OptimizerLoopTests):
             self.assertIn("attempt #2", user)
 
 
+class TargetEvaluationTests(unittest.TestCase):
+    def test_targets_met_and_gaps(self):
+        from c2hlsc_agent.qor import PPATargets, evaluate_targets
+
+        targets = PPATargets(max_latency_cycles=200, min_slack_ns=0.5, max_area_um2=1000.0, max_power_w=2e-3)
+        self.assertTrue(targets.specified)
+        self.assertTrue(targets.needs_local_ppa)
+        good = QoRMetrics(latency_worst=150, sta_worst_slack_max_ns=1.2, yosys_area_um2=900.0, sta_total_power_w=1e-3)
+        met, gaps, gap = evaluate_targets(good, targets)
+        self.assertTrue(met)
+        self.assertEqual(gaps, [])
+        self.assertEqual(gap, 0.0)
+        bad = QoRMetrics(latency_worst=300, sta_worst_slack_max_ns=0.1, yosys_area_um2=1500.0, sta_total_power_w=5e-3)
+        met, gaps, gap = evaluate_targets(bad, targets)
+        self.assertFalse(met)
+        self.assertEqual(len(gaps), 4)
+        self.assertGreater(gap, 0.0)
+
+    def test_missing_measurement_counts_as_unmet(self):
+        from c2hlsc_agent.qor import PPATargets, evaluate_targets
+
+        targets = PPATargets(min_slack_ns=0.5)
+        met, gaps, gap = evaluate_targets(QoRMetrics(latency_worst=100), targets)
+        self.assertFalse(met)
+        self.assertIn("no measurement", gaps[0])
+        self.assertEqual(gap, 1.0)
+
+    def test_latency_only_targets_do_not_need_local_ppa(self):
+        from c2hlsc_agent.qor import PPATargets
+
+        self.assertFalse(PPATargets(max_latency_cycles=100).needs_local_ppa)
+        self.assertFalse(PPATargets().specified)
+
+
+class LocalPPATests(unittest.TestCase):
+    def test_scripts_reference_flow(self):
+        from c2hlsc_agent.local_ppa import _sta_script, _yosys_script
+
+        ys = _yosys_script([Path("/x/rtl/top.v")], "cnn_conv3x3", Path("/lib/n45.lib"), 10.0, Path("syn/net.v"))
+        self.assertIn("read_verilog /x/rtl/top.v", ys)
+        self.assertIn("dfflibmap -liberty /lib/n45.lib", ys)
+        self.assertIn("abc -liberty /lib/n45.lib -D 10000", ys)
+        self.assertIn("stat -liberty", ys)
+        tcl = _sta_script(Path("/lib/n45.lib"), Path("syn/net.v"), "cnn_conv3x3", 10.0, "ap_clk")
+        self.assertIn("create_clock -name ap_clk -period 10.0", tcl)
+        self.assertIn("report_worst_slack -max", tcl)
+        self.assertIn("report_power", tcl)
+        self.assertIn("-group_path_count 3", tcl)  # non-deprecated OpenSTA flag
+
+    def test_generate_cell_models_from_liberty(self):
+        from c2hlsc_agent.local_ppa import generate_cell_models
+
+        liberty = (
+            'cell (INV_X1) {\n'
+            '  pin (A) { direction : input; }\n'
+            '  pin (ZN) { direction : output; function : "!A"; }\n'
+            '}\n'
+        )
+        netlist = "module top(a, z);\n  INV_X1 u0 ( .A(a), .ZN(z) );\nendmodule\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            lib = Path(tmp) / "n.lib"; lib.write_text(liberty, encoding="utf-8")
+            net = Path(tmp) / "net.v"; net.write_text(netlist, encoding="utf-8")
+            out = Path(tmp) / "cells_sim.v"
+            n = generate_cell_models(lib, net, out)
+            text = out.read_text(encoding="utf-8")
+        self.assertEqual(n, 1)
+        self.assertIn("module INV_X1(ZN, A);", text)
+        self.assertIn("assign ZN = ~A;", text)
+
+    def test_generate_cell_models_dff_qn_polarity(self):
+        # QN must be the INVERTED state — the original gen_cell_models.py contract.
+        from c2hlsc_agent.local_ppa import generate_cell_models
+
+        liberty = (
+            'cell (DFF_X1) {\n'
+            '  ff ("IQ", "IQN") { next_state : "D"; clocked_on : "CK"; }\n'
+            '  pin (D) { direction : input; }\n'
+            '  pin (CK) { direction : input; }\n'
+            '  pin (Q) { direction : output; function : "IQ"; }\n'
+            '  pin (QN) { direction : output; function : "IQN"; }\n'
+            '}\n'
+        )
+        netlist = "module top(d, ck, q, qn);\n  DFF_X1 u0 ( .D(d), .CK(ck), .Q(q), .QN(qn) );\nendmodule\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            lib = Path(tmp) / "n.lib"; lib.write_text(liberty, encoding="utf-8")
+            net = Path(tmp) / "net.v"; net.write_text(netlist, encoding="utf-8")
+            out = Path(tmp) / "cells_sim.v"
+            generate_cell_models(lib, net, out)
+            text = out.read_text(encoding="utf-8")
+        self.assertIn("reg IQ;", text)
+        self.assertIn("IQ <= D;", text)
+        self.assertIn("assign Q = IQ;", text)
+        self.assertIn("assign QN = ~IQ;", text)
+
+    def test_run_local_ppa_skips_without_rtl(self):
+        from c2hlsc_agent.local_ppa import run_local_ppa
+
+        with tempfile.TemporaryDirectory() as tmp:
+            metrics, outcome = run_local_ppa(Path(tmp), "top", 10.0)
+        self.assertIsNone(metrics)
+        self.assertEqual(outcome.status, "skipped")
+        self.assertIn("no RTL", outcome.note)
+
+
+def _fake_local_ppa_factory(slacks: list[float]):
+    """Fake run_local_ppa: pops the next slack into the passed metrics."""
+
+    from c2hlsc_agent.local_ppa import LocalPPAOutcome
+
+    def fake(project_dir, top, clock_ns, liberty=None, sta_bin=None, clock_port="ap_clk",
+             gate_sim=True, metrics=None, verbose=False):
+        m = metrics or QoRMetrics()
+        m.sta_worst_slack_max_ns = slacks.pop(0) if slacks else 9.9
+        m.yosys_area_um2 = 900.0
+        m.sta_total_power_w = 1e-3
+        return m, LocalPPAOutcome(status="ok", gate_sim="pass")
+
+    return fake
+
+
+class TargetLoopTests(OptimizerLoopTests):
+    def test_iterates_rounds_until_slack_target_met(self):
+        from c2hlsc_agent.qor import PPATargets
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir, analysis, config = self._project(Path(tmp))
+            # round 0: det cand slack 0.5, llm cand slack 0.4 (det adopted, target unmet)
+            # round 1: llm cand slack 1.2 -> target met, accepted
+            slacks = [0.2, 0.5, 0.4, 1.2, 1.2]  # baseline, det, llm r0, llm r1, final
+            variant = _optimized_cpp("v2").replace("factor=4", "factor=8")
+            llm = SeqLLM([_optimized_cpp("r0"), variant])
+            with mock.patch("c2hlsc_agent.qor_optimizer.run_software_equivalence",
+                            return_value=PhaseResult("software_equivalence", "pass")), \
+                 mock.patch("c2hlsc_agent.qor_optimizer.run_vitis",
+                            side_effect=self._fake_run_vitis([200, 210, 190])), \
+                 mock.patch("c2hlsc_agent.qor_optimizer.run_local_ppa",
+                            side_effect=_fake_local_ppa_factory(slacks)), \
+                 mock.patch("c2hlsc_agent.qor_optimizer.verify_project", return_value=self._passing_state()):
+                outcome = optimize_project(out_dir, analysis, config, llm, None,
+                                           objective="latency", iterations=1,
+                                           targets=PPATargets(min_slack_ns=1.0), max_rounds=3)
+            self.assertTrue(outcome.accepted)
+            self.assertTrue(outcome.targets_met)
+            self.assertEqual(len(outcome.rounds), 2)  # round 0 adopted det, round 1 met target
+            self.assertEqual(outcome.rounds[0]["adopted_candidate"], 0)
+            # round-1 prompt carries the gap text AND the adopted working source
+            _system, user = llm.calls[1]
+            self.assertIn("PPA targets", user)
+            self.assertIn("worst setup slack", user)
+            self.assertIn("PIPELINE II=1", user)  # round 0's adopted deterministic source
+            report = json.loads((out_dir / "qor_report.json").read_text(encoding="utf-8"))
+            self.assertTrue(report["targets_met"])
+            self.assertEqual(report["targets"]["min_slack_ns"], 1.0)
+
+    def test_no_progress_with_targets_reports_gaps(self):
+        from c2hlsc_agent.qor import PPATargets
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir, analysis, config = self._project(Path(tmp))
+            # every candidate has WORSE slack than baseline -> no progress, stop
+            slacks = [0.5, 0.2, 0.1]
+            llm = SeqLLM([_optimized_cpp("worse")])
+            with mock.patch("c2hlsc_agent.qor_optimizer.run_software_equivalence",
+                            return_value=PhaseResult("software_equivalence", "pass")), \
+                 mock.patch("c2hlsc_agent.qor_optimizer.run_vitis",
+                            side_effect=self._fake_run_vitis([200, 210])), \
+                 mock.patch("c2hlsc_agent.qor_optimizer.run_local_ppa",
+                            side_effect=_fake_local_ppa_factory(slacks)):
+                outcome = optimize_project(out_dir, analysis, config, llm, None,
+                                           objective="latency", iterations=1,
+                                           targets=PPATargets(min_slack_ns=1.0), max_rounds=3)
+            self.assertFalse(outcome.accepted)
+            self.assertIn("No candidate made progress", outcome.summary)
+            self.assertIn("slack", outcome.summary)
+
+    def test_baseline_already_meeting_targets_is_a_noop(self):
+        from c2hlsc_agent.qor import PPATargets
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir, analysis, config = self._project(Path(tmp))
+            with mock.patch("c2hlsc_agent.qor_optimizer.run_local_ppa",
+                            side_effect=_fake_local_ppa_factory([5.0])):
+                outcome = optimize_project(out_dir, analysis, config, None, None,
+                                           objective="latency", iterations=0,
+                                           targets=PPATargets(min_slack_ns=1.0), max_rounds=3)
+            self.assertFalse(outcome.accepted)
+            self.assertTrue(outcome.targets_met)
+            self.assertIn("already meets", outcome.summary)
+
+
 class OptimizeCliTests(unittest.TestCase):
+    def test_parser_accepts_targets(self):
+        args = build_parser().parse_args(
+            ["optimize", "--project", "p", "--target-latency", "150", "--target-slack", "0.5",
+             "--target-area", "1000", "--target-power", "2e-3", "--max-rounds", "3",
+             "--local-ppa", "--liberty", "/lib/n45.lib", "--no-gate-sim"]
+        )
+        self.assertEqual(args.target_latency, 150)
+        self.assertAlmostEqual(args.target_power, 2e-3)
+        self.assertEqual(args.max_rounds, 3)
+        self.assertTrue(args.local_ppa)
+
     def test_parser_accepts_optimize(self):
         args = build_parser().parse_args(
             ["optimize", "--project", "p", "--objective", "area", "--iterations", "2",

@@ -36,9 +36,12 @@ from .analyze import AnalysisResult
 from .config import AgentConfig
 from .hls_runner import run_software_equivalence, run_vitis, verify_project
 from .llm import LLMClient, build_qor_prompt, extract_full_file, is_plausible_translation_unit
+from .local_ppa import run_local_ppa
 from .qor import (
+    PPATargets,
     QoRMetrics,
     collect_local_ppa,
+    evaluate_targets,
     find_csynth_xml,
     objective_score,
     parse_csynth_xml,
@@ -67,20 +70,28 @@ class CandidateResult:
     index: int
     kind: str  # "deterministic-pipeline" | "llm"
     status: str  # scored | equiv_fail | csim_fail | csynth_fail | unparsable | duplicate | timing_regressed
+    round_no: int = 0
     source_sha: str | None = None
     score: float | None = None
     metrics: QoRMetrics | None = None
     note: str = ""
+    gap_score: float | None = None  # target shortfall (0.0 = all targets met); None when no targets
+    targets_met: bool | None = None
+    target_gaps: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, object]:
         return {
             "index": self.index,
             "kind": self.kind,
             "status": self.status,
+            "round": self.round_no,
             "source_sha": self.source_sha,
             "score": self.score,
             "metrics": self.metrics.to_dict() if self.metrics else None,
             "note": self.note,
+            "gap_score": self.gap_score,
+            "targets_met": self.targets_met,
+            "target_gaps": list(self.target_gaps),
         }
 
 
@@ -94,6 +105,11 @@ class OptimizeOutcome:
     rolled_back: bool = False
     delta: dict[str, dict[str, object]] = field(default_factory=dict)
     summary: str = ""
+    targets: PPATargets | None = None
+    targets_met: bool | None = None
+    target_gaps: list[str] = field(default_factory=list)
+    rounds: list[dict[str, object]] = field(default_factory=list)
+    local_ppa: dict[str, object] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -106,6 +122,11 @@ class OptimizeOutcome:
             "rolled_back": self.rolled_back,
             "delta": self.delta,
             "summary": self.summary,
+            "targets": self.targets.to_dict() if self.targets else None,
+            "targets_met": self.targets_met,
+            "target_gaps": list(self.target_gaps),
+            "rounds": list(self.rounds),
+            "local_ppa": dict(self.local_ppa),
         }
 
 
@@ -233,6 +254,26 @@ def _pragma_summary(baseline_source: str, candidate_source: str) -> str:
     return "; ".join(parts) or "no pragma changes (refactor only)"
 
 
+def _targets_text(targets: PPATargets | None, gaps: list[str]) -> str:
+    if targets is None:
+        return ""
+    lines = ["PPA targets — the design must meet ALL of these; close the gaps listed:"]
+    if targets.max_latency_cycles is not None:
+        lines.append(f"- latency (worst cycles) <= {targets.max_latency_cycles}")
+    if targets.min_slack_ns is not None:
+        lines.append(f"- worst setup slack >= {targets.min_slack_ns} ns (post-synthesis STA)")
+    if targets.max_area_um2 is not None:
+        lines.append(f"- std-cell area <= {targets.max_area_um2} um^2 (yosys, Nangate45)")
+    if targets.max_power_w is not None:
+        lines.append(f"- total power <= {targets.max_power_w} W (OpenSTA)")
+    if gaps:
+        lines.append("Current gaps of the working design:")
+        lines.extend(f"- {gap}" for gap in gaps)
+    else:
+        lines.append("The working design currently meets all targets; do not regress them.")
+    return "\n".join(lines) + "\n"
+
+
 def _llm_candidate_source(
     analysis: AnalysisResult,
     config: AgentConfig,
@@ -242,6 +283,7 @@ def _llm_candidate_source(
     objective: str,
     history: list[dict[str, object]],
     attempt: int = 0,
+    targets_text: str = "",
 ) -> tuple[str | None, str]:
     system, user = build_qor_prompt(
         analysis,
@@ -251,6 +293,7 @@ def _llm_candidate_source(
         history=history,
         nl_spec=getattr(config, "nl_spec", None),
         attempt=attempt,
+        targets_text=targets_text,
     )
     try:
         response = llm.complete(system, user)
@@ -275,12 +318,33 @@ def optimize_project(
     iterations: int = 4,
     cosim_winner: bool = True,
     ppa_script: str | None = None,
+    targets: PPATargets | None = None,
+    max_rounds: int = 5,
+    local_ppa: bool = False,
+    liberty: str | None = None,
+    sta_bin: str | None = None,
+    clock_port: str = "ap_clk",
+    gate_sim: bool = True,
     verbose: bool = False,
 ) -> OptimizeOutcome:
-    """Run the post-equivalence QoR loop on ``project_dir`` and write the QoR reports."""
+    """Run the post-equivalence QoR loop on ``project_dir`` and write the QoR reports.
+
+    Without ``targets`` this is a single round of candidates and the best improver wins.
+    With ``targets`` (explicit latency / slack / area / power goals) the loop ITERATES:
+    each round's best candidate becomes the new working point and the next round's
+    prompts carry the remaining target gaps, until every target is met, no candidate
+    makes progress, or ``max_rounds`` is exhausted. Slack/area/power come from the local
+    synthesis+STA step (yosys + OpenSTA, with a best-effort gate-level waveform sim) run
+    on each scored candidate's Vitis RTL.
+    """
 
     src_path = project_dir / "src" / "hls_top.cpp"
     baseline_source = src_path.read_text(encoding="utf-8")
+    top = analysis.function.name
+    if targets is not None and not targets.specified:
+        targets = None
+    needs_ppa = local_ppa or (targets is not None and targets.needs_local_ppa)
+    ppa_kwargs = dict(liberty=liberty, sta_bin=sta_bin, clock_port=clock_port, gate_sim=gate_sim, verbose=verbose)
 
     # 1. Baseline metrics: reuse the existing csynth report only when it is fresh
     # (newer than the sources it describes) and parseable; else synthesize once.
@@ -297,79 +361,155 @@ def optimize_project(
         baseline, note = _synth_metrics(project_dir, remote)
         if baseline is None:
             raise RuntimeError(f"cannot establish baseline QoR: {note}")
-    collect_local_ppa(project_dir, baseline)
+    if needs_ppa:
+        _, base_ppa = run_local_ppa(project_dir, top, config.clock, metrics=baseline, **ppa_kwargs)
+        if verbose:
+            print(f"baseline local PPA: {base_ppa.status} ({base_ppa.note or 'ok'})")
+    else:
+        collect_local_ppa(project_dir, baseline)
     baseline_score = objective_score(baseline, objective, baseline)
-    outcome = OptimizeOutcome(objective=objective, baseline=baseline)
+    outcome = OptimizeOutcome(objective=objective, baseline=baseline, targets=targets)
+    if needs_ppa:
+        outcome.local_ppa["baseline"] = base_ppa.to_dict()
     if baseline_score is None:
         raise RuntimeError("baseline csynth report lacks the metrics needed for the objective")
+    if targets is not None:
+        met, gaps, gap = evaluate_targets(baseline, targets)
+        outcome.targets_met, outcome.target_gaps = met, gaps
+        if met:
+            outcome.summary = "Baseline already meets every PPA target; nothing to do."
+            _write_reports(project_dir, outcome)
+            return outcome
+    else:
+        gaps, gap = [], 0.0
     if verbose:
-        print(f"Baseline {objective} score: {baseline_score}")
+        print(f"Baseline {objective} score: {baseline_score}" + (f"; target gaps: {gaps}" if gaps else ""))
 
-    # 2-3. Propose and gate candidates.
+    # 2-3. Propose and gate candidates, round by round.
     seen = {_sha(baseline_source)}
     history: list[dict[str, object]] = []
-    best: tuple[float, int, str] | None = None  # (score, index, source)
+    sources: dict[int, str] = {}
 
-    def consider(index: int, kind: str, source: str | None, note: str) -> None:
-        nonlocal best
-        result = CandidateResult(index=index, kind=kind, status="unparsable", note=note)
+    def consider(index: int, round_no: int, kind: str, source: str | None, note: str) -> CandidateResult:
+        result = CandidateResult(index=index, round_no=round_no, kind=kind, status="unparsable", note=note)
         outcome.candidates.append(result)
         if source is None:
             history.append({"index": index, "kind": kind, "status": result.status, "note": note})
-            return
+            return result
         sha = _sha(source)
         result.source_sha = sha
         if sha in seen:
             result.status = "duplicate"
             history.append({"index": index, "kind": kind, "status": "duplicate"})
-            return
+            return result
         seen.add(sha)
+        sources[index] = source
         cand_dir = _stage_candidate(project_dir, index, source)
         equiv = run_software_equivalence(cand_dir)
         if equiv.status != "pass":
             result.status = "equiv_fail"
             result.note = (equiv.summary or "host equivalence failed").strip()[:300]
             history.append({"index": index, "kind": kind, "status": "equiv_fail", "note": result.note})
-            return
+            return result
         metrics, fail_note = _synth_metrics(cand_dir, remote)
         strategy = _pragma_summary(baseline_source, source)
         if metrics is None:
             result.status = fail_note.split(":", 1)[0] if ":" in fail_note else "csynth_fail"
             result.note = f"{strategy} — {fail_note}"[:300]
             history.append({"index": index, "kind": kind, "status": result.status, "note": result.note})
-            return
+            return result
+        if needs_ppa:
+            _, cand_ppa = run_local_ppa(cand_dir, top, config.clock, metrics=metrics, **ppa_kwargs)
+            outcome.local_ppa[f"cand_{index}"] = cand_ppa.to_dict()
         result.metrics = metrics
         score = objective_score(metrics, objective, baseline)
         result.score = score
         result.note = strategy
+        if targets is not None:
+            result.targets_met, result.target_gaps, result.gap_score = evaluate_targets(metrics, targets)
         if metrics.timing_met is False and baseline.timing_met is not False:
             result.status = "timing_regressed"
             history.append({"index": index, "kind": kind, "status": "timing_regressed", "score": score, "note": strategy})
-            return
+            return result
         result.status = "scored"
-        history.append({"index": index, "kind": kind, "status": "scored", "score": score, "note": strategy})
-        if score is not None and score < (best[0] if best else baseline_score):
-            best = (score, index, source)
+        entry = {"index": index, "kind": kind, "status": "scored", "score": score, "note": strategy}
+        if result.gap_score is not None:
+            entry["note"] = f"{strategy}; remaining target gap {result.gap_score:.3f}"
+        history.append(entry)
         if verbose:
-            print(f"candidate {index} [{kind}]: score={score} (baseline {baseline_score})")
+            gap_text = f", gap={result.gap_score:.3f}" if result.gap_score is not None else ""
+            print(f"candidate {index} [round {round_no}, {kind}]: score={score}{gap_text} (baseline {baseline_score})")
+        return result
 
+    working_source = baseline_source
+    working_metrics = baseline
+    working_score = baseline_score
+    working_gap = gap
+    working_gaps = list(gaps)
+    adopted: tuple[int, str] | None = None  # (index, source) of the current working point
+    rounds_budget = max(1, max_rounds) if targets is not None else 1
     index = 0
-    deterministic = _pipeline_innermost_loops(baseline_source)
-    if deterministic is not None:
-        consider(index, "deterministic-pipeline", deterministic, "")
-        index += 1
-    if llm is not None:
-        for attempt in range(max(0, iterations)):
-            source, note = _llm_candidate_source(
-                analysis, config, llm, baseline_source, baseline, objective, history, attempt=attempt
-            )
-            consider(index, "llm", source, note)
-            index += 1
-    elif verbose:
-        print("No LLM client: only the deterministic pipeline candidate was tried.")
+    stop_reason = ""
 
-    # 4. Promote the best strictly-improving candidate through the FULL ladder.
-    if best is None:
+    for round_no in range(rounds_budget):
+        round_results: list[CandidateResult] = []
+        if round_no == 0:
+            deterministic = _pipeline_innermost_loops(working_source)
+            if deterministic is not None:
+                round_results.append(consider(index, round_no, "deterministic-pipeline", deterministic, ""))
+                index += 1
+        if llm is not None:
+            targets_prompt = _targets_text(targets, working_gaps)
+            for attempt in range(max(0, iterations)):
+                source, note = _llm_candidate_source(
+                    analysis, config, llm, working_source, working_metrics, objective, history,
+                    attempt=attempt, targets_text=targets_prompt,
+                )
+                round_results.append(consider(index, round_no, "llm", source, note))
+                index += 1
+        elif round_no == 0 and verbose:
+            print("No LLM client: only the deterministic pipeline candidate was tried.")
+
+        # Round selection: strictly better than the current working point.
+        improving: list[CandidateResult] = []
+        for cand in round_results:
+            if cand.status != "scored" or cand.score is None:
+                continue
+            if targets is not None:
+                assert cand.gap_score is not None
+                if cand.gap_score < working_gap or (cand.gap_score == working_gap and cand.score < working_score):
+                    improving.append(cand)
+            elif cand.score < working_score:
+                improving.append(cand)
+        if not improving:
+            stop_reason = f"round {round_no}: no candidate improved on the working point"
+            break
+        round_best = min(improving, key=lambda c: (c.gap_score if c.gap_score is not None else 0.0, c.score))
+        adopted = (round_best.index, sources[round_best.index])
+        working_source = sources[round_best.index]
+        working_metrics = round_best.metrics
+        working_score = round_best.score
+        working_gap = round_best.gap_score if round_best.gap_score is not None else 0.0
+        working_gaps = list(round_best.target_gaps)
+        outcome.rounds.append(
+            {
+                "round": round_no,
+                "adopted_candidate": round_best.index,
+                "score": round_best.score,
+                "gap_score": round_best.gap_score,
+                "remaining_gaps": list(round_best.target_gaps),
+            }
+        )
+        if verbose:
+            print(f"round {round_no}: adopted candidate {round_best.index} as the new working point")
+        if targets is not None and round_best.targets_met:
+            stop_reason = f"targets met in round {round_no}"
+            break
+        if targets is None:
+            break  # classic single-pass mode
+
+    # 4. Promote the working point (the last adopted candidate) through the FULL ladder.
+    if adopted is None:
         scored_any = any(c.status in ("scored", "timing_regressed") for c in outcome.candidates)
         infra_notes = [
             c.note for c in outcome.candidates
@@ -381,6 +521,11 @@ def optimize_project(
                 f"QoR optimization could not synthesize any candidate ({infra_notes[0][:200]}); "
                 "no comparison was possible — this is an infrastructure problem, not a QoR verdict."
             )
+        elif targets is not None:
+            outcome.summary = (
+                f"No candidate made progress toward the PPA targets (remaining gaps: {'; '.join(working_gaps) or 'none'}); "
+                "baseline kept."
+            )
         else:
             outcome.summary = (
                 f"No candidate improved the {objective} objective (baseline score {baseline_score}); "
@@ -390,7 +535,8 @@ def optimize_project(
         _write_reports(project_dir, outcome)
         return outcome
 
-    best_score, best_index, best_source = best
+    best_index, best_source = adopted
+    best_score = working_score
     backup = src_path.parent / PRE_QOR_BACKUP
     # Never clobber an existing backup: on repeated optimize runs it must keep holding
     # the TRUE pre-QoR original, not the previous run's already-optimized source.
@@ -439,6 +585,13 @@ def optimize_project(
             except RuntimeError:
                 pass  # keep the candidate-directory metrics
 
+    if needs_ppa:
+        # Authoritative post-acceptance synthesis + waveform + STA on the promoted design.
+        _, final_ppa = run_local_ppa(project_dir, top, config.clock, metrics=winner_metrics, **ppa_kwargs)
+        outcome.local_ppa["final"] = final_ppa.to_dict()
+        if verbose:
+            print(f"final local PPA: {final_ppa.status} (gate sim: {final_ppa.gate_sim})")
+
     if ppa_script:
         ppa_started = time.time()
         try:
@@ -472,9 +625,22 @@ def optimize_project(
 
     outcome.delta = qor_delta(baseline, winner_metrics)
     improvement = f"score {best_score} vs baseline {baseline_score}"
+    targets_note = ""
+    if targets is not None:
+        met, gaps_final, _gap = evaluate_targets(winner_metrics, targets)
+        outcome.targets_met, outcome.target_gaps = met, gaps_final
+        rounds_used = len(outcome.rounds)
+        if met:
+            targets_note = f" All PPA targets MET after {rounds_used} round(s)."
+        else:
+            targets_note = (
+                f" PPA targets NOT fully met after {rounds_used} round(s) "
+                f"(remaining: {'; '.join(gaps_final)}); best improvement kept."
+            )
     outcome.summary = (
         f"Accepted candidate {best_index} ({outcome.candidates[best_index].kind}) for objective "
-        f"'{objective}' ({improvement}); full ladder re-verified. Pre-QoR source kept at src/{PRE_QOR_BACKUP}."
+        f"'{objective}' ({improvement}); full ladder re-verified.{targets_note} "
+        f"Pre-QoR source kept at src/{PRE_QOR_BACKUP}."
     )
     _cleanup_candidates(project_dir, keep_index=best_index)
     _write_reports(project_dir, outcome)

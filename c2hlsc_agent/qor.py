@@ -242,6 +242,71 @@ def qor_delta(baseline: QoRMetrics, candidate: QoRMetrics) -> dict[str, dict[str
 OBJECTIVES = ("latency", "area", "balanced")
 
 
+@dataclass(frozen=True)
+class PPATargets:
+    """Explicit targets the optimization loop iterates toward. All optional; a run with
+    no targets behaves like classic single-pass optimization."""
+
+    max_latency_cycles: int | None = None  # worst-case latency (Vitis csynth)
+    min_slack_ns: float | None = None  # worst setup slack (OpenSTA on the mapped netlist)
+    max_area_um2: float | None = None  # std-cell area (yosys stat)
+    max_power_w: float | None = None  # total power (OpenSTA report_power)
+
+    @property
+    def specified(self) -> bool:
+        return any(v is not None for v in (self.max_latency_cycles, self.min_slack_ns, self.max_area_um2, self.max_power_w))
+
+    @property
+    def needs_local_ppa(self) -> bool:
+        return any(v is not None for v in (self.min_slack_ns, self.max_area_um2, self.max_power_w))
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "max_latency_cycles": self.max_latency_cycles,
+            "min_slack_ns": self.min_slack_ns,
+            "max_area_um2": self.max_area_um2,
+            "max_power_w": self.max_power_w,
+        }
+
+
+def evaluate_targets(metrics: QoRMetrics, targets: PPATargets) -> tuple[bool, list[str], float]:
+    """Check ``metrics`` against ``targets``.
+
+    Returns ``(all_met, gap_descriptions, gap_score)`` where ``gap_score`` sums the
+    normalized shortfalls (0.0 when every specified target is met; a target whose metric
+    is missing counts as fully unmet, 1.0). Lower gap_score = closer to the targets.
+    """
+
+    gaps: list[str] = []
+    gap_score = 0.0
+
+    def check(name: str, value: float | None, limit: float, kind: str) -> None:
+        nonlocal gap_score
+        if value is None:
+            gaps.append(f"{name}: no measurement yet (target {kind} {limit})")
+            gap_score += 1.0
+            return
+        if kind == "<=" and value > limit:
+            short = (value - limit) / max(abs(limit), 1e-12)
+            gaps.append(f"{name}: {value:g} exceeds target {limit:g} (over by {short * 100:.1f}%)")
+            gap_score += min(short, 1.0)
+        elif kind == ">=" and value < limit:
+            short = (limit - value) / max(abs(limit), 1e-12)
+            gaps.append(f"{name}: {value:g} below target {limit:g} (short by {short * 100:.1f}%)")
+            gap_score += min(short, 1.0)
+
+    if targets.max_latency_cycles is not None:
+        latency = metrics.latency_worst if metrics.latency_worst is not None else metrics.interval_max
+        check("latency (worst cycles)", latency, float(targets.max_latency_cycles), "<=")
+    if targets.min_slack_ns is not None:
+        check("worst setup slack (ns)", metrics.sta_worst_slack_max_ns, targets.min_slack_ns, ">=")
+    if targets.max_area_um2 is not None:
+        check("std-cell area (um^2)", metrics.yosys_area_um2, targets.max_area_um2, "<=")
+    if targets.max_power_w is not None:
+        check("total power (W)", metrics.sta_total_power_w, targets.max_power_w, "<=")
+    return (not gaps, gaps, gap_score)
+
+
 def objective_score(metrics: QoRMetrics, objective: str, baseline: QoRMetrics | None = None) -> float | None:
     """Scalar score, LOWER is better. ``None`` when the needed metrics are missing.
 
