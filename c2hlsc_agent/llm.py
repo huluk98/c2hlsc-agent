@@ -497,6 +497,7 @@ def build_qor_prompt(
     history: list[dict[str, object]] | None = None,
     nl_spec: str | None = None,
     attempt: int = 0,
+    targets_text: str = "",
 ) -> tuple[str, str]:
     """Prompt for one QoR-optimization candidate, grounded in the csynth report."""
 
@@ -519,7 +520,7 @@ def build_qor_prompt(
             "point in the design space than the attempts above.\n"
         )
     user = f"""Objective: minimize {objective}.
-Must-preserve top-function signature: `{fn.signature}`
+{targets_text}Must-preserve top-function signature: `{fn.signature}`
 {_nl_spec_section(nl_spec)}
 Current Vitis synthesis report (baseline for this attempt):
 ```

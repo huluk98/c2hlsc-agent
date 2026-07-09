@@ -510,11 +510,49 @@ original source is restored (kept at `src/hls_top.cpp.pre_qor` on success).
 Objectives: `latency` (worst-case cycles), `area` (weighted LUT/FF/DSP/BRAM/URAM proxy),
 `balanced` (latency×area product vs the baseline).
 
-Outputs, per run: `qor_report.json` (baseline, every candidate's metrics/status, delta),
-`qor_report.md`, and `qor_table.tex` — a booktabs baseline-vs-optimized table ready to
-`\input` into a paper. With `--ppa-script syn/run_ppa.sh` the local yosys/OpenSTA flow
-runs after acceptance and its std-cell area, worst slack, and total power join the
-report (ASIC-style PPA next to the FPGA estimates, as in `build/cnn_3x3`).
+### Targeted PPA: iterate until the goals are met
+
+Give the loop explicit power/area/performance goals and it keeps iterating — each
+round's best candidate becomes the new working point and the next round's prompts carry
+the remaining gaps — until **every** target is met, no candidate makes progress, or
+`--max-rounds` is exhausted (exit code 1 when targets were requested but not reached):
+
+```bash
+python -m c2hlsc_agent.cli optimize --project build/cnn_3x3 \
+  --target-latency 150 --target-slack 0.5 --target-area 1000 --target-power 2e-3 \
+  --max-rounds 5 --vitis-ssh luke@linux-box
+```
+
+- `--target-latency` — max worst-case cycles (from the Vitis csynth report)
+- `--target-slack` / `--target-area` / `--target-power` — min worst setup slack (ns),
+  max std-cell area (µm²), max total power (W), measured by the **local
+  synthesis+waveform+STA step** below, which runs automatically on every scored
+  candidate when any of these three targets is set (or with `--local-ppa`).
+
+### Local synthesis + waveform + STA step (slack checking)
+
+Generalized from the `build/cnn_3x3/syn/run_ppa.sh` reference flow, per candidate and
+on the accepted design, entirely on the local machine:
+
+1. **yosys** maps the Vitis-generated RTL (pulled back from the remote run) to the
+   target liberty (Nangate45 by default) → `syn/yosys_area.rpt` + gate netlist;
+2. **gate-level waveform sim** (best-effort): when the project carries the RTL-testbench
+   artifacts (`tb/<top>_tb.sv` + `rtl_vectors/`) and Icarus Verilog is installed, the
+   netlist is simulated against the golden vectors with liberty-derived cell models,
+   dumping `waves/<top>_gate.vcd` for GTKWave;
+3. **OpenSTA** reports worst setup/hold slack, TNS, and power → `syn/sta_report.txt`.
+
+Tool discovery: `--liberty` / `C2HLSC_LIBERTY` / `syn/lib/*.lib`; `--sta-bin` /
+`STA_BIN` / `~/tools/eda/opensta/bin/sta`; `--clock-port` (default `ap_clk`);
+`--no-gate-sim` skips step 2. Every measurement lands in the QoR report and drives the
+target check.
+
+Outputs, per run: `qor_report.json` (baseline, every candidate's metrics/status/target
+gaps, per-round trajectory, delta), `qor_report.md`, and `qor_table.tex` — a booktabs
+baseline-vs-optimized table ready to `\input` into a paper. The delta table includes
+std-cell area, worst slack, and total power whenever the local flow ran (ASIC-style PPA
+next to the FPGA estimates, as in `build/cnn_3x3`). `--ppa-script` remains available to
+run a custom flow instead.
 
 ## Install
 

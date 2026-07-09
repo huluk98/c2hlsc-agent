@@ -120,7 +120,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="latency",
         help="what to minimize; 'balanced' minimizes the latency*area product relative to the baseline",
     )
-    optimize.add_argument("--iterations", type=int, default=4, help="number of LLM optimization candidates (default 4)")
+    optimize.add_argument("--iterations", type=int, default=4, help="number of LLM optimization candidates per round (default 4)")
     optimize.add_argument(
         "--no-cosim-winner",
         action="store_true",
@@ -131,6 +131,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="script run in the project dir after acceptance (e.g. syn/run_ppa.sh); its "
         "yosys_area.rpt / sta_report.txt enrich the QoR report with area/slack/power",
     )
+    targets_group = optimize.add_argument_group(
+        "PPA targets",
+        "explicit goals the loop iterates toward (each round's winner becomes the new "
+        "working point until every specified target is met, no candidate makes progress, "
+        "or --max-rounds is exhausted). Slack/area/power targets enable the local "
+        "synthesis+waveform+STA step (yosys + OpenSTA) on every scored candidate.",
+    )
+    targets_group.add_argument("--target-latency", type=int, help="max worst-case latency in cycles (Vitis csynth)")
+    targets_group.add_argument("--target-slack", type=float, help="min worst setup slack in ns (OpenSTA on the mapped netlist)")
+    targets_group.add_argument("--target-area", type=float, help="max std-cell area in um^2 (yosys stat)")
+    targets_group.add_argument("--target-power", type=float, help="max total power in W (OpenSTA report_power), e.g. 2e-3")
+    targets_group.add_argument("--max-rounds", type=int, default=5, help="max target-driven optimization rounds (default 5)")
+    local = optimize.add_argument_group("local synthesis / STA (waveform PPA step)")
+    local.add_argument(
+        "--local-ppa",
+        action="store_true",
+        help="run the local yosys->gate-sim->OpenSTA step even without slack/area/power targets",
+    )
+    local.add_argument("--liberty", help="liberty file for synthesis/STA (default: syn/lib/*.lib or C2HLSC_LIBERTY)")
+    local.add_argument("--sta-bin", help="OpenSTA binary (default: STA_BIN/C2HLSC_STA env, PATH, or ~/tools/eda/opensta/bin/sta)")
+    local.add_argument("--clock-port", default="ap_clk", help="clock port name for STA (default ap_clk)")
+    local.add_argument("--no-gate-sim", action="store_true", help="skip the gate-level waveform simulation step")
     optimize.add_argument("--verbose", action="store_true", help="print per-candidate progress")
     _add_remote_vitis_arguments(optimize)
     _add_llm_arguments(optimize)
@@ -369,7 +391,15 @@ def run_repair(args: argparse.Namespace) -> int:
 
 
 def run_optimize(args: argparse.Namespace) -> int:
+    from .qor import PPATargets
     from .qor_optimizer import optimize_project
+
+    targets = PPATargets(
+        max_latency_cycles=args.target_latency,
+        min_slack_ns=args.target_slack,
+        max_area_um2=args.target_area,
+        max_power_w=args.target_power,
+    )
 
     project_dir = Path(args.project).resolve()
     if not (project_dir / "src" / "hls_top.cpp").exists():
@@ -408,6 +438,13 @@ def run_optimize(args: argparse.Namespace) -> int:
             iterations=args.iterations,
             cosim_winner=not args.no_cosim_winner,
             ppa_script=args.ppa_script,
+            targets=targets if targets.specified else None,
+            max_rounds=args.max_rounds,
+            local_ppa=args.local_ppa,
+            liberty=args.liberty,
+            sta_bin=args.sta_bin,
+            clock_port=args.clock_port,
+            gate_sim=not args.no_gate_sim,
             verbose=args.verbose,
         )
     except RuntimeError as exc:
@@ -417,6 +454,9 @@ def run_optimize(args: argparse.Namespace) -> int:
     if outcome.rolled_back:
         # The winner failed the acceptance ladder — the project was restored, but the
         # run needs attention; distinguish it from a clean accept/no-improvement.
+        return 1
+    if outcome.targets is not None and outcome.targets_met is False:
+        # Explicit PPA targets were requested and the loop could not reach them.
         return 1
     if not outcome.accepted and outcome.candidates and not any(
         c.status in ("scored", "timing_regressed") for c in outcome.candidates
