@@ -47,14 +47,32 @@ class AgentConfig:
     vitis_remote_dir: str = "~/c2hlsc_runs"
     vitis_setup: str | None = None
     vitis_bin: str = "vitis_hls"
+    # Which backend runs the csynth/cosim ladder. "auto" picks vitis-ssh if a remote
+    # host is configured, else local vitis_hls if on PATH, else the local Bambu backend
+    # (local-hls) if available, else skips. Explicit values: vitis | vitis-ssh | local-hls | none.
+    cosim_backend: str = "auto"
+    # PPA workflow criteria (the `ppa:` config block). The node is a first-class
+    # criterion: every slack/area/power gate is measured against it. min_slack is in
+    # the node's liberty time unit (ns for nangate45/sky130hd, ps for asap7).
+    node: str = "nangate45"
+    run_local_ppa: bool = False
+    min_slack: float | None = None
+    max_area_um2: float | None = None
+    max_power_w: float | None = None
+    max_latency_cycles: int | None = None
+    liberty: str | None = None  # explicit single-liberty override (legacy escape hatch)
 
 
 def _parse_scalar(value: str) -> Any:
     value = value.strip()
     if value == "":
         return {}
-    if value.lower() in {"true", "false"}:
-        return value.lower() == "true"
+    # Match PyYAML's boolean set so the dependency-free fallback parser agrees with the
+    # PyYAML path (e.g. `run_local_ppa: no` -> False either way, not the truthy str "no").
+    if value.lower() in {"true", "yes", "on"}:
+        return True
+    if value.lower() in {"false", "no", "off"}:
+        return False
     if value.lower() in {"null", "none"}:
         return None
     if value.startswith("[") and value.endswith("]"):
@@ -180,6 +198,51 @@ def _argument_config(data: Any) -> ArgumentConfig:
     )
 
 
+def _ppa_block(data: dict[str, Any]) -> dict[str, Any]:
+    """Parse the `ppa:` criteria block. Presence of the block enables the local PPA
+    step by default (that is what "hardwired into the workflow" means) — it can still
+    be disabled explicitly with `run_local_ppa: false`."""
+
+    block = data.get("ppa")
+    if block is None:
+        return {}
+    if not isinstance(block, dict):
+        raise ValueError("config `ppa` must be a mapping (node/min_slack/... keys)")
+    known = {"node", "run_local_ppa", "min_slack", "max_area_um2", "max_power_w", "max_latency_cycles", "liberty"}
+    unknown = set(block) - known
+    if unknown:
+        raise ValueError(f"unknown ppa config keys: {sorted(unknown)} (expected {sorted(known)})")
+    node = str(block.get("node", "nangate45"))
+    from .nodes import NODES  # local import keeps config importable without heavy deps
+
+    if node not in NODES:
+        raise ValueError(f"unknown ppa node {node!r}; expected one of {', '.join(sorted(NODES))}")
+    criteria = {
+        "min_slack": (float(block["min_slack"]) if block.get("min_slack") is not None else None),
+        "max_area_um2": (float(block["max_area_um2"]) if block.get("max_area_um2") is not None else None),
+        "max_power_w": (float(block["max_power_w"]) if block.get("max_power_w") is not None else None),
+        "max_latency_cycles": (int(block["max_latency_cycles"]) if block.get("max_latency_cycles") is not None else None),
+    }
+    any_criterion = any(v is not None for v in criteria.values())
+    # run_local_ppa is the single switch that runs the step. A declared hard criterion
+    # must be enforced, so it forces the switch on; an explicit `run_local_ppa: false`
+    # alongside a criterion is a contradiction we surface loudly rather than silently
+    # dropping the criterion (finding: asymmetric gate-enable).
+    explicit_off = block.get("run_local_ppa") is False
+    if any_criterion and explicit_off:
+        declared = [k for k, v in criteria.items() if v is not None]
+        raise ValueError(
+            f"ppa.run_local_ppa is false but these criteria were declared and would be "
+            f"silently ignored: {declared}. Remove the criteria or set run_local_ppa: true."
+        )
+    return {
+        "node": node,
+        "run_local_ppa": bool(block.get("run_local_ppa", True)) or any_criterion,
+        "liberty": (str(block["liberty"]) if block.get("liberty") else None),
+        **criteria,
+    }
+
+
 def load_config(path: Path | None) -> AgentConfig:
     if path is None:
         return AgentConfig()
@@ -218,6 +281,8 @@ def load_config(path: Path | None) -> AgentConfig:
         vitis_remote_dir=str(data.get("vitis_remote_dir", "~/c2hlsc_runs")),
         vitis_setup=(str(data["vitis_setup"]) if data.get("vitis_setup") else None),
         vitis_bin=str(data.get("vitis_bin", "vitis_hls")),
+        cosim_backend=str(data.get("cosim_backend", "auto")),
+        **_ppa_block(data),
     )
 
 
@@ -276,6 +341,26 @@ def merge_cli_config(config: AgentConfig, args: Any) -> AgentConfig:
         config.vitis_setup = args.vitis_setup
     if getattr(args, "vitis_bin", None):
         config.vitis_bin = args.vitis_bin
+    if getattr(args, "cosim_backend", None):
+        config.cosim_backend = args.cosim_backend
+    if getattr(args, "node", None):
+        config.node = args.node
+    if getattr(args, "min_slack", None) is not None:
+        config.min_slack = float(args.min_slack)
+        config.run_local_ppa = True
+    if getattr(args, "max_area", None) is not None:
+        config.max_area_um2 = float(args.max_area)
+        config.run_local_ppa = True
+    if getattr(args, "max_power", None) is not None:
+        config.max_power_w = float(args.max_power)
+        config.run_local_ppa = True
+    if getattr(args, "max_latency", None) is not None:
+        config.max_latency_cycles = int(args.max_latency)
+        config.run_local_ppa = True
+    if getattr(args, "local_ppa", False):
+        config.run_local_ppa = True
+    if getattr(args, "liberty", None):
+        config.liberty = args.liberty
     # Fold in the env var here (not only in RemoteVitis.from_config) so the
     # "remote host implies --run-vitis" rule below applies to it too.
     config.vitis_ssh_host = config.vitis_ssh_host or os.environ.get("C2HLSC_VITIS_SSH")

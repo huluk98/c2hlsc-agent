@@ -146,6 +146,11 @@ def _phase_text(state: VerificationState, phase: str) -> str:
 
 def classify_log_family(phase: str, text: str) -> str:
     lowered = text.lower()
+    if "local-hls backend" in lowered:
+        # A local-hls (Bambu) csynth/cosim failure: the backend synthesizes the
+        # golden C, so this is a backend/toolchain limitation, not a repairable
+        # HLS-C defect. Route to a blocked family so no HLS-C mutation happens.
+        return "local_hls_backend"
     if "vitis_hls not found" in lowered or "remote vitis unavailable" in lowered:
         return "toolchain_unavailable"
     if re.search(r"\b(timeout|timed out|deadlock|stdout-silence)\b", lowered):
@@ -230,6 +235,17 @@ def classify_failure(
             continue
         text = _phase_text(state, phase)
         family = classify_log_family(phase, text)
+        if family == "local_hls_backend":
+            return FailureAnalysis(
+                family="local_hls_backend",
+                owner_agent="cosim_operator",
+                next_action="A local-hls (Bambu) csynth/cosim failure reflects the golden-C to RTL path "
+                "or a Bambu limitation, not a repairable HLS-C defect; inspect the Bambu log, or use the "
+                "Vitis backend for HLS-C-accurate cosim. HLS-C is left untouched.",
+                evidence_needed=("bambu log excerpt", "top function", "unsupported construct or mismatch"),
+                repair_scope="backend/toolchain (no HLS-C mutation)",
+                status="blocked",
+            )
         if family == "toolchain_unavailable":
             return FailureAnalysis(
                 family=family,

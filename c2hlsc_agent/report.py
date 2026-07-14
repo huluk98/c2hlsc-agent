@@ -27,7 +27,14 @@ def final_status(state: VerificationState, run_vitis: bool, diagnostics_has_erro
     required = ["software_equivalence"]
     if run_vitis:
         required.extend(["csim", "csynth", "cosim"])
-    return "pass" if all(state.status_for(phase) == "pass" for phase in required) else "fail"
+    if all(state.status_for(phase) == "pass" for phase in required):
+        # The PPA workflow-criteria phase gates only when it actually reached a verdict.
+        # A "skipped" ppa (tools/RTL missing, no hard criteria) is recorded for
+        # transparency but does not fail the run; a "fail" (a declared criterion unmet or
+        # the gate-level sim failed) does. This keeps the headline status and the convert
+        # exit code in agreement.
+        return "fail" if state.status_for("ppa") == "fail" else "pass"
+    return "fail"
 
 
 def write_reports(

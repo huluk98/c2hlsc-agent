@@ -379,6 +379,60 @@ the earliest failing Vitis stage remotely, classify locally, repair locally with
 Claude CLI, re-run the full ladder — no manual log ferrying (the `repair` subcommand
 remains available for air-gapped setups).
 
+### Local co-simulation without Vitis (`--cosim-backend local-hls`)
+
+On a machine without Vitis (e.g. an Apple Silicon Mac), the whole `csynth`/`cosim`
+ladder can run locally with the open-source [PandA Bambu](https://github.com/ferrandi/PandA-bambu)
+HLS tool instead of Xilinx. Bambu synthesizes the golden C reference to Verilog and
+co-simulates it against the C with Verilator; combined with the host
+`software_equivalence` check (generated HLS-C ≡ golden C), this proves the design is
+functionally equivalent to real RTL — no Vitis, no remote host.
+
+One-time setup (downloads the Bambu AppImage and builds a small amd64 runtime image;
+Bambu is x86, so on Apple Silicon it runs in a `linux/amd64` container via Docker):
+
+```bash
+bash scripts/setup_bambu.sh
+```
+
+Then select the backend:
+
+```bash
+python -m c2hlsc_agent.cli convert \
+  --config examples/vector_add/config.yaml --out build/vector_add \
+  --cosim-backend local-hls
+```
+
+Backends: `--cosim-backend` is one of `auto` (default), `vitis`, `vitis-ssh`,
+`local-hls`, or `none`. `auto` prefers a configured remote Vitis host, then a local
+`vitis_hls` on `PATH`, then `local-hls` if Bambu is installed, else skips the ladder.
+The Vitis and `--vitis-ssh` paths are unchanged — a Windows/Linux box with Vitis still
+uses them (`--cosim-backend auto` picks Vitis automatically when it is present), so the
+same config runs the accurate Vitis flow there and the local Bambu flow on the Mac.
+
+The synthesized Verilog is collected into the project's `rtl/` directory. Knobs:
+`C2HLSC_BAMBU_TESTS` (co-sim vector count, default 16), `C2HLSC_BAMBU_SIMULATOR`
+(`VERILATOR`, default), `C2HLSC_BAMBU_SQUASHFS`, `C2HLSC_BAMBU_IMAGE`,
+`C2HLSC_LOCAL_HLS_CMD` (replace the whole Bambu invocation, e.g. a native `bambu` on
+Linux).
+
+**Local PPA on Bambu RTL.** `--local-ppa` (or a `ppa:` criteria block) runs the local
+yosys/OpenSTA flow directly on the Bambu-synthesized `rtl/` after a passing ladder —
+yosys area + OpenSTA slack/power, keyed to Bambu's `clock` port. The Vitis-shaped
+self-checking gate testbench does not match Bambu's start/done + memory-bus protocol, so
+the gate-level sim is skipped (Bambu's own cosim already checked function); area/timing/
+power still report normally.
+
+**Auto-repair.** A `local-hls` csynth/cosim failure is classified as a backend
+limitation (`local_hls_backend`, blocked): because the backend synthesizes the *golden* C
+and host `software_equivalence` already proved HLS-C ≡ golden C, such a failure is a
+Bambu/design issue, not a repairable HLS-C defect. `--auto-repair` therefore reports it
+and leaves the HLS-C untouched rather than mutating correct source. For HLS-C-accurate
+cosim that drives repair, use the Vitis backend.
+
+**Scope:** the RTL is Bambu's, not Vitis's, so `local-hls` is a fast local *correctness*
+gate — Vitis QoR (post-P&R latency/area/timing) still comes from the Vitis path.
+
 ### Repair memory and oscillation guard
 
 Every repair is already recorded in `repair_audit.json`; the LLM repair prompt now
@@ -542,10 +596,58 @@ on the accepted design, entirely on the local machine:
    dumping `waves/<top>_gate.vcd` for GTKWave;
 3. **OpenSTA** reports worst setup/hold slack, TNS, and power → `syn/sta_report.txt`.
 
-Tool discovery: `--liberty` / `C2HLSC_LIBERTY` / `syn/lib/*.lib`; `--sta-bin` /
-`STA_BIN` / `~/tools/eda/opensta/bin/sta`; `--clock-port` (default `ap_clk`);
-`--no-gate-sim` skips step 2. Every measurement lands in the QoR report and drives the
-target check.
+Tool discovery: the process node's liberty set (see below) or an explicit `--liberty` /
+`C2HLSC_LIBERTY` override; `--sta-bin` / `STA_BIN` / `~/tools/eda/opensta/bin/sta`;
+`--clock-port` (default `ap_clk`); `--no-gate-sim` skips step 2. Every measurement lands
+in the QoR report and drives the target check.
+
+## PPA Workflow Criteria (process node + slack gate)
+
+The PPA step is a first-class, config-declared workflow criterion — not just an
+optimizer add-on. Declare it in the config `ppa:` block:
+
+```yaml
+ppa:
+  node: nangate45     # nangate45 (45nm, default) | sky130hd (130nm) | asap7 (7nm)
+  min_slack: 0.0      # worst-setup-slack floor, in the node's time unit (ns; ps for asap7)
+  # optional: max_area_um2, max_power_w, max_latency_cycles, run_local_ppa, liberty
+```
+
+The **process node (工艺节点)** picks which standard-cell library every slack/area/power
+number is measured against:
+
+| node | process | role | manufacturable | slack unit |
+|---|---|---|---|---|
+| `nangate45` | 45 nm FreePDK45 | citable open baseline (default) | no | ns |
+| `sky130hd` | SkyWater 130 nm HD | real foundry PDK (chipIgnite/MPW) | **yes** | ns |
+| `asap7` | ASAP7 7 nm RVT | modern-node scaling datapoint | no | ps |
+
+Liberty files are not vendored: they resolve from `<project>/syn/lib`, then the PDK cache
+(`$C2HLSC_PDK_DIR` or `~/.c2hlsc/pdk`), then an on-demand download from
+OpenROAD-flow-scripts (with a jsDelivr fallback). An explicit `--liberty` /
+`C2HLSC_LIBERTY` still overrides the node (legacy single-library path, ns units); a path
+that does not exist is a hard error, never a silent fall-through.
+
+**Where it runs.** During `convert`, once the equivalence ladder passes and RTL exists,
+a `ppa` verification phase synthesizes + times the design on the node and **fails the run
+(nonzero exit)** when a declared criterion is unmet or unverifiable — the headline status,
+`conversion_report.json`, and the exit code always agree. It also drives the `optimize`
+loop's target check. Any declared criterion enables the step automatically; a bare
+`ppa: {run_local_ppa: false}` with criteria declared is rejected as contradictory.
+
+**Standalone + iterate loop.** Every generated project ships a `make ppa` target and the
+`ppa` subcommand:
+
+```bash
+c2hlsc_agent ppa --project <dir> --node sky130hd --min-slack 0.5   # ns
+c2hlsc_agent ppa --project <dir> --node asap7 --min-slack 50       # ps
+make ppa                                                           # baked criteria
+```
+
+Each run writes `ppa_report.json` with the measured metrics and the **slack headroom**
+(measured slack minus the floor) — the iteration budget you can spend on functionality or
+frequency without dropping below the floor. The QoR optimizer surfaces that headroom in
+its candidate prompts so it spends, never overspends, the budget.
 
 Outputs, per run: `qor_report.json` (baseline, every candidate's metrics/status/target
 gaps, per-round trajectory, delta), `qor_report.md`, and `qor_table.tex` — a booktabs

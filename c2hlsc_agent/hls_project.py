@@ -78,6 +78,20 @@ exit
 
 def render_makefile(config: AgentConfig) -> str:
     flags = " ".join(config.compiler_flags)
+    # Bake the config's PPA criteria into the `make ppa` target so the iterate loop
+    # (edit RTL/source -> make ppa -> read slack headroom) needs no re-typed flags and
+    # no external config file — every declared criterion is enforced, not just slack.
+    ppa_flags = f"--node {config.node} --clock {config.clock}"
+    if config.min_slack is not None:
+        ppa_flags += f" --min-slack {config.min_slack}"
+    if config.max_area_um2 is not None:
+        ppa_flags += f" --max-area {config.max_area_um2}"
+    if config.max_power_w is not None:
+        ppa_flags += f" --max-power {config.max_power_w}"
+    if config.max_latency_cycles is not None:
+        ppa_flags += f" --max-latency {config.max_latency_cycles}"
+    if config.top:
+        ppa_flags += f" --top {config.top}"
     return f"""CXX ?= g++
 CXXFLAGS ?= -std=c++17 -Wall -Wextra -I src {flags}
 TB_EXE ?= c2hlsc_tb
@@ -86,7 +100,7 @@ LEVERI_HLS_EXE ?= leveri_hls_tb
 RTL_VECTORS_EXE ?= rtl_vectors_tb
 
 .PHONY: all test leveri-test gcov-coverage klee-coverage coverage \\
-        rtl-vectors rtl-testbench rtl-cosim clean vitis
+        rtl-vectors rtl-testbench rtl-cosim ppa clean vitis
 
 all: test
 
@@ -129,6 +143,13 @@ rtl-testbench:
 
 rtl-cosim:
 \tpython3 tb/run_rtl_sim.py
+
+# PPA workflow criteria: yosys + OpenSTA on the project's RTL, measured on the
+# configured process node; prints the slack headroom (iteration budget) and exits
+# nonzero when a declared criterion (e.g. min_slack) is unmet. Needs the
+# c2hlsc_agent package importable plus yosys/OpenSTA; liberties auto-download.
+ppa:
+\tpython3 -m c2hlsc_agent.cli ppa --project . {ppa_flags}
 
 vitis:
 \tvitis_hls -f run_hls.tcl

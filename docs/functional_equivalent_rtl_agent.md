@@ -101,14 +101,27 @@ stimuli; otherwise keep coverage metrics and counterexamples in the report.
      - Rerun the full verifier from the beginning after every patch.
 
 7. RTL optimizer agent
-   - Inputs: four-stage passing HLS-C, Vitis synthesis reports, optimization policy.
+   - Inputs: four-stage passing HLS-C, Vitis synthesis reports, optimization policy,
+     the configured PPA criteria (process node + slack floor).
    - Outputs: optimized HLS-C candidates, QoR delta, accepted/rejected decisions.
    - Gate:
      - This agent is disabled until functional equivalence is signed off.
+   - PPA workflow criteria (hardwired via the config `ppa:` block):
+     - Every slack/area/power number is measured on the declared process node
+       (`ppa.node`: nangate45 45 nm citable baseline — the default; sky130hd 130 nm
+       manufacturable; asap7 7 nm predictive), via the local yosys + OpenSTA step.
+     - `ppa.min_slack` (node time units) is the slack floor. Measured slack above the
+       floor is the **iteration budget**: spend it on functionality or frequency
+       (more work per cycle, deeper unroll, higher clock) — never accept a candidate
+       that lands below the floor.
+     - The `ppa` verification phase fails the run when a declared criterion is unmet
+       or unverifiable, and its `ppa_report.json` records slack headroom per run so
+       iterations can be compared.
    - Procedures:
      - Try one optimization family at a time: pipeline, unroll, array partition,
        dataflow, interface choice, bitwidth narrowing.
-     - Accept only if host equivalence, CSim, CSynth, and CoSim all pass again.
+     - Accept only if host equivalence, CSim, CSynth, and CoSim all pass again, and
+       the PPA criteria still hold on the configured node.
      - Record QoR deltas and rollback rejected changes.
 
 8. Audit memory agent

@@ -37,6 +37,7 @@ from .config import AgentConfig
 from .hls_runner import run_software_equivalence, run_vitis, verify_project
 from .llm import LLMClient, build_qor_prompt, extract_full_file, is_plausible_translation_unit
 from .local_ppa import run_local_ppa
+from .nodes import resolve_node
 from .qor import (
     PPATargets,
     QoRMetrics,
@@ -48,6 +49,7 @@ from .qor import (
     qor_delta,
     render_latex_table,
     render_markdown,
+    slack_headroom,
 )
 from .remote import RemoteVitis
 from .report import final_status
@@ -254,16 +256,22 @@ def _pragma_summary(baseline_source: str, candidate_source: str) -> str:
     return "; ".join(parts) or "no pragma changes (refactor only)"
 
 
-def _targets_text(targets: PPATargets | None, gaps: list[str]) -> str:
+def _targets_text(
+    targets: PPATargets | None,
+    gaps: list[str],
+    metrics: QoRMetrics | None = None,
+    node: str = "nangate45",
+    time_unit: str = "ns",
+) -> str:
     if targets is None:
         return ""
-    lines = ["PPA targets — the design must meet ALL of these; close the gaps listed:"]
+    lines = [f"PPA targets on process node {node} — the design must meet ALL of these; close the gaps listed:"]
     if targets.max_latency_cycles is not None:
         lines.append(f"- latency (worst cycles) <= {targets.max_latency_cycles}")
     if targets.min_slack_ns is not None:
-        lines.append(f"- worst setup slack >= {targets.min_slack_ns} ns (post-synthesis STA)")
+        lines.append(f"- worst setup slack >= {targets.min_slack_ns} {time_unit} (post-synthesis STA, {node})")
     if targets.max_area_um2 is not None:
-        lines.append(f"- std-cell area <= {targets.max_area_um2} um^2 (yosys, Nangate45)")
+        lines.append(f"- std-cell area <= {targets.max_area_um2} um^2 (yosys, {node})")
     if targets.max_power_w is not None:
         lines.append(f"- total power <= {targets.max_power_w} W (OpenSTA)")
     if gaps:
@@ -271,6 +279,13 @@ def _targets_text(targets: PPATargets | None, gaps: list[str]) -> str:
         lines.extend(f"- {gap}" for gap in gaps)
     else:
         lines.append("The working design currently meets all targets; do not regress them.")
+        headroom = slack_headroom(metrics, targets) if metrics is not None else None
+        if headroom is not None and headroom > 0:
+            lines.append(
+                f"Slack headroom available: {headroom:.3f} {time_unit} above the floor — this is the "
+                "iteration budget. Spend it on functionality or performance (more work per cycle, "
+                "deeper unroll, higher clock), never by regressing below the slack floor."
+            )
     return "\n".join(lines) + "\n"
 
 
@@ -344,7 +359,12 @@ def optimize_project(
     if targets is not None and not targets.specified:
         targets = None
     needs_ppa = local_ppa or (targets is not None and targets.needs_local_ppa)
-    ppa_kwargs = dict(liberty=liberty, sta_bin=sta_bin, clock_port=clock_port, gate_sim=gate_sim, verbose=verbose)
+    node = getattr(config, "node", "nangate45")
+    time_unit = "ns" if liberty else resolve_node(node).time_unit
+    ppa_kwargs = dict(
+        liberty=liberty, sta_bin=sta_bin, clock_port=clock_port, gate_sim=gate_sim,
+        verbose=verbose, node=node,
+    )
 
     # 1. Baseline metrics: reuse the existing csynth report only when it is fresh
     # (newer than the sources it describes) and parseable; else synthesize once.
@@ -374,7 +394,7 @@ def optimize_project(
     if baseline_score is None:
         raise RuntimeError("baseline csynth report lacks the metrics needed for the objective")
     if targets is not None:
-        met, gaps, gap = evaluate_targets(baseline, targets)
+        met, gaps, gap = evaluate_targets(baseline, targets, time_unit=time_unit)
         outcome.targets_met, outcome.target_gaps = met, gaps
         if met:
             outcome.summary = "Baseline already meets every PPA target; nothing to do."
@@ -426,7 +446,7 @@ def optimize_project(
         result.score = score
         result.note = strategy
         if targets is not None:
-            result.targets_met, result.target_gaps, result.gap_score = evaluate_targets(metrics, targets)
+            result.targets_met, result.target_gaps, result.gap_score = evaluate_targets(metrics, targets, time_unit=time_unit)
         if metrics.timing_met is False and baseline.timing_met is not False:
             result.status = "timing_regressed"
             history.append({"index": index, "kind": kind, "status": "timing_regressed", "score": score, "note": strategy})
@@ -459,7 +479,7 @@ def optimize_project(
                 round_results.append(consider(index, round_no, "deterministic-pipeline", deterministic, ""))
                 index += 1
         if llm is not None:
-            targets_prompt = _targets_text(targets, working_gaps)
+            targets_prompt = _targets_text(targets, working_gaps, metrics=working_metrics, node=node, time_unit=time_unit)
             for attempt in range(max(0, iterations)):
                 source, note = _llm_candidate_source(
                     analysis, config, llm, working_source, working_metrics, objective, history,
@@ -627,7 +647,7 @@ def optimize_project(
     improvement = f"score {best_score} vs baseline {baseline_score}"
     targets_note = ""
     if targets is not None:
-        met, gaps_final, _gap = evaluate_targets(winner_metrics, targets)
+        met, gaps_final, _gap = evaluate_targets(winner_metrics, targets, time_unit=time_unit)
         outcome.targets_met, outcome.target_gaps = met, gaps_final
         rounds_used = len(outcome.rounds)
         if met:

@@ -1,0 +1,25 @@
+input_files:
+  - input.c
+top: cnn_conv3x3
+part: xczu7ev-ffvc1156-2-e
+clock: 10
+num_tests: 200
+seed: 7
+interface_mode: ap_memory
+# PPA workflow criteria (工艺节点 + slack gate). nangate45 (45 nm) is the citable
+# baseline; sky130hd is the manufacturable option; asap7 the 7 nm datapoint.
+# min_slack is in the node's time unit (ns here); positive measured slack above it
+# is the iteration budget for adding functionality or raising the clock.
+ppa:
+  node: nangate45
+  min_slack: 0.0
+arguments:
+  in:
+    direction: input
+    length: 9
+  kernel:
+    direction: input
+    length: 9
+  out:
+    direction: output
+    length: 9

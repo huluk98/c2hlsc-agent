@@ -175,6 +175,7 @@ def verify_project(
     run_vitis_requested: bool,
     verbose: bool = False,
     remote: RemoteVitis | None = None,
+    local: "object | None" = None,
 ) -> VerificationState:
     state = VerificationState()
     software = run_software_equivalence(project_dir, verbose=verbose)
@@ -184,6 +185,12 @@ def verify_project(
         state.add_phase(PhaseResult("csim", "blocked", summary="software equivalence failed"))
         state.add_phase(PhaseResult("csynth", "blocked", summary="software equivalence failed"))
         state.add_phase(PhaseResult("cosim", "blocked", summary="software equivalence failed"))
+        return state
+    # local-hls backend: run the whole csynth/cosim ladder locally (Bambu), no Vitis.
+    # It is only constructed when selected, so `local is not None` means "use it".
+    if local is not None and run_vitis_requested:
+        for result in local.run(project_dir).values():
+            state.add_phase(result)
         return state
     for result in run_vitis(project_dir, run_vitis_requested, remote=remote).values():
         state.add_phase(result)

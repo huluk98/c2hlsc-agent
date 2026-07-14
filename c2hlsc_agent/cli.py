@@ -13,6 +13,7 @@ from .hlsc_repair_agent import clear_repair_audit, repair_project
 from .hls_project import write_project
 from .hls_runner import verify_project
 from .llm import build_llm_client, missing_llm_reason
+from .local_hls import LocalHlsCosim, available as local_hls_available, resolve_cosim_backend
 from .remote import RemoteVitis
 from .report import final_status, write_reports
 
@@ -90,11 +91,40 @@ def build_parser() -> argparse.ArgumentParser:
     _add_remote_vitis_arguments(convert)
     convert.add_argument("--cosim-tool", help="cosim simulator tool, e.g. xsim")
     convert.add_argument("--rtl", default="verilog", help="RTL language for cosim, default verilog")
+    convert.add_argument(
+        "--cosim-backend",
+        choices=["auto", "vitis", "vitis-ssh", "local-hls", "none"],
+        help="who runs the csynth/cosim ladder: 'vitis'/'vitis-ssh' (Xilinx), 'local-hls' "
+        "(local Bambu, no Vitis needed), 'none' (skip), or 'auto' (default: vitis-ssh if a "
+        "remote host is set, else local vitis_hls, else local-hls, else skip)",
+    )
     _add_llm_arguments(convert)
     convert.add_argument("--seed", type=int, help="random seed")
     convert.add_argument("--max-iterations", type=int, help="max verification iterations (default 1); repaired reruns require --auto-repair")
     convert.add_argument("--auto-repair", action="store_true", help="apply mechanical and LLM repairs automatically between verification attempts")
     convert.add_argument("--keep-going", action="store_true", help="emit project even when static diagnostics contain errors")
+    ppa_criteria = convert.add_argument_group(
+        "PPA workflow criteria",
+        "process node + slack gate for the local synthesis/STA step (config `ppa:` block); "
+        "runs after the equivalence ladder passes and RTL exists",
+    )
+    ppa_criteria.add_argument(
+        "--node",
+        choices=["nangate45", "sky130hd", "asap7"],
+        help="process node the PPA criteria are measured on (default nangate45; "
+        "sky130hd is the manufacturable option, asap7 the 7 nm predictive datapoint)",
+    )
+    ppa_criteria.add_argument(
+        "--min-slack",
+        type=float,
+        help="minimum worst setup slack in the node's time unit (ns; ps for asap7); "
+        "implies the local PPA step and fails the run when unmet",
+    )
+    ppa_criteria.add_argument(
+        "--local-ppa",
+        action="store_true",
+        help="run the local yosys/OpenSTA PPA step after a passing ladder even without a slack criterion",
+    )
     convert.add_argument("--verbose", action="store_true", help="print command output")
     repair = sub.add_parser("repair", help="apply a repair from externally supplied Vitis/verification evidence")
     repair.add_argument("--project", required=True, help="existing generated project directory")
@@ -149,13 +179,44 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="run the local yosys->gate-sim->OpenSTA step even without slack/area/power targets",
     )
-    local.add_argument("--liberty", help="liberty file for synthesis/STA (default: syn/lib/*.lib or C2HLSC_LIBERTY)")
+    local.add_argument(
+        "--node",
+        choices=["nangate45", "sky130hd", "asap7"],
+        help="process node for the local PPA step (default: config ppa.node, else nangate45); "
+        "slack targets are in the node's time unit (ns; ps for asap7)",
+    )
+    local.add_argument("--liberty", help="explicit liberty file override (default: the node's liberty set, or C2HLSC_LIBERTY)")
     local.add_argument("--sta-bin", help="OpenSTA binary (default: STA_BIN/C2HLSC_STA env, PATH, or ~/tools/eda/opensta/bin/sta)")
     local.add_argument("--clock-port", default="ap_clk", help="clock port name for STA (default ap_clk)")
     local.add_argument("--no-gate-sim", action="store_true", help="skip the gate-level waveform simulation step")
     optimize.add_argument("--verbose", action="store_true", help="print per-candidate progress")
+    optimize.add_argument(
+        "--cosim-backend",
+        choices=["auto", "vitis", "vitis-ssh", "local-hls", "none"],
+        help="scoring backend (default auto). With 'local-hls' (Bambu) the pragma-driven "
+        "QoR loop does not apply — Bambu ignores HLS pragmas — so optimize reports a "
+        "baseline PPA measurement of the local RTL instead of searching candidates",
+    )
     _add_remote_vitis_arguments(optimize)
     _add_llm_arguments(optimize)
+    ppa = sub.add_parser(
+        "ppa",
+        help="measure a project's RTL against the PPA workflow criteria (node + slack headroom) and write ppa_report.json",
+    )
+    ppa.add_argument("--project", required=True, help="generated project directory containing RTL (Vitis syn/verilog, rtl/, or C2HLSC_RTL_DIR)")
+    ppa.add_argument("--top", help="top function name; defaults to conversion_report.json top when available")
+    ppa.add_argument("--config", help="YAML/JSON config file (source of the ppa criteria block)")
+    ppa.add_argument("--node", choices=["nangate45", "sky130hd", "asap7"], help="process node override")
+    ppa.add_argument("--min-slack", type=float, help="minimum worst setup slack in the node's time unit; exit 1 when unmet")
+    ppa.add_argument("--max-area", type=float, help="maximum std-cell area in um^2 (yosys); exit 1 when unmet")
+    ppa.add_argument("--max-power", type=float, help="maximum total power in W (OpenSTA); exit 1 when unmet")
+    ppa.add_argument("--max-latency", type=int, help="maximum worst-case latency in cycles (Vitis csynth); exit 1 when unmet")
+    ppa.add_argument("--clock", type=float, help="clock period in ns (default: config clock, else 10.0)")
+    ppa.add_argument("--liberty", help="explicit liberty file override")
+    ppa.add_argument("--sta-bin", help="OpenSTA binary override")
+    ppa.add_argument("--clock-port", default="ap_clk", help="clock port name for STA (default ap_clk)")
+    ppa.add_argument("--no-gate-sim", action="store_true", help="skip the gate-level waveform simulation step")
+    ppa.add_argument("--verbose", action="store_true", help="print progress")
     return parser
 
 
@@ -258,13 +319,39 @@ def run_convert(args: argparse.Namespace) -> int:
         print(f"Static analysis failed; report written to {out_dir / 'conversion_report.md'}", file=sys.stderr)
         return 1
 
+    # Choose who runs the csynth/cosim ladder. local-hls replaces Vitis entirely
+    # (local Bambu); vitis/vitis-ssh keep the Xilinx path; none skips it.
+    explicit_backend = (config.cosim_backend or "auto").lower() != "auto"
+    backend = resolve_cosim_backend(config, remote)
+    local = None
+    if backend == "local-hls":
+        remote = None
+        # Run the local ladder when the user asked for RTL verification: either
+        # --run-vitis (already set run_vitis) or an explicit --cosim-backend local-hls.
+        # If local-hls was only auto-selected and nothing requested a run, skip it
+        # (same as the Vitis path being available but --run-vitis absent).
+        want_run = config.run_vitis or (explicit_backend and not getattr(args, "no_run_vitis", False))
+        if want_run:
+            local = LocalHlsCosim.from_config(config, analysis, out_dir)
+            if local is None:
+                _, reason = local_hls_available()
+                raise SystemExit(f"--cosim-backend local-hls is unavailable: {reason}")
+            config.run_vitis = True
+    elif backend == "vitis":
+        remote = None
+    elif backend == "none":
+        remote = None
+        config.run_vitis = False
+    if args.verbose:
+        print(f"cosim backend: {backend}" + (" (running local Bambu ladder)" if local is not None else ""))
+
     iterations = max(1, config.max_iterations)
     state = None
     completed_iterations = 0
     seen_signatures = {_project_signature(out_dir)}
     for iteration in range(iterations):
         completed_iterations = iteration + 1
-        state = verify_project(out_dir, config.run_vitis, verbose=args.verbose, remote=remote)
+        state = verify_project(out_dir, config.run_vitis, verbose=args.verbose, remote=remote, local=local)
         status = final_status(state, config.run_vitis, analysis.diagnostics.has_errors)
         if status == "pass":
             break
@@ -287,11 +374,120 @@ def run_convert(args: argparse.Namespace) -> int:
             break
         seen_signatures.add(signature)
     assert state is not None
+    # PPA workflow criteria run only on a functionally-signed-off design, so the slack
+    # numbers always describe RTL that already passed the equivalence ladder. config
+    # parsing guarantees run_local_ppa is True whenever any hard criterion is declared,
+    # so this single switch never silently drops a criterion.
+    if config.run_local_ppa and final_status(state, config.run_vitis, analysis.diagnostics.has_errors) == "pass":
+        # Bambu RTL names its clock `clock` (Vitis uses `ap_clk`) and uses a
+        # start/done + memory-bus protocol the Vitis-shaped self-checking gate
+        # testbench does not match, so drive PPA off the Bambu netlist with the
+        # right clock and no gate sim (Bambu's own cosim already checked function).
+        local_hls_rtl = backend == "local-hls"
+        ppa_phase = _ppa_gate_phase(
+            out_dir, config, verbose=args.verbose,
+            clock_port="clock" if local_hls_rtl else "ap_clk",
+            gate_sim=not local_hls_rtl,
+        )
+        state.add_phase(ppa_phase)
+        print(f"PPA[{config.node}]: {ppa_phase.status} — {ppa_phase.summary}")
+    # final_status now accounts for a present ppa phase, so the headline status, the
+    # report, and the exit code cannot disagree.
     write_reports(project, analysis, generated, config, state, completed_iterations, repair_history)
     status = final_status(state, config.run_vitis, analysis.diagnostics.has_errors)
     if args.verbose:
         print(f"Report: {out_dir / 'conversion_report.md'}")
     return 0 if status == "pass" else 1
+
+
+def _ppa_gate_phase(
+    project_dir: Path,
+    config,
+    verbose: bool = False,
+    clock_port: str = "ap_clk",
+    gate_sim: bool = True,
+    sta_bin: str | None = None,
+):
+    """Run the local PPA step and grade it against the config's criteria.
+
+    Grading: missing RTL or missing local tools -> "skipped" when no hard criteria are
+    set, "fail" when a criterion (min_slack etc.) was declared but cannot be verified
+    (an unverifiable criterion is not a met criterion). A failing gate-level sim always
+    fails the phase — it is a functional verdict, not a QoR one.
+    """
+
+    from .equivalence import PhaseResult
+    from .local_ppa import run_local_ppa
+    from .qor import QoRMetrics, evaluate_targets, find_csynth_xml, parse_csynth_xml, slack_headroom, targets_from_config
+
+    targets = targets_from_config(config)
+    # A max_latency_cycles criterion is measured by Vitis csynth, not by the local
+    # yosys/OpenSTA flow. Seed latency from the project's csynth.xml (when present) so
+    # that criterion can actually be evaluated — matching what the optimize path does.
+    # Without this, a declared latency target is always "no measurement yet" -> fail.
+    seed = QoRMetrics()
+    csynth = find_csynth_xml(project_dir)
+    if csynth is not None:
+        try:
+            seed = parse_csynth_xml(csynth)
+        except RuntimeError:
+            seed = QoRMetrics()  # malformed report: leave latency unmeasured
+    metrics, outcome = run_local_ppa(
+        project_dir,
+        config.top,
+        config.clock,
+        liberty=config.liberty,
+        node=config.node,
+        clock_port=clock_port,
+        gate_sim=gate_sim,
+        sta_bin=sta_bin,
+        metrics=seed,
+        verbose=verbose,
+    )
+    unit = outcome.time_unit
+    report_path = project_dir / "ppa_report.json"
+    payload: dict[str, object] = {
+        "node": outcome.node or config.node,
+        "time_unit": unit,
+        "criteria": targets.to_dict(),
+        "outcome": outcome.to_dict(),
+        "metrics": metrics.to_dict() if metrics is not None else None,
+    }
+    if metrics is None or outcome.status != "ok":
+        note = outcome.note or outcome.status
+        status = "fail" if (outcome.status == "fail" or targets.specified) else "skipped"
+        payload["status"] = status
+        report_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        return PhaseResult("ppa", status, summary=f"node {config.node}: {note}")
+
+    parts = [f"node {outcome.node}"]
+    headroom = slack_headroom(metrics, targets)
+    if metrics.sta_worst_slack_max_ns is not None:
+        parts.append(f"worst slack {metrics.sta_worst_slack_max_ns:g} {unit}")
+        parts.append(f"slack headroom {headroom:+.3f} {unit} (iteration budget)")
+    if metrics.yosys_area_um2 is not None:
+        parts.append(f"area {metrics.yosys_area_um2:g} um^2")
+    if metrics.sta_total_power_w is not None:
+        parts.append(f"power {metrics.sta_total_power_w:.3g} W")
+    if outcome.gate_sim != "skipped":
+        parts.append(f"gate-sim {outcome.gate_sim}")
+    payload["slack_headroom"] = headroom
+
+    if outcome.gate_sim == "fail":
+        payload["status"] = "fail"
+        report_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        return PhaseResult("ppa", "fail", summary="; ".join(parts) + f" — gate-level sim FAILED: {outcome.gate_sim_note}")
+    if targets.specified:
+        met, gaps, _gap_score = evaluate_targets(metrics, targets, time_unit=unit)
+        if not met:
+            payload["status"] = "fail"
+            payload["gaps"] = gaps
+            report_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+            return PhaseResult("ppa", "fail", summary="; ".join(parts) + " — criteria NOT met: " + "; ".join(gaps))
+        parts.append("criteria met")
+    payload["status"] = "pass"
+    report_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    return PhaseResult("ppa", "pass", summary="; ".join(parts))
 
 
 def _project_signature(project_dir: Path) -> str:
@@ -390,21 +586,64 @@ def run_repair(args: argparse.Namespace) -> int:
     return 0 if repair.changed else 1
 
 
+def _optimize_local_hls_baseline(project_dir: Path, config, analysis, verbose: bool = False) -> int:
+    """`optimize` under the local-hls backend: Bambu ignores HLS performance pragmas,
+    so a pragma-variant search cannot move QoR. Synthesize the local RTL if needed and
+    report its baseline PPA (graded against any configured criteria) instead."""
+
+    rtl = sorted((project_dir / "rtl").glob("*.v"))
+    if not rtl:
+        backend = LocalHlsCosim.from_config(config, analysis, project_dir)
+        if backend is None:
+            _, reason = local_hls_available()
+            raise SystemExit(f"no rtl/ to measure and local-hls is unavailable: {reason}")
+        print("optimize[local-hls]: no rtl/ found; synthesizing with Bambu for a baseline...")
+        phases = backend.run(project_dir)
+        if phases["csynth"].status != "pass":
+            raise SystemExit(f"local-hls synthesis failed: {phases['csynth'].summary}")
+    config.run_local_ppa = True
+    phase = _ppa_gate_phase(project_dir, config, verbose=verbose, clock_port="clock", gate_sim=False)
+    print(
+        "\noptimize[local-hls]: the Bambu backend ignores HLS performance pragmas, so the "
+        "pragma-driven QoR search does not apply. Reporting the baseline PPA of the local "
+        "RTL; use --cosim-backend vitis/vitis-ssh to search pragma candidates.\n"
+    )
+    print(f"baseline PPA[{config.node}]: {phase.status} — {phase.summary}")
+    (project_dir / "qor_report.json").write_text(
+        json.dumps(
+            {
+                "backend": "local-hls",
+                "optimization": "not_applicable",
+                "reason": "Bambu ignores HLS performance pragmas; no pragma-driven QoR search is possible.",
+                "baseline_ppa_status": phase.status,
+                "baseline_ppa": phase.summary,
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    # A "fail" here means a declared PPA criterion is unmet and this backend cannot
+    # optimize toward it — surface that as a non-zero exit.
+    return 1 if phase.status == "fail" else 0
+
+
 def run_optimize(args: argparse.Namespace) -> int:
     from .qor import PPATargets
     from .qor_optimizer import optimize_project
-
-    targets = PPATargets(
-        max_latency_cycles=args.target_latency,
-        min_slack_ns=args.target_slack,
-        max_area_um2=args.target_area,
-        max_power_w=args.target_power,
-    )
 
     project_dir = Path(args.project).resolve()
     if not (project_dir / "src" / "hls_top.cpp").exists():
         raise SystemExit(f"{project_dir} does not look like a generated project (no src/hls_top.cpp)")
     config = merge_cli_config(load_config(Path(args.config).resolve() if args.config else None), args)
+    # CLI target flags override the config's hardwired `ppa:` criteria; unset flags
+    # fall back to the config so the workflow criteria apply without re-typing them.
+    targets = PPATargets(
+        max_latency_cycles=args.target_latency if args.target_latency is not None else config.max_latency_cycles,
+        min_slack_ns=args.target_slack if args.target_slack is not None else config.min_slack,
+        max_area_um2=args.target_area if args.target_area is not None else config.max_area_um2,
+        max_power_w=args.target_power if args.target_power is not None else config.max_power_w,
+    )
     if not config.input_files:
         config.input_files = [(project_dir / "input.c").resolve()]
     if not config.input_files[0].exists():
@@ -427,6 +666,11 @@ def run_optimize(args: argparse.Namespace) -> int:
     if remote is not None and args.verbose:
         print(f"Vitis phases will run on {remote.host}; everything else runs locally.")
     analysis = analyze_source(config.input_files[0], config.top, config)
+    if resolve_cosim_backend(config, remote) == "local-hls":
+        # Bambu ignores HLS performance pragmas, so the pragma-variant candidate search
+        # cannot change the RTL. Report the baseline PPA of the local RTL instead of
+        # running a degenerate loop; pragma optimization requires the Vitis backend.
+        return _optimize_local_hls_baseline(project_dir, config, analysis, args.verbose)
     try:
         outcome = optimize_project(
             project_dir,
@@ -440,8 +684,8 @@ def run_optimize(args: argparse.Namespace) -> int:
             ppa_script=args.ppa_script,
             targets=targets if targets.specified else None,
             max_rounds=args.max_rounds,
-            local_ppa=args.local_ppa,
-            liberty=args.liberty,
+            local_ppa=args.local_ppa or config.run_local_ppa,
+            liberty=args.liberty or config.liberty,
             sta_bin=args.sta_bin,
             clock_port=args.clock_port,
             gate_sim=not args.no_gate_sim,
@@ -467,6 +711,27 @@ def run_optimize(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_ppa(args: argparse.Namespace) -> int:
+    """Standalone PPA criteria check: the edit-RTL -> `make ppa` -> read-headroom loop."""
+
+    project_dir = Path(args.project).resolve()
+    config = merge_cli_config(load_config(Path(args.config).resolve() if args.config else None), args)
+    if getattr(args, "clock", None) is not None:
+        config.clock = float(args.clock)
+    if not config.top:
+        config.top = _load_project_top(project_dir)
+    if not config.top:
+        raise SystemExit("--top is required because conversion_report.json does not record a top function")
+    config.run_local_ppa = True
+    phase = _ppa_gate_phase(
+        project_dir, config, verbose=args.verbose, clock_port=args.clock_port,
+        gate_sim=not args.no_gate_sim, sta_bin=args.sta_bin,
+    )
+    print(f"PPA[{config.node}]: {phase.status} — {phase.summary}")
+    print(f"Report: {project_dir / 'ppa_report.json'}")
+    return 0 if phase.status in ("pass", "skipped") else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -476,6 +741,8 @@ def main(argv: list[str] | None = None) -> int:
         return run_repair(args)
     if args.command == "optimize":
         return run_optimize(args)
+    if args.command == "ppa":
+        return run_ppa(args)
     parser.error(f"unknown command {args.command}")
     return 2
 
