@@ -412,9 +412,11 @@ same config runs the accurate Vitis flow there and the local Bambu flow on the M
 
 The synthesized Verilog is collected into the project's `rtl/` directory. Knobs:
 `C2HLSC_BAMBU_TESTS` (co-sim vector count, default 16), `C2HLSC_BAMBU_SIMULATOR`
-(`VERILATOR`, default), `C2HLSC_BAMBU_SQUASHFS`, `C2HLSC_BAMBU_IMAGE`,
-`C2HLSC_LOCAL_HLS_CMD` (replace the whole Bambu invocation, e.g. a native `bambu` on
-Linux).
+(`VERILATOR`, default), `C2HLSC_BAMBU_SETUP` (Bambu `--experimental-setup`; default is
+`BAMBU-BALANCED-MP` = `-O2`; use `BAMBU-AREA-MP` for ~2× smaller area, `BAMBU-PERFORMANCE`
+for speed), `C2HLSC_BAMBU_FLAGS` (any extra bambu flags), `C2HLSC_BAMBU_SQUASHFS`,
+`C2HLSC_BAMBU_IMAGE`, `C2HLSC_LOCAL_HLS_CMD` (replace the whole Bambu invocation, e.g. a
+native `bambu` on Linux).
 
 **Local PPA on Bambu RTL.** `--local-ppa` (or a `ppa:` criteria block) runs the local
 yosys/OpenSTA flow directly on the Bambu-synthesized `rtl/` after a passing ladder —

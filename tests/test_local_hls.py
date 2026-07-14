@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -100,6 +101,27 @@ class RunLadderTests(unittest.TestCase):
             self.assertEqual(phases["csim"].status, "pass")
             # the synthesized RTL is collected into the project's rtl/ dir
             self.assertTrue((project / "rtl" / "vector_add.v").exists())
+
+    def test_bambu_setup_env_appends_experimental_setup(self):
+        captured = {}
+
+        def fake(cmd, capture_output, text, timeout):
+            captured["cmd"] = cmd
+            workdir = next(Path(a) for a in cmd if Path(a).is_dir())
+            (workdir / "vector_add.v").write_text("module vector_add(); endmodule\n")
+            return subprocess.CompletedProcess(cmd, 0, stdout="Number of executions : 1\n", stderr="")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            (project / "golden.c").write_text("void vector_add(){}\n")
+            backend = LocalHlsCosim(
+                golden_c=project / "golden.c", top="vector_add",
+                function_args=_vector_add_args(), num_tests=1, seed=7,
+            )
+            with mock.patch.dict(os.environ, {"C2HLSC_BAMBU_SETUP": "BAMBU-AREA-MP"}), \
+                 mock.patch.object(local_hls.subprocess, "run", side_effect=fake):
+                backend.run(project)
+        self.assertIn("--experimental-setup=BAMBU-AREA-MP", captured["cmd"])
 
     def test_run_reports_failure_on_nonzero_exit(self):
         import tempfile

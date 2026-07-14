@@ -224,6 +224,14 @@ class LocalHlsCosim:
             _testbench_xml(self.function_args, self.num_tests, self.seed), encoding="utf-8"
         )
 
+        # Optimization knobs (Bambu's default is the BAMBU-BALANCED-MP setup, i.e. -O2):
+        #   C2HLSC_BAMBU_SETUP  -> --experimental-setup=<setup> (e.g. BAMBU-AREA, BAMBU-PERFORMANCE)
+        #   C2HLSC_BAMBU_FLAGS  -> any extra bambu flags, shlex-split
+        extra: list[str] = []
+        setup = os.environ.get("C2HLSC_BAMBU_SETUP")
+        if setup:
+            extra.append(f"--experimental-setup={setup}")
+        extra += shlex.split(os.environ.get("C2HLSC_BAMBU_FLAGS", ""))
         cmd = _wrapper_cmd() + [
             str(work),
             "spec.c",
@@ -232,6 +240,7 @@ class LocalHlsCosim:
             "--simulate",
             f"--simulator={os.environ.get('C2HLSC_BAMBU_SIMULATOR', 'VERILATOR')}",
             "--no-clean",
+            *extra,
         ]
         try:
             proc = subprocess.run(
