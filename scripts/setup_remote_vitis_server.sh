@@ -51,7 +51,7 @@ fi
 [[ -n "$VSET" && -f "$VSET" ]] || fail "could not find Vitis settings64.sh — pass --vitis-settings <path>"
 ok "settings64.sh: $VSET"
 # shellcheck disable=SC1090
-source "$VSET"
+. "$VSET"
 command -v rsync     >/dev/null 2>&1 || fail "rsync not on PATH"; ok "rsync: $(command -v rsync)"
 command -v vitis_hls >/dev/null 2>&1 || fail "vitis_hls not on PATH after sourcing settings"; ok "vitis_hls: $(command -v vitis_hls)"
 # xsim is invoked *internally* by vitis_hls for cosim; it need not be on PATH. Report, don't fail.
