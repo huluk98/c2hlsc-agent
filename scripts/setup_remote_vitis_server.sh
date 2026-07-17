@@ -44,8 +44,9 @@ fi
 # --- 2. locate + verify Vitis ----------------------------------------------------------
 echo "[2/4] locating Vitis"
 if [[ -z "$VSET" ]]; then
-  VSET="$(find /opt /tools /usr/local "$HOME" -maxdepth 6 -name settings64.sh 2>/dev/null \
-          | grep -i '/vitis/' | grep -vi '/vivado/' | sort | tail -1 || true)"
+  VSET="$(find /opt /tools /usr/local /DATA /data /scratch /apps /mnt "$HOME" \
+            -maxdepth 7 -name settings64.sh 2>/dev/null \
+          | grep -iE 'vitis' | grep -vi 'vivado' | sort | tail -1 || true)"
 fi
 [[ -n "$VSET" && -f "$VSET" ]] || fail "could not find Vitis settings64.sh — pass --vitis-settings <path>"
 ok "settings64.sh: $VSET"
@@ -53,7 +54,9 @@ ok "settings64.sh: $VSET"
 source "$VSET"
 command -v rsync     >/dev/null 2>&1 || fail "rsync not on PATH"; ok "rsync: $(command -v rsync)"
 command -v vitis_hls >/dev/null 2>&1 || fail "vitis_hls not on PATH after sourcing settings"; ok "vitis_hls: $(command -v vitis_hls)"
-command -v xsim      >/dev/null 2>&1 || fail "xsim not on PATH (cosim needs the simulator)"; ok "xsim: $(command -v xsim)"
+# xsim is invoked *internally* by vitis_hls for cosim; it need not be on PATH. Report, don't fail.
+if command -v xsim >/dev/null 2>&1; then ok "xsim: $(command -v xsim)"
+else echo "  note: 'xsim' not on PATH — fine, Vitis HLS uses its bundled simulator for cosim"; fi
 
 # --- 3. scratch dir --------------------------------------------------------------------
 echo "[3/4] run dir"
