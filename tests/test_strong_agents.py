@@ -73,6 +73,10 @@ class SeqLLM:
         self.model = model
         self._by_attempt: dict[int, tuple[str, str]] = {}
         self._lock = threading.Lock()
+        # Keying by attempt makes `calls` deterministic under concurrency, but a dict
+        # OVERWRITES -- so len(calls) alone cannot catch one attempt dispatched twice
+        # while another never fires. Count invocations separately to keep that check.
+        self.invocations = 0
 
     @property
     def calls(self) -> list[tuple[str, str]]:
@@ -84,6 +88,7 @@ class SeqLLM:
         attempt = int(match.group(1)) - 1 if match else 0
         with self._lock:
             self._by_attempt[attempt] = (system, user)
+            self.invocations += 1
         if not self.responses:
             raise AssertionError("SeqLLM ran out of queued responses")
         if attempt < len(self.responses):
@@ -159,11 +164,18 @@ class ClaudeCLIBackendTests(unittest.TestCase):
         argv = run.call_args.args[0]
         self.assertEqual(argv[:3], ["claude", "-p", "--model"])
         self.assertEqual(argv[3], "opus")
-        self.assertIn("--output-format", argv)
+        self.assertEqual(argv[argv.index("--output-format") + 1], "json")
         self.assertIn("--strict-mcp-config", argv)
         self.assertIn("--no-session-persistence", argv)
         self.assertIn("--system-prompt", argv)
         self.assertEqual(argv[argv.index("--system-prompt") + 1], "SYS")
+        # The two empty-valued flags carry the isolation guarantee documented in CLAUDE.md:
+        # no user/project settings, no tools. Assert the VALUES, not just the flag names.
+        self.assertEqual(argv[argv.index("--setting-sources") + 1], "")
+        self.assertEqual(argv[argv.index("--tools") + 1], "")
+        # --tools is variadic (`--tools <tools...>`), so its empty value only stays empty
+        # because a '-'-prefixed token follows it. Pin that ordering.
+        self.assertTrue(argv[argv.index("--tools") + 2].startswith("-"))
         self.assertEqual(run.call_args.kwargs["input"], "USER")
         self.assertEqual(client.call_count, 1)
 
@@ -185,6 +197,26 @@ class ClaudeCLIBackendTests(unittest.TestCase):
         with mock.patch.object(llm_module.subprocess, "run", return_value=completed):
             with self.assertRaises(RuntimeError):
                 client.complete("SYS", "USER")
+
+    def test_cli_client_surfaces_api_error_when_rc_nonzero_and_stderr_empty(self):
+        # A real API failure (e.g. 529 overload) exits rc=1, prints a full JSON envelope on
+        # stdout, and leaves stderr EMPTY. Checking rc first would discard the only
+        # description of the failure and report an empty reason to the caller.
+        client = ClaudeCLIClient()
+        stdout = json.dumps({
+            "is_error": True, "api_error_status": 529, "total_cost_usd": 0.000592,
+            "result": "API Error: 529 Overloaded. This is a server-side issue.",
+        })
+        completed = subprocess.CompletedProcess(args=[], returncode=1, stdout=stdout, stderr="")
+        with mock.patch.object(llm_module.subprocess, "run", return_value=completed):
+            with self.assertRaises(RuntimeError) as ctx:
+                client.complete("SYS", "USER")
+        msg = str(ctx.exception)
+        self.assertIn("529", msg)
+        self.assertIn("Overloaded", msg)
+        # Failed calls still report spend; it must be accounted, not dropped.
+        self.assertEqual(client.call_count, 1)
+        self.assertAlmostEqual(client.total_cost_usd, 0.000592)
 
     def test_cli_client_raises_on_is_error_envelope(self):
         client = ClaudeCLIClient()
@@ -315,6 +347,8 @@ class CandidateSelectionTests(unittest.TestCase):
             candidates = generate_hls_source_candidates(analysis, config, llm, 3)
         self.assertEqual(len(candidates), 1)
         self.assertEqual(len(llm.calls), 3)
+        # Distinct attempts AND exactly one dispatch each (no duplicate/missing attempt).
+        self.assertEqual(llm.invocations, 3)
 
     def test_selection_prefers_passing_candidate(self):
         variant = CANDIDATE_B.replace("#pragma HLS PIPELINE", "#pragma HLS PIPELINE II=1")

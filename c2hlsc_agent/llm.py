@@ -186,23 +186,41 @@ class ClaudeCLIClient:
             capture_output=True,
             timeout=self._timeout,
         )
-        if proc.returncode != 0:
-            raise RuntimeError(f"claude CLI failed (rc={proc.returncode}): {proc.stderr[-800:]}")
+        # The CLI reports API failures as rc!=0 WITH a complete JSON envelope on stdout and
+        # an EMPTY stderr (verified against a real 529: rc=1, stderr="", and the envelope
+        # carrying is_error/api_error_status/result). So parse the envelope BEFORE trusting
+        # the return code -- checking rc first throws the only description of the failure
+        # away and leaves callers reporting an empty reason.
+        envelope = None
         try:
-            envelope = json.loads(proc.stdout)
-        except ValueError as exc:
-            raise RuntimeError(f"claude CLI returned non-JSON stdout: {proc.stdout[-800:]}") from exc
-        if not isinstance(envelope, dict):
-            raise RuntimeError(f"claude CLI returned a non-object JSON payload: {proc.stdout[-800:]}")
-        if envelope.get("is_error"):
-            raise RuntimeError(f"claude CLI reported an error: {str(envelope.get('result', proc.stdout))[-800:]}")
-        cost = envelope.get("total_cost_usd")
-        with self._usage_lock:
-            self.call_count += 1
-            if isinstance(cost, (int, float)):
-                self.total_cost_usd += float(cost)
-        result = envelope.get("result", "")
-        return result if isinstance(result, str) else str(result)
+            parsed = json.loads(proc.stdout)
+        except ValueError:
+            parsed = None
+        if isinstance(parsed, dict):
+            envelope = parsed
+
+        if envelope is not None:
+            # Failed calls still report spend, so account before raising.
+            cost = envelope.get("total_cost_usd")
+            with self._usage_lock:
+                self.call_count += 1
+                if isinstance(cost, (int, float)):
+                    self.total_cost_usd += float(cost)
+            if envelope.get("is_error") or proc.returncode != 0:
+                status = envelope.get("api_error_status")
+                detail = str(envelope.get("result") or "").strip()[-800:]
+                raise RuntimeError(
+                    f"claude CLI error (rc={proc.returncode}"
+                    + (f", api_status={status}" if status else "")
+                    + f"): {detail or '<no detail in envelope>'}"
+                )
+            result = envelope.get("result", "")
+            return result if isinstance(result, str) else str(result)
+
+        # No usable envelope: fall back to the return code and stderr.
+        if proc.returncode != 0:
+            raise RuntimeError(f"claude CLI failed (rc={proc.returncode}): {(proc.stderr or '')[-800:]}")
+        raise RuntimeError(f"claude CLI returned non-JSON stdout: {proc.stdout[-800:]}")
 
 
 def _text_from_response(response: object) -> str:
