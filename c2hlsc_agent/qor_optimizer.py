@@ -480,6 +480,13 @@ def optimize_project(
                 index += 1
         if llm is not None:
             targets_prompt = _targets_text(targets, working_gaps, metrics=working_metrics, node=node, time_unit=time_unit)
+            # NOTE: these attempts are deliberately SEQUENTIAL, not concurrent. consider()
+            # appends each scored candidate (and its pragma strategy) to `history`, and the
+            # next attempt's prompt carries that as "Already-tried candidates (do NOT
+            # resubmit these strategies)". Generating a round's attempts in parallel would
+            # blind each one to its siblings and cost candidate diversity -- the loop trades
+            # wall-clock for a better search on purpose. Best-of-N generation in convert.py
+            # has no such chaining and IS parallelized.
             for attempt in range(max(0, iterations)):
                 source, note = _llm_candidate_source(
                     analysis, config, llm, working_source, working_metrics, objective, history,

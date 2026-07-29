@@ -131,6 +131,77 @@ def _contract_comment(fn_args: list[FunctionArg], return_type: str, arrays: list
     return "\n".join(lines)
 
 
+# Shared C++ helper prelude: stimulus generators, tolerance compare, clamp. Hoisted to a
+# module constant so the cross-reference differential harness embeds the SAME text —
+# values_equal (the tolerance policy) and the stimulus scheme must not drift between the
+# golden-oracle testbench and the A-vs-B differential oracle.
+CPP_STIMULUS_HELPERS = """template <typename T>
+T random_value(std::mt19937_64& rng) {
+  if (std::numeric_limits<T>::is_integer) {
+    return static_cast<T>(rng());
+  }
+  return static_cast<T>((rng() % 20001) - 10000) / static_cast<T>(100);
+}
+
+template <typename T>
+T bounded_scalar(int test_idx, std::mt19937_64& rng, long long lo, long long hi) {
+  if (hi < lo) return static_cast<T>(lo);
+  long long value = lo;
+  if (test_idx == 0) {
+    value = lo;
+  } else if (test_idx == 1) {
+    value = hi;
+  } else if (test_idx == 2) {
+    value = lo + ((hi - lo) / 2);
+  } else if (test_idx == 3 && lo <= 1 && hi >= 1) {
+    value = 1;
+  } else {
+    const unsigned long long span = static_cast<unsigned long long>(hi - lo) + 1ULL;
+    value = lo + static_cast<long long>(rng() % span);
+  }
+  return static_cast<T>(value);
+}
+
+template <typename T>
+T patterned_value(int test_idx, int element_idx, std::mt19937_64& rng, bool is_unsigned) {
+  if (test_idx == 0) return static_cast<T>(0);
+  if (test_idx == 1) return static_cast<T>(~static_cast<unsigned long long>(0));
+  if (test_idx == 2 && std::numeric_limits<T>::is_integer) {
+    return is_unsigned ? std::numeric_limits<T>::max()
+                       : (element_idx % 2 ? std::numeric_limits<T>::max() : std::numeric_limits<T>::min());
+  }
+  if (test_idx == 3) return static_cast<T>(element_idx % 2 ? 0xAAAAAAAAULL : 0x55555555ULL);
+  return random_value<T>(rng);
+}
+
+template <typename T>
+T output_sentinel(int test_idx, int element_idx) {
+  unsigned long long value = 0x9E3779B97F4A7C15ULL;
+  value ^= static_cast<unsigned long long>(test_idx + 1) * 0xBF58476D1CE4E5B9ULL;
+  value ^= static_cast<unsigned long long>(element_idx + 1) * 0x94D049BB133111EBULL;
+  return static_cast<T>(value);
+}
+
+template <typename T>
+bool values_equal(T a, T b) {
+  if (std::numeric_limits<T>::is_integer) {
+    return a == b;
+  }
+  long double da = static_cast<long double>(a);
+  long double db = static_cast<long double>(b);
+  long double diff = da > db ? da - db : db - da;
+  long double scale = std::fabs(da) > std::fabs(db) ? std::fabs(da) : std::fabs(db);
+  if (scale < 1.0L) scale = 1.0L;
+  return diff <= 1e-6L * scale;
+}
+
+int clamp_count(long long value, int limit) {
+  if (value < 0) return 0;
+  if (value > limit) return limit;
+  return static_cast<int>(value);
+}"""
+
+
 def generate_testbench(analysis: AnalysisResult, config: AgentConfig) -> str:
     fn = analysis.function
     arrays = [arg for arg in fn.args if arg.is_pointer_like]
@@ -206,71 +277,7 @@ extern "C" {{
 
 #include "../src/hls_top.hpp"
 
-template <typename T>
-T random_value(std::mt19937_64& rng) {{
-  if (std::numeric_limits<T>::is_integer) {{
-    return static_cast<T>(rng());
-  }}
-  return static_cast<T>((rng() % 20001) - 10000) / static_cast<T>(100);
-}}
-
-template <typename T>
-T bounded_scalar(int test_idx, std::mt19937_64& rng, long long lo, long long hi) {{
-  if (hi < lo) return static_cast<T>(lo);
-  long long value = lo;
-  if (test_idx == 0) {{
-    value = lo;
-  }} else if (test_idx == 1) {{
-    value = hi;
-  }} else if (test_idx == 2) {{
-    value = lo + ((hi - lo) / 2);
-  }} else if (test_idx == 3 && lo <= 1 && hi >= 1) {{
-    value = 1;
-  }} else {{
-    const unsigned long long span = static_cast<unsigned long long>(hi - lo) + 1ULL;
-    value = lo + static_cast<long long>(rng() % span);
-  }}
-  return static_cast<T>(value);
-}}
-
-template <typename T>
-T patterned_value(int test_idx, int element_idx, std::mt19937_64& rng, bool is_unsigned) {{
-  if (test_idx == 0) return static_cast<T>(0);
-  if (test_idx == 1) return static_cast<T>(~static_cast<unsigned long long>(0));
-  if (test_idx == 2 && std::numeric_limits<T>::is_integer) {{
-    return is_unsigned ? std::numeric_limits<T>::max()
-                       : (element_idx % 2 ? std::numeric_limits<T>::max() : std::numeric_limits<T>::min());
-  }}
-  if (test_idx == 3) return static_cast<T>(element_idx % 2 ? 0xAAAAAAAAULL : 0x55555555ULL);
-  return random_value<T>(rng);
-}}
-
-template <typename T>
-T output_sentinel(int test_idx, int element_idx) {{
-  unsigned long long value = 0x9E3779B97F4A7C15ULL;
-  value ^= static_cast<unsigned long long>(test_idx + 1) * 0xBF58476D1CE4E5B9ULL;
-  value ^= static_cast<unsigned long long>(element_idx + 1) * 0x94D049BB133111EBULL;
-  return static_cast<T>(value);
-}}
-
-template <typename T>
-bool values_equal(T a, T b) {{
-  if (std::numeric_limits<T>::is_integer) {{
-    return a == b;
-  }}
-  long double da = static_cast<long double>(a);
-  long double db = static_cast<long double>(b);
-  long double diff = da > db ? da - db : db - da;
-  long double scale = std::fabs(da) > std::fabs(db) ? std::fabs(da) : std::fabs(db);
-  if (scale < 1.0L) scale = 1.0L;
-  return diff <= 1e-6L * scale;
-}}
-
-int clamp_count(long long value, int limit) {{
-  if (value < 0) return 0;
-  if (value > limit) return limit;
-  return static_cast<int>(value);
-}}
+{CPP_STIMULUS_HELPERS}
 
 int main() {{
   std::mt19937_64 rng({config.seed}ULL);

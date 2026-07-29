@@ -14,9 +14,12 @@ import contextlib
 import io
 import json
 import os
+import re
 import subprocess
 import tempfile
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest import mock
 
@@ -54,20 +57,38 @@ void vector_add(const int32_t *a, const int32_t *b, int32_t *out, int n) {
 
 
 class SeqLLM:
-    """FakeLLM that returns one queued response per call and records prompts."""
+    """FakeLLM that maps each queued response to a specific generation attempt.
+
+    Candidate generation runs concurrently, so responses CANNOT be handed out by
+    call-arrival order (that would be a race). Both generator call sites stamp the
+    attempt number into the prompt ("independent candidate #N"), so attribute by that
+    instead; attempt 0 emits no marker and takes the first response. ``calls`` is
+    likewise recorded by attempt index, so ``calls[i]`` is always attempt i's prompt.
+    """
+
+    _ATTEMPT_RE = re.compile(r"independent (?:candidate|optimization attempt) #(\d+)")
 
     def __init__(self, responses: list[str], model: str = "fake-model") -> None:
         self.responses = list(responses)
         self.model = model
-        self.calls: list[tuple[str, str]] = []
+        self._by_attempt: dict[int, tuple[str, str]] = {}
+        self._lock = threading.Lock()
+
+    @property
+    def calls(self) -> list[tuple[str, str]]:
+        with self._lock:
+            return [self._by_attempt[k] for k in sorted(self._by_attempt)]
 
     def complete(self, system: str, user: str, *, max_tokens: int = 8000) -> str:
-        self.calls.append((system, user))
+        match = self._ATTEMPT_RE.search(user)
+        attempt = int(match.group(1)) - 1 if match else 0
+        with self._lock:
+            self._by_attempt[attempt] = (system, user)
         if not self.responses:
             raise AssertionError("SeqLLM ran out of queued responses")
-        if len(self.responses) == 1:
-            return self.responses[0]
-        return self.responses.pop(0)
+        if attempt < len(self.responses):
+            return self.responses[attempt]
+        return self.responses[-1]
 
 
 def _analysis(tmp: Path, config: AgentConfig, source_text: str = VECTOR_ADD, top: str = "vector_add"):
@@ -130,19 +151,52 @@ class ClaudeCLIBackendTests(unittest.TestCase):
 
     def test_cli_client_pipes_prompt_and_returns_stdout(self):
         client = ClaudeCLIClient(model="opus", cli_cmd="claude")
-        completed = subprocess.CompletedProcess(args=[], returncode=0, stdout="ANSWER", stderr="")
+        stdout = json.dumps({"result": "ANSWER", "is_error": False, "session_id": "abc"})
+        completed = subprocess.CompletedProcess(args=[], returncode=0, stdout=stdout, stderr="")
         with mock.patch.object(llm_module.subprocess, "run", return_value=completed) as run:
             result = client.complete("SYS", "USER")
         self.assertEqual(result, "ANSWER")
         argv = run.call_args.args[0]
         self.assertEqual(argv[:3], ["claude", "-p", "--model"])
         self.assertEqual(argv[3], "opus")
-        self.assertIn("SYS", run.call_args.kwargs["input"])
-        self.assertIn("USER", run.call_args.kwargs["input"])
+        self.assertIn("--output-format", argv)
+        self.assertIn("--strict-mcp-config", argv)
+        self.assertIn("--no-session-persistence", argv)
+        self.assertIn("--system-prompt", argv)
+        self.assertEqual(argv[argv.index("--system-prompt") + 1], "SYS")
+        self.assertEqual(run.call_args.kwargs["input"], "USER")
+        self.assertEqual(client.call_count, 1)
+
+    def test_cli_client_usage_totals_survive_concurrent_calls(self):
+        # One client is shared by the parallel best-of-N threads, so usage accounting
+        # must accumulate rather than race on a per-call "last value".
+        client = ClaudeCLIClient()
+        stdout = json.dumps({"result": "OK", "is_error": False, "total_cost_usd": 0.25})
+        completed = subprocess.CompletedProcess(args=[], returncode=0, stdout=stdout, stderr="")
+        with mock.patch.object(llm_module.subprocess, "run", return_value=completed):
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                list(pool.map(lambda _: client.complete("SYS", "USER"), range(40)))
+        self.assertEqual(client.call_count, 40)
+        self.assertAlmostEqual(client.total_cost_usd, 10.0)
 
     def test_cli_client_raises_on_nonzero_exit(self):
         client = ClaudeCLIClient()
         completed = subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="boom")
+        with mock.patch.object(llm_module.subprocess, "run", return_value=completed):
+            with self.assertRaises(RuntimeError):
+                client.complete("SYS", "USER")
+
+    def test_cli_client_raises_on_is_error_envelope(self):
+        client = ClaudeCLIClient()
+        stdout = json.dumps({"result": "something went wrong", "is_error": True})
+        completed = subprocess.CompletedProcess(args=[], returncode=0, stdout=stdout, stderr="")
+        with mock.patch.object(llm_module.subprocess, "run", return_value=completed):
+            with self.assertRaises(RuntimeError):
+                client.complete("SYS", "USER")
+
+    def test_cli_client_raises_on_malformed_json_stdout(self):
+        client = ClaudeCLIClient()
+        completed = subprocess.CompletedProcess(args=[], returncode=0, stdout="not json", stderr="")
         with mock.patch.object(llm_module.subprocess, "run", return_value=completed):
             with self.assertRaises(RuntimeError):
                 client.complete("SYS", "USER")

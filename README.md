@@ -263,7 +263,13 @@ one cloud API:
 
 - **`claude-cli`** — the local Claude Code CLI (`claude -p`). Subscription auth: no API
   key, no per-token billing, no extra dependency. Model via `--llm-model` (default
-  `opus`); a custom command via `--llm-cli-cmd` (may be multi-word).
+  `opus`); a custom command via `--llm-cli-cmd` (may be multi-word). Each call is a lean,
+  fully isolated one-shot: `--output-format json` (errors surface from the envelope's
+  `is_error` instead of being guessed from stdout), plus `--strict-mcp-config`,
+  `--no-session-persistence`, `--setting-sources ""` and `--tools ""` so no MCP server,
+  saved session, settings file, or tool loop is loaded for what is a pure text completion.
+  Notably `--setting-sources ""` keeps pipeline calls from picking up this repo's own
+  `.claude/` skills and hooks, which exist for interactive sessions only.
 - **`openai`** — any OpenAI Chat Completions-compatible endpoint, using only the standard
   library (no extra dependency). This is how it runs on a **local model with no cloud
   key**: point `--llm-base-url` at Ollama / LM Studio / llama.cpp / vLLM. The same backend
@@ -348,6 +354,13 @@ testbench — seconds on the Mac. Only the winner is promoted to `<out>` and sen
 Vitis, so no Vitis time is spent on losing candidates. Scores land in
 `<out>/candidate_scores.json`. A candidate that passes host equivalence wins immediately;
 otherwise the one with the fewest mismatches is taken and the repair loop drives it home.
+
+The N generations run **concurrently** (they are independent calls that each block on the
+backend), so best-of-N costs roughly one generation of wall-clock instead of N. Measured on
+`examples/vector_add` with `--candidates 3` against the `claude-cli` backend: 2m49s
+concurrent vs 6m52s serial, same winner. Tune with `--llm-candidate-workers N` (default 4;
+`1` restores fully serial generation). Scoring and de-duplication remain serial and in
+attempt order, so the selected winner is identical either way.
 
 ### Remote Vitis over SSH (`--vitis-ssh`)
 
@@ -443,6 +456,53 @@ to repeat them, and evidence excerpts are **tail**-sliced so the model sees the 
 error at the end of a Vitis log rather than the tool banner. A proposed patch whose
 content hash matches any previously visited source state (an A→B→A cycle) is rejected as
 `oscillation_rejected`, which stops the loop instead of burning Vitis runs on a cycle.
+
+### Live contract planner (`--plan-contracts`)
+
+The declared `contract_planner` agent is live: after static analysis, an LLM pass
+proposes per-argument `direction` / `length` / `range` where the regex inference is
+uncertain, as a `{"arguments": {...}}` JSON proposal validated field-by-field. Your
+own config always wins per-field; validated proposals are merged and the source is
+re-analyzed so bounds take effect in the testbench. Everything is recorded in
+`contract_plan.json` and the conversion report, and the verifier ladder still gates —
+a wrong proposal can only ever produce a failing, fully-audited run. Implies
+`--use-llm`; any planner failure silently falls back to the analyzer's own contract.
+
+### Audit-memory knowledge base (`--audit-memory`, opt-in)
+
+The declared `audit_memory_agent` is live: when a convert run **passes** after
+repairs, the repairs that actually cleared their failure (last of each
+stage/family chain — intermediate attempts that demonstrably didn't work are never
+promoted) are distilled into repair-success cards in an append-only JSONL store
+(`--audit-memory-path`, `C2HLSC_AUDIT_MEMORY`, default `~/.c2hlsc/audit_memory.jsonl`).
+On later repairs, the top matching cards (same failure family, ranked by evidence
+overlap) are injected into the repair prompt as clearly-delimited strategy hints.
+Cards never contain golden `input.c` text, and retrieval never bypasses the
+structural gates or the oscillation guard.
+
+### Cross-reference dual generation (`cross-reference`)
+
+The paper-figure workflow is live as a subcommand: for each HLS_NL record, two
+INDEPENDENT generations (arm A: the instruction verbatim; arm B: a restructured
+spec — separate `claude -p` processes share no context) are normalized through the
+structural gates, compiled as separate translation units inside `xref_a`/`xref_b`
+namespaces (macros cannot leak across arms; `extern "C"` wrappers are stripped),
+and driven with byte-identical seeded stimulus. Verdicts: `cross_verified` (both
+agree on every vector), `divergent` (mismatch evidence recorded), `unavailable`
+(host oracle limits: `hls::stream`/`ap_*` types, compile failures), `unparseable`.
+
+```bash
+python3 -m c2hlsc_agent.cli cross-reference \
+  --records data/hls_nl/hls_nl_repaired.accepted.jsonl \
+  --out build/xref --limit 20 --num-vectors 16
+```
+
+`results.jsonl` is the append-only commit stream (resumable: completed records are
+skipped, LLM-backend failures are retried); `cross_referenced_corpus.jsonl` is
+schema-compatible with the accepted dataset, so the testbench generator and the
+Vitis batch runner consume it unchanged; `needs_review.jsonl` holds everything else.
+The dataset's reference implementation is never shown to either arm. Concurrent
+shards must use separate `--out` dirs.
 
 ## HLS-LeVeri-Style Testbench Generator
 

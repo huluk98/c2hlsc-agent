@@ -27,6 +27,7 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import urllib.error
 import urllib.request
 from typing import Protocol
@@ -152,22 +153,56 @@ class ClaudeCLIClient:
     ) -> None:
         import shlex
 
-        self._base = shlex.split(cli_cmd) + ["-p", "--model", model]
+        # Lean, fully-isolated one-shot invocation: no MCP servers, no on-disk session,
+        # no user/project/local settings (this is an automated completion call, not an
+        # interactive session -- it must not pick up hooks/skills meant for Luke's own
+        # interactive use of this repo), and no tool use (single text-in/text-out call).
+        self._base = shlex.split(cli_cmd) + [
+            "-p",
+            "--model", model,
+            "--output-format", "json",
+            "--strict-mcp-config",
+            "--no-session-persistence",
+            "--setting-sources", "",
+            "--tools", "",
+        ]
         self.model = model
         self._timeout = timeout
+        # One client instance is shared across the concurrent best-of-N generation
+        # threads, so per-call "last value" fields would be a race with an arbitrary
+        # winner. Accumulate totals under a lock instead -- that is also the number
+        # worth having for a pipeline that makes thousands of calls.
+        self._usage_lock = threading.Lock()
+        self.total_cost_usd = 0.0
+        self.call_count = 0
 
     def complete(self, system: str, user: str, *, max_tokens: int = _DEFAULT_MAX_TOKENS) -> str:
         del max_tokens  # the CLI manages its own output budget
+        argv = self._base + ["--system-prompt", system]
         proc = subprocess.run(
-            self._base,
-            input=f"{system}\n\n{user}",
+            argv,
+            input=user,
             text=True,
             capture_output=True,
             timeout=self._timeout,
         )
         if proc.returncode != 0:
             raise RuntimeError(f"claude CLI failed (rc={proc.returncode}): {proc.stderr[-800:]}")
-        return proc.stdout
+        try:
+            envelope = json.loads(proc.stdout)
+        except ValueError as exc:
+            raise RuntimeError(f"claude CLI returned non-JSON stdout: {proc.stdout[-800:]}") from exc
+        if not isinstance(envelope, dict):
+            raise RuntimeError(f"claude CLI returned a non-object JSON payload: {proc.stdout[-800:]}")
+        if envelope.get("is_error"):
+            raise RuntimeError(f"claude CLI reported an error: {str(envelope.get('result', proc.stdout))[-800:]}")
+        cost = envelope.get("total_cost_usd")
+        with self._usage_lock:
+            self.call_count += 1
+            if isinstance(cost, (int, float)):
+                self.total_cost_usd += float(cost)
+        result = envelope.get("result", "")
+        return result if isinstance(result, str) else str(result)
 
 
 def _text_from_response(response: object) -> str:
@@ -431,6 +466,23 @@ try a genuinely different fix:
 """
 
 
+def _audit_cards_section(audit_cards: list[str] | None) -> str:
+    """Render retrieved audit-memory success cards as a delimited hints section.
+
+    A separate section (never appended to the evidence text): the evidence is
+    tail-sliced to ``_EVIDENCE_LIMIT``, so anything folded into it would be cut.
+    """
+
+    if not audit_cards:
+        return ""
+    rendered = "\n\n".join(f"--- card {i} ---\n{card}" for i, card in enumerate(audit_cards[:3], start=1))
+    return f"""
+Previously AUDITED successful repairs for similar failures (verified fixes from past
+runs; strategy hints only — do NOT copy blindly, this candidate differs):
+{rendered}
+"""
+
+
 def build_repair_prompt(
     analysis: AnalysisResult,
     decision: object,
@@ -440,6 +492,7 @@ def build_repair_prompt(
     current_text: str,
     history: list[object] | None = None,
     nl_spec: str | None = None,
+    audit_cards: list[str] | None = None,
 ) -> tuple[str, str]:
     fn = analysis.function
     # Tail slice: Vitis logs put the failure at the end, after the tool banner.
@@ -449,7 +502,7 @@ Failure family: {getattr(decision, 'family', 'unknown')}
 Repair intent: {getattr(decision, 'next_action', '')}
 Repair scope: {getattr(decision, 'repair_scope', '')}
 Must-preserve top-function signature: `{fn.signature}`
-{_nl_spec_section(nl_spec)}{_history_section(history)}
+{_nl_spec_section(nl_spec)}{_history_section(history)}{_audit_cards_section(audit_cards)}
 Earliest-failure evidence (tail of the log):
 ```
 {excerpt}
@@ -582,6 +635,56 @@ def extract_reference_c(text: str, top_name: str) -> str | None:
     return code
 
 
+CONTRACT_PLANNER_SYSTEM_PROMPT = """You are contract_planner in an equivalence-first C-to-HLS-C conversion pipeline.
+
+Your job: make the top function's interface contract explicit. A regex-based static
+analyzer has already inferred per-argument directions, array lengths, and value ranges;
+some of those fields are uncertain or conservatively defaulted. You propose corrections
+ONLY where the code (or the stated design intent) gives you clear evidence.
+
+Rules:
+- Never rename arguments, change the signature, or propose code.
+- Per-argument fields you may propose: direction ("input"|"output"|"inout"),
+  length (positive integer, array element count), range ([lo, hi] inclusive scalar bounds).
+- Omit any argument you have no opinion on; omit any field you cannot justify.
+- A wrong bound can unsound the equivalence testbench. Prefer conservative proposals
+  (larger length, wider range) when uncertain, and omit when you cannot tell.
+- Respond with a single ```json fenced block of the shape:
+  {"arguments": {"<name>": {"direction": ..., "length": ..., "range": [lo, hi]}, ...},
+   "notes": "<one-line rationale>"}
+  and nothing else of substance.
+"""
+
+
+def build_planner_prompt(
+    analysis: AnalysisResult,
+    original_source: str,
+    nl_spec: str | None = None,
+) -> tuple[str, str]:
+    """Prompt for the live contract_planner: propose ArgumentConfig-shaped fields.
+
+    Generation-side prompt, so showing the original C is allowed (it is evidence for
+    the contract, not a copy-reference for equivalence).
+    """
+
+    fn = analysis.function
+    user = f"""Top function: `{fn.name}`  (signature: `{fn.signature}`)
+{_nl_spec_section(nl_spec)}
+Analyzer's current argument contract (uncertain fields may be defaulted):
+{_argument_lines(analysis)}
+
+Static analyzer notes:
+{_diagnostic_lines(analysis)}
+
+Original C source (evidence for your proposals; do not rewrite it):
+```c
+{original_source.strip()}
+```
+
+Respond with the single ```json block described in the system prompt."""
+    return CONTRACT_PLANNER_SYSTEM_PROMPT, user
+
+
 # --------------------------------------------------------------------------- #
 # Response parsing
 # --------------------------------------------------------------------------- #
@@ -687,3 +790,51 @@ def extract_full_file(text: str, must_contain: str | None = None) -> str | None:
         return None
     body = max((b for _lang, b in pool), key=len)
     return body.rstrip() + "\n"
+
+
+def extract_json_block(text: str) -> object | None:
+    """Extract a JSON payload from a model response.
+
+    ``_CODE_LANGS`` deliberately excludes ``json`` (the C-oriented extractors must never
+    select a JSON block as source code), so structured-output consumers need this
+    dedicated path: prefer ```json fenced blocks, then untagged fences, then the first
+    balanced ``{...}`` object in the raw text. Returns ``None`` when nothing parses.
+    """
+
+    blocks = extract_code_blocks(text)
+    for want in ("json", ""):
+        for lang, body in blocks:
+            if lang != want:
+                continue
+            try:
+                return json.loads(body)
+            except ValueError:
+                continue
+    raw = text or ""
+    start = raw.find("{")
+    while start != -1:
+        depth = 0
+        in_string = False
+        escape = False
+        for idx in range(start, len(raw)):
+            char = raw[idx]
+            if in_string:
+                if escape:
+                    escape = False
+                elif char == "\\":
+                    escape = True
+                elif char == '"':
+                    in_string = False
+            elif char == '"':
+                in_string = True
+            elif char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        return json.loads(raw[start : idx + 1])
+                    except ValueError:
+                        break
+        start = raw.find("{", start + 1)
+    return None

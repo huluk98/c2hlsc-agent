@@ -37,11 +37,27 @@ class AgentConfig:
     keep_going: bool = False
     run_vitis: bool = False
     use_llm: bool = False
+    # Live contract_planner: an LLM pass after analysis that proposes per-argument
+    # direction/length/range where the regex inference is uncertain; user config wins
+    # per-field and the verifier ladder still gates everything. Requires use_llm.
+    plan_contracts: bool = False
+    # Audit-memory knowledge base (opt-in): promote audited repair successes into a
+    # JSONL card store and retrieve them into future repair prompts as strategy hints.
+    # Store path precedence: audit_memory_path > C2HLSC_AUDIT_MEMORY env > ~/.c2hlsc/.
+    audit_memory: bool = False
+    audit_memory_path: str | None = None
     llm_backend: str = "auto"
     llm_model: str | None = None
     llm_base_url: str | None = None
     llm_cli_cmd: str = "claude"
     llm_candidates: int = 1
+    # Best-of-N generation (--candidates) dispatches its independent candidate generations
+    # concurrently: each is a pure text-in/text-out call that blocks on the backend, so
+    # threads overlap the waiting. De-duplication and scoring stay serial and in attempt
+    # order, so the winner is identical to the serial path. Set to 1 to fully serialize.
+    # NOTE: this does NOT apply to the qor_optimizer round loop, whose attempts chain
+    # through `history` on purpose and must stay sequential.
+    llm_candidate_workers: int = 4
     nl_spec: str | None = None
     vitis_ssh_host: str | None = None
     vitis_remote_dir: str = "~/c2hlsc_runs"
@@ -271,11 +287,15 @@ def load_config(path: Path | None) -> AgentConfig:
         run_vitis=bool(data.get("run_vitis", False)),
         seed=int(data.get("seed", 1)),
         use_llm=bool(data.get("use_llm", False)),
+        plan_contracts=bool(data.get("plan_contracts", False)),
+        audit_memory=bool(data.get("audit_memory", False)),
+        audit_memory_path=(str(data["audit_memory_path"]) if data.get("audit_memory_path") else None),
         llm_backend=str(data.get("llm_backend", "auto")),
         llm_model=(str(data["llm_model"]) if data.get("llm_model") is not None else None),
         llm_base_url=(str(data["llm_base_url"]) if data.get("llm_base_url") is not None else None),
         llm_cli_cmd=str(data.get("llm_cli_cmd", "claude")),
         llm_candidates=int(data.get("llm_candidates", 1)),
+        llm_candidate_workers=max(1, int(data.get("llm_candidate_workers", 4))),
         nl_spec=(str(data["nl_spec"]) if data.get("nl_spec") else None),
         vitis_ssh_host=(str(data["vitis_ssh_host"]) if data.get("vitis_ssh_host") else None),
         vitis_remote_dir=str(data.get("vitis_remote_dir", "~/c2hlsc_runs")),
@@ -317,6 +337,17 @@ def merge_cli_config(config: AgentConfig, args: Any) -> AgentConfig:
         config.use_llm = True
     elif getattr(args, "no_llm", False):
         config.use_llm = False
+    if getattr(args, "plan_contracts", False):
+        config.plan_contracts = True
+    elif getattr(args, "no_plan_contracts", False):
+        config.plan_contracts = False
+    if getattr(args, "audit_memory", False):
+        config.audit_memory = True
+    elif getattr(args, "no_audit_memory", False):
+        config.audit_memory = False
+    if getattr(args, "audit_memory_path", None):
+        config.audit_memory_path = args.audit_memory_path
+        config.audit_memory = True
     if getattr(args, "llm_backend", None):
         config.llm_backend = args.llm_backend
     if getattr(args, "llm_model", None):
@@ -327,6 +358,8 @@ def merge_cli_config(config: AgentConfig, args: Any) -> AgentConfig:
         config.llm_cli_cmd = args.llm_cli_cmd
     if getattr(args, "candidates", None) is not None:
         config.llm_candidates = max(1, int(args.candidates))
+    if getattr(args, "llm_candidate_workers", None) is not None:
+        config.llm_candidate_workers = max(1, int(args.llm_candidate_workers))
     spec_inline = getattr(args, "spec", None)
     spec_file = getattr(args, "spec_file", None)
     if spec_file:

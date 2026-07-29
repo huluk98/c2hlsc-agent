@@ -134,6 +134,18 @@ def multi_agent_procedures() -> tuple[AgentProcedure, ...]:
             outputs=("audit ledger", "repair-success cards", "retrieval blind-spot notes"),
             stop_condition="No reference HLS, hidden labels, or manual fixes enter prompt-facing memory.",
         ),
+        AgentProcedure(
+            name="cross_reference_operator",
+            role="Dual-generation differential oracle",
+            owns="Generate two independent implementations from the same NL spec (no shared "
+            "context, different framings), compare them under shared stimulus in isolated "
+            "namespaces, and classify each record.",
+            inputs=("HLS_NL record (NL spec + top name)", "stimulus seed", "vector count"),
+            outputs=("cross_referenced_corpus.jsonl", "needs_review.jsonl", "results.jsonl"),
+            stop_condition="Only records whose two arms parse, compile, and agree on every "
+            "driven vector enter the cross-verified corpus; the dataset reference is never "
+            "shown to either arm.",
+        ),
     )
 
 

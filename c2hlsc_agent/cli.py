@@ -6,8 +6,10 @@ import sys
 from pathlib import Path
 
 from .analyze import analyze_source
+from .audit_memory import promote_run, resolve_store_path
 from .candidates import select_best_candidate
 from .config import load_config, merge_cli_config
+from .contract_planner import plan_contracts
 from .convert import ReferenceGenerationError, generate_hls_sources, generate_reference_c
 from .hlsc_repair_agent import clear_repair_audit, repair_project
 from .hls_project import write_project
@@ -81,6 +83,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="best-of-N LLM generation: score candidates with local host equivalence and "
         "send only the winner to Vitis (default 1)",
     )
+    convert.add_argument(
+        "--llm-candidate-workers",
+        type=int,
+        help="how many independent LLM candidate generations to run concurrently "
+        "(default 4; 1 serializes them)",
+    )
     convert.add_argument("--part", help="Vitis part name")
     convert.add_argument("--clock", type=float, help="clock period in ns")
     convert.add_argument("--num-tests", type=int, help="number of generated tests")
@@ -99,6 +107,37 @@ def build_parser() -> argparse.ArgumentParser:
         "remote host is set, else local vitis_hls, else local-hls, else skip)",
     )
     _add_llm_arguments(convert)
+    plan = convert.add_mutually_exclusive_group()
+    plan.add_argument(
+        "--plan-contracts",
+        action="store_true",
+        help="run the live contract_planner: an LLM pass after static analysis that "
+        "proposes per-argument direction/length/range where the regex inference is "
+        "uncertain (user config wins per-field; the verifier still gates). Implies --use-llm.",
+    )
+    plan.add_argument(
+        "--no-plan-contracts",
+        action="store_true",
+        help="disable the contract_planner pass even if the config enables it",
+    )
+    memory = convert.add_mutually_exclusive_group()
+    memory.add_argument(
+        "--audit-memory",
+        action="store_true",
+        help="opt into the audit-memory knowledge base: audited repair successes from "
+        "passing runs are promoted into a card store and retrieved into future repair "
+        "prompts as strategy hints (store: --audit-memory-path, C2HLSC_AUDIT_MEMORY, "
+        "or ~/.c2hlsc/audit_memory.jsonl)",
+    )
+    memory.add_argument(
+        "--no-audit-memory",
+        action="store_true",
+        help="disable audit memory even if the config enables it",
+    )
+    convert.add_argument(
+        "--audit-memory-path",
+        help="card store JSONL path for --audit-memory (implies --audit-memory)",
+    )
     convert.add_argument("--seed", type=int, help="random seed")
     convert.add_argument("--max-iterations", type=int, help="max verification iterations (default 1); repaired reruns require --auto-repair")
     convert.add_argument("--auto-repair", action="store_true", help="apply mechanical and LLM repairs automatically between verification attempts")
@@ -217,6 +256,22 @@ def build_parser() -> argparse.ArgumentParser:
     ppa.add_argument("--clock-port", default="ap_clk", help="clock port name for STA (default ap_clk)")
     ppa.add_argument("--no-gate-sim", action="store_true", help="skip the gate-level waveform simulation step")
     ppa.add_argument("--verbose", action="store_true", help="print progress")
+    xref = sub.add_parser(
+        "cross-reference",
+        help="dual-generation differential oracle over HLS_NL records: two independent "
+        "LLM generations (different framings, no shared context) are compiled into "
+        "isolated namespaces and compared under shared stimulus; verdicts land in "
+        "results.jsonl / cross_referenced_corpus.jsonl / needs_review.jsonl",
+    )
+    xref.add_argument("--records", required=True, help="HLS_NL records file (JSON array or JSONL)")
+    xref.add_argument("--out", required=True, help="output directory")
+    xref.add_argument("--offset", type=int, help="skip this many records (shards must use separate --out dirs)")
+    xref.add_argument("--limit", type=int, help="process at most this many records")
+    xref.add_argument("--record-id", type=int, help="process only this record id")
+    xref.add_argument("--seed", type=int, help="shared stimulus seed (default 1)")
+    xref.add_argument("--num-vectors", type=int, help="stimulus vectors per record (default 16)")
+    _add_llm_arguments(xref)
+    xref.add_argument("--verbose", action="store_true", help="print progress")
     return parser
 
 
@@ -229,11 +284,12 @@ def run_convert(args: argparse.Namespace) -> int:
         raise SystemExit("--top or config top is required")
     if nl_only:
         config.use_llm = True  # NL-only generation is inherently LLM-driven
-    # --spec (design intent) and --candidates (best-of-N) are only honoured on the LLM
-    # path; auto-enable it so they are not silently ignored, unless --no-llm is explicit.
-    elif (config.nl_spec or config.llm_candidates > 1) and not config.use_llm:
+    # --spec (design intent), --candidates (best-of-N), and --plan-contracts are only
+    # honoured on the LLM path; auto-enable it so they are not silently ignored, unless
+    # --no-llm is explicit.
+    elif (config.nl_spec or config.llm_candidates > 1 or config.plan_contracts) and not config.use_llm:
         if getattr(args, "no_llm", False):
-            which = "--spec" if config.nl_spec else "--candidates"
+            which = "--spec" if config.nl_spec else ("--candidates" if config.llm_candidates > 1 else "--plan-contracts")
             print(f"{which} has no effect with --no-llm; using the deterministic generator.", file=sys.stderr)
         else:
             config.use_llm = True
@@ -271,6 +327,21 @@ def run_convert(args: argparse.Namespace) -> int:
             print(f"Golden C reference generated from the NL spec: {reference_path}")
 
     analysis = analyze_source(config.input_files[0], config.top, config)
+    plan = None
+    if config.plan_contracts and config.use_llm and llm is not None:
+        # Live contract_planner (runs BEFORE the nl-only unbounded warning below, so
+        # that warning only fires for bounds the planner left unset).
+        original_text = config.input_files[0].read_text(encoding="utf-8")
+        plan = plan_contracts(analysis, config, llm, original_text)
+        if plan.changed:
+            # Directions/bounds are baked into AnalysisResult at analyze time; the
+            # merged contract only takes effect through a re-analyze.
+            analysis = analyze_source(config.input_files[0], config.top, config)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "contract_plan.json").write_text(json.dumps(plan.to_dict(), indent=2), encoding="utf-8")
+        if args.verbose:
+            applied = ", ".join(f"{name}({'/'.join(fields)})" for name, fields in plan.applied.items()) or "none"
+            print(f"contract_planner: applied {applied}; plan written to {out_dir / 'contract_plan.json'}")
     if nl_only:
         # The reference is now the golden oracle. If it left any array parameter unbounded,
         # the testbench must guess a length (16) and may drive it with a random count,
@@ -307,6 +378,11 @@ def run_convert(args: argparse.Namespace) -> int:
             )
     if generated is None:
         generated = generate_hls_sources(analysis, config, llm=llm)
+    if plan is not None and (plan.applied or plan.skipped):
+        generated.transformations.append(
+            f"contract_planner: applied={json.dumps(plan.applied, sort_keys=True)} "
+            f"skipped={json.dumps(plan.skipped, sort_keys=True)}"
+        )
     project = write_project(out_dir, analysis, generated, config)
     clear_repair_audit(out_dir)
     repair_history = []
@@ -348,6 +424,7 @@ def run_convert(args: argparse.Namespace) -> int:
     iterations = max(1, config.max_iterations)
     state = None
     completed_iterations = 0
+    audit_store = resolve_store_path(config) if config.audit_memory else None
     seen_signatures = {_project_signature(out_dir)}
     for iteration in range(iterations):
         completed_iterations = iteration + 1
@@ -361,7 +438,7 @@ def run_convert(args: argparse.Namespace) -> int:
             if args.verbose:
                 print("Automatic repair is disabled; bring Vitis/CoSim evidence back with the repair command.")
             break
-        repair = repair_project(out_dir, analysis, config, state, completed_iterations, llm=llm)
+        repair = repair_project(out_dir, analysis, config, state, completed_iterations, llm=llm, audit_store=audit_store)
         repair_history.append(repair)
         if args.verbose:
             print(f"Repair iteration {completed_iterations}: {repair.summary}")
@@ -374,6 +451,14 @@ def run_convert(args: argparse.Namespace) -> int:
             break
         seen_signatures.add(signature)
     assert state is not None
+    if audit_store is not None and repair_history:
+        # Promotion keys on the PRE-PPA functional verdict: PPA is a QoR gate and never
+        # decides whether a repair functionally worked. The chain rule inside
+        # promote_run keeps ineffective intermediate repairs out of the card store.
+        functional_status = final_status(state, config.run_vitis, analysis.diagnostics.has_errors)
+        promoted = promote_run(audit_store, repair_history, out_dir.name, functional_status)
+        if args.verbose and promoted:
+            print(f"audit_memory: promoted {len(promoted)} repair-success card(s) to {audit_store}")
     # PPA workflow criteria run only on a functionally-signed-off design, so the slack
     # numbers always describe RTL that already passed the equivalence ladder. config
     # parsing guarantees run_local_ppa is True whenever any hard criterion is declared,
@@ -743,6 +828,10 @@ def main(argv: list[str] | None = None) -> int:
         return run_optimize(args)
     if args.command == "ppa":
         return run_ppa(args)
+    if args.command == "cross-reference":
+        from .cross_reference import run_cross_reference
+
+        return run_cross_reference(args)
     parser.error(f"unknown command {args.command}")
     return 2
 

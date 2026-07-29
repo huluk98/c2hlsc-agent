@@ -308,6 +308,22 @@ gated by the same dataclass), (2) contract_planner suggestions surfaced as confi
 proposals, (3) testbench augmentation, (4) rtl_optimizer with full re-verification,
 (5) retrieval memory from `repair_audit.json`.
 
+**2026-07-23 addendum — increments now LIVE.** Increment (2) shipped as
+`contract_planner.py` + `--plan-contracts` (JSON proposals validated into
+`ArgumentConfig`, user config wins per-field, mandatory re-analyze, provenance in
+`contract_plan.json`). Increment (5) shipped as `audit_memory.py` + `--audit-memory`
+(chain-rule promotion — only the last applied repair per stage/family chain of a
+PASSING run; JSONL card store; retrieval by family + evidence overlap into
+`build_repair_prompt`'s `audit_cards` section). The cross-reference dual-generation
+workflow (the paper figure) shipped as `cross_reference.py` + the `cross-reference`
+subcommand (two isolated claude-CLI framings → structural gates →
+separate-translation-unit namespace oracle → corpus/needs_review/results JSONLs).
+Supporting refactors: the HLS_NL parser now lives in `nl_records.py` (the script
+imports it), and testgen's C++ stimulus/compare helpers are the shared
+`CPP_STIMULUS_HELPERS` constant. (4) was already live via `qor_optimizer.py`.
+Remaining declarative-only: shift-left testbench augmentation (3) and a live LLM
+`failure_analyst` (1) — `classify_failure` remains regex-based.
+
 **Do not break:** `extract_hls_source`/`is_plausible_translation_unit` structural gates,
 the deterministic fallback in `generate_hls_sources`, the never-hand-original-C-to-model
 rule, `_gate_cosim_on_log`, the repair audit provenance, and the oscillation guard in

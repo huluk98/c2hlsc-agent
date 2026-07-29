@@ -10,6 +10,7 @@ from pathlib import Path
 
 from .agent_loop import classify_failure
 from .analyze import AnalysisResult
+from .audit_memory import retrieve_cards
 from .config import AgentConfig
 from .equivalence import VerificationState
 from .hls_runner import earliest_failing_phase
@@ -121,6 +122,7 @@ def repair_project(
     state: VerificationState,
     iteration: int,
     llm: LLMClient | None = None,
+    audit_store: Path | None = None,
 ) -> RepairOutcome:
     phase = earliest_failing_phase(state, config.run_vitis)
     decision = classify_failure(state, config.run_vitis, analysis.diagnostics.has_errors)
@@ -143,8 +145,14 @@ def repair_project(
             status = "applied"
             summary = f"Applied {len(changes)} auditable mechanical repair(s); rerun verification from software equivalence."
         elif llm is not None and getattr(config, "use_llm", False):
+            audit_cards: list[str] | None = None
+            if audit_store is not None:
+                # Retrieved success cards are prompt evidence only; the structural
+                # gates and the oscillation guard below stay the acceptors.
+                audit_cards = retrieve_cards(audit_store, decision.family, phase, evidence) or None
             llm_changes, oscillated = _llm_repair(
-                project_dir, analysis, decision, phase, evidence, llm, config=config, history=history
+                project_dir, analysis, decision, phase, evidence, llm, config=config, history=history,
+                audit_cards=audit_cards,
             )
             changes.extend(llm_changes)
             if llm_changes:
@@ -204,6 +212,7 @@ def _llm_repair(
     llm: LLMClient,
     config: object | None = None,
     history: list[RepairOutcome] | None = None,
+    audit_cards: list[str] | None = None,
 ) -> tuple[list[RepairFileChange], bool]:
     """Escalate to an LLM for a minimal patch to the generated HLS-C.
 
@@ -232,6 +241,7 @@ def _llm_repair(
         current,
         history=history,
         nl_spec=getattr(config, "nl_spec", None) if config is not None else None,
+        audit_cards=audit_cards,
     )
     try:
         response = llm.complete(system, user)

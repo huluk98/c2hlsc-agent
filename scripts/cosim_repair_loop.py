@@ -29,8 +29,6 @@ import argparse
 import json
 import os
 import re
-import shlex
-import subprocess
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -70,17 +68,13 @@ def make_completer(args: argparse.Namespace) -> Completer:
 
     # Claude Code path (subscription auth, no API key). `claude -p` reads the prompt and
     # prints the answer. Set --claude-cmd "ssh you@mac claude" to drive Claude Code on a
-    # remote Mac from the Vitis server.
-    base = shlex.split(args.claude_cmd) + ["-p", "--model", args.claude_model]
+    # remote Mac from the Vitis server. Reuse ClaudeCLIClient so this script inherits the
+    # same lean-flag/JSON-envelope hardening as the rest of the pipeline instead of
+    # drifting from it with its own bespoke subprocess invocation.
+    from c2hlsc_agent.llm import ClaudeCLIClient
 
-    def complete(system: str, user: str) -> str:
-        prompt = f"{system}\n\n{user}"
-        proc = subprocess.run(base, input=prompt, text=True, capture_output=True, timeout=args.repair_timeout)
-        if proc.returncode != 0:
-            raise RuntimeError(f"claude CLI failed (rc={proc.returncode}): {proc.stderr[-800:]}")
-        return proc.stdout
-
-    return complete
+    client = ClaudeCLIClient(model=args.claude_model, cli_cmd=args.claude_cmd, timeout=args.repair_timeout)
+    return client.complete
 
 
 REPAIR_SYSTEM = (
