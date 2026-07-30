@@ -225,6 +225,7 @@ def generate_testbench(analysis: AnalysisResult, config: AgentConfig) -> str:
         return_capture_ref = f"{fn.return_type} ref_ret = "
         return_capture_hls = f"{fn.return_type} hls_ret = "
         return_compare = f"""
+    ++comparisons_done;
     if (!values_equal(ref_ret, hls_ret)) {{
       std::cerr << "Mismatch test=" << test_idx << " return expected="
                 << {_value_print('ref_ret')} << " actual=" << {_value_print('hls_ret')}
@@ -248,6 +249,7 @@ def generate_testbench(analysis: AnalysisResult, config: AgentConfig) -> str:
             if trace_lines:
                 trace_lines = "\n" + trace_lines
             comparisons.append(f"""    for (int i = 0; i < {compare_var}; ++i) {{
+      ++comparisons_done;
       if (!values_equal(ref_{arg.name}[i], hls_{arg.name}[i])) {{
         std::cerr << "Mismatch test=" << test_idx << " arg={arg.name} index=" << i
                   << " expected=" << {_value_print(f'ref_{arg.name}[i]')}
@@ -281,6 +283,13 @@ extern "C" {{
 
 int main() {{
   std::mt19937_64 rng({config.seed}ULL);
+  // Fail-closed evidence counter. A testbench that compares NOTHING must never report
+  // success: an output argument misclassified as `input`, a return type of void with no
+  // output array, or num_tests <= 0 all produce an oracle that exits 0 while proving
+  // nothing -- and this same file is the CSim/CoSim testbench, so the whole ladder would
+  // pass a DUT that computes nothing. Counted at runtime so it holds regardless of HOW
+  // the contract ended up empty.
+  long long comparisons_done = 0;
   for (int test_idx = 0; test_idx < {config.num_tests}; ++test_idx) {{
 {chr(10).join(declarations)}
 {chr(10).join(initializers)}
@@ -291,7 +300,14 @@ int main() {{
 {return_compare}
 {chr(10).join(comparisons)}
   }}
-  std::cout << "c2hlsc_agent: all {config.num_tests} tests passed, seed={config.seed}\\n";
+  if (comparisons_done == 0) {{
+    std::cerr << "c2hlsc_agent: ERROR no values were compared (comparisons=0) -- this "
+                 "oracle cannot detect a wrong implementation. Check argument directions "
+                 "and num_tests.\\n";
+    return 1;
+  }}
+  std::cout << "c2hlsc_agent: all {config.num_tests} tests passed, seed={config.seed}"
+            << ", comparisons=" << comparisons_done << "\\n";
   return 0;
 }}
 """

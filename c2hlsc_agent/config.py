@@ -197,6 +197,9 @@ def _as_list(value: Any) -> list[Any]:
     return [value]
 
 
+_ARG_DIRECTIONS = {"input", "output", "inout"}
+
+
 def _argument_config(data: Any) -> ArgumentConfig:
     if data is None:
         data = {}
@@ -206,8 +209,17 @@ def _argument_config(data: Any) -> ArgumentConfig:
     parsed_range = None
     if isinstance(range_value, (list, tuple)) and len(range_value) == 2:
         parsed_range = (int(range_value[0]), int(range_value[1]))
+    # Validate `direction` rather than passing any string through: every consumer tests
+    # membership in {"output", "inout"}, so a typo like `out` silently means "not
+    # compared" and the testbench proves nothing. Fail at config-load time instead.
+    direction = data.get("direction")
+    if direction is not None:
+        if not isinstance(direction, str) or direction not in _ARG_DIRECTIONS:
+            raise ValueError(
+                f"argument direction must be one of {sorted(_ARG_DIRECTIONS)}; got {direction!r}"
+            )
     return ArgumentConfig(
-        direction=data.get("direction"),
+        direction=direction,
         length=int(data["length"]) if data.get("length") is not None else None,
         range=parsed_range,
         interface=data.get("interface"),
@@ -275,7 +287,9 @@ def load_config(path: Path | None) -> AgentConfig:
         compiler_flags=[str(item) for item in _as_list(data.get("compiler_flags"))],
         top=data.get("top"),
         arguments=arguments,
-        num_tests=int(data.get("num_tests", data.get("random_test_count", 100))),
+        # Clamp to >= 1: num_tests <= 0 makes the testbench loop body (including the
+        # directed boundary cases) never execute, so nothing is compared.
+        num_tests=max(1, int(data.get("num_tests", data.get("random_test_count", 100)))),
         directed_tests=[str(item) for item in _as_list(data.get("directed_tests"))] or ["zeros", "ones", "minmax", "alternating"],
         part=str(data.get("part", "xczu7ev-ffvc1156-2-e")),
         clock=float(data.get("clock", data.get("clock_period", 10.0))),
@@ -316,7 +330,10 @@ def merge_cli_config(config: AgentConfig, args: Any) -> AgentConfig:
     if getattr(args, "clock", None) is not None:
         config.clock = float(args.clock)
     if getattr(args, "num_tests", None) is not None:
-        config.num_tests = int(args.num_tests)
+        requested = int(args.num_tests)
+        if requested < 1:
+            raise ValueError("--num-tests must be >= 1 (0 compares nothing)")
+        config.num_tests = requested
     if getattr(args, "cosim_tool", None):
         config.cosim_tool = args.cosim_tool
     if getattr(args, "rtl", None):

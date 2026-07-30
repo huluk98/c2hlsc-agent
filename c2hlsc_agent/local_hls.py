@@ -171,10 +171,24 @@ def _parse_cosim(stdout: str, returncode: int) -> tuple[bool, str]:
             if "error ->" in line.lower():  # Bambu's fatal-error prefix
                 return False, line.strip()[:200]
         return False, f"Bambu exited {returncode} during synthesis/co-simulation"
+    # Require POSITIVE evidence that vectors actually ran. Exit 0 alone is not a cosim
+    # pass: if --simulate degrades (rejected testbench XML, a simulator Bambu accepts but
+    # does not run, a front-end path that stops after synthesis) the log carries no
+    # verdict at all, and returning True here reported "cosim: pass" for a run in which
+    # no C/RTL comparison happened. Zero executions is likewise not a pass.
     match = re.search(r"Number of executions\s*:\s*(\d+)", stdout)
     if match:
-        return True, f"Bambu C/RTL co-simulation passed ({match.group(1)} vectors, Verilator)"
-    return True, "Bambu completed with exit 0 (no co-simulation summary found)"
+        executions = int(match.group(1))
+        if executions < 1:
+            return False, (
+                f"{BACKEND_LOG_TAG} Bambu exited 0 but ran 0 co-simulation vectors — "
+                "no C/RTL comparison was performed"
+            )
+        return True, f"Bambu C/RTL co-simulation passed ({executions} vectors, Verilator)"
+    return False, (
+        f"{BACKEND_LOG_TAG} Bambu exited 0 but produced no co-simulation summary "
+        "('Number of executions' absent) — cannot confirm any C/RTL comparison ran"
+    )
 
 
 @dataclass

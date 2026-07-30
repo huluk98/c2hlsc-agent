@@ -170,14 +170,40 @@ def _infer_pointer_directions(function: FunctionInfo, config: AgentConfig) -> No
         if arg.name in config.arguments and config.arguments[arg.name].direction:
             continue
         name = re.escape(arg.name)
-        write_pattern = rf"(?:\*\s*{name}|{name}\s*\[[^\]]+\])\s*(?:=(?!=)|\+=|-=|\*=|/=|%=|&=|\|=|\^=|<<=|>>=|\+\+|--)"
+        assign_ops = r"(?:=(?!=)|\+=|-=|\*=|/=|%=|&=|\|=|\^=|<<=|>>=|\+\+|--)"
+        # Recognize every shape a write can take. The original pattern only matched
+        # `*p =` and a SINGLE `p[i] =`, so writes through a second subscript
+        # (`p[i][j] =` -- the common HLS kernel shape), a struct member (`p->v =`),
+        # or offset arithmetic (`*(p + i) =`) all read as "no write" and the argument
+        # was classified `input`, which excludes it from every comparison.
+        write_pattern = (
+            rf"(?:"
+            rf"\*\s*{name}"                          # *p =
+            rf"|\*\s*\(\s*{name}\s*[+-][^)]*\)"      # *(p + i) =
+            rf"|{name}(?:\s*\[[^\]]*\])+"            # p[i] = / p[i][j] =
+            rf"|{name}\s*(?:->|\.)\s*\w+"            # p->v = / p.v =
+            rf")\s*{assign_ops}"
+        )
         writes = bool(re.search(write_pattern, body))
         body_without_lhs_writes = re.sub(write_pattern, "", body)
-        reads = bool(re.search(rf"(?:\*\s*{name}|{name}\s*\[[^\]]+\]|{name}\s*\+)", body_without_lhs_writes))
-        if writes and reads:
+        reads = bool(re.search(rf"(?:\*\s*{name}|{name}\s*\[[^\]]*\]|{name}\s*\+)", body_without_lhs_writes))
+        # A pointer handed to a callee may be written there, and we cannot see the callee
+        # body. Treat that as a possible write unless the parameter is const-qualified.
+        escapes = bool(re.search(rf"\b\w+\s*\([^;{{}}]*\b{name}\b[^;{{}}]*\)", body_without_lhs_writes))
+        is_const = "const" in (arg.c_type or "")
+
+        if is_const:
+            # const-qualified: cannot be written through, so `input` is provable.
+            arg.direction = "input"
+        elif writes and reads:
             arg.direction = "inout"
         elif writes:
             arg.direction = "output"
+        elif escapes:
+            # Fail SAFE: over-comparison is free (both sides receive identical stimulus,
+            # so comparing a read-only buffer can never produce a false mismatch), while
+            # under-comparison silently removes the argument from the oracle entirely.
+            arg.direction = "inout"
         else:
             arg.direction = "input"
 

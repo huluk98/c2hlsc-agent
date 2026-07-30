@@ -49,7 +49,34 @@ def run_software_equivalence(project_dir: Path, verbose: bool = False) -> PhaseR
         return _timeout_result(project_dir, "software_equivalence", exc, "host equivalence")
     if verbose and result.stdout:
         print(result.stdout)
-    return result
+    return _gate_equivalence_on_evidence(result)
+
+
+# The generated oracle prints this once it has compared at least one value. Requiring it
+# means a testbench that exits 0 without proving anything cannot pass -- symmetric with
+# _gate_cosim_on_log, and backend-agnostic (it guards the Bambu and Vitis paths alike,
+# since host equivalence is the first rung for both).
+_EQUIV_SUCCESS_MARKER = "c2hlsc_agent: all"
+
+
+def _gate_equivalence_on_evidence(result: PhaseResult) -> PhaseResult:
+    """Downgrade a passing host-equivalence phase that shows no comparison evidence."""
+    if result.status != "pass":
+        return result
+    text = f"{result.stdout or ''}\n{result.summary or ''}"
+    if _EQUIV_SUCCESS_MARKER in text:
+        return result
+    return PhaseResult(
+        result.name,
+        "fail",
+        summary=(
+            "host equivalence exited 0 but the testbench printed no success marker "
+            f"({_EQUIV_SUCCESS_MARKER!r}) — no evidence any value was compared"
+        ),
+        stdout=result.stdout,
+        stderr=result.stderr,
+        log_path=result.log_path,
+    )
 
 
 def _run_vitis_phase(project_dir: Path, phase: str, remote: RemoteVitis | None) -> PhaseResult:

@@ -103,6 +103,14 @@ def _validate_proposal(name: str, data: Any, known_args: set[str]) -> tuple[Argu
     return ArgumentConfig(direction=direction, length=length, range=parsed_range), ""
 
 
+def _inferred_direction(analysis: AnalysisResult, name: str) -> str | None:
+    """The direction the static analyzer assigned to ``name``, if it is pointer-like."""
+    for arg in analysis.function.args:
+        if arg.name == name and arg.is_pointer_like:
+            return arg.direction
+    return None
+
+
 def plan_contracts(
     analysis: AnalysisResult,
     config: AgentConfig,
@@ -141,6 +149,19 @@ def plan_contracts(
         if proposal is None:
             result.skipped[name] = reason
             continue
+        # Never let a proposal NARROW an argument the analyzer saw being written. Setting
+        # `direction` also suppresses _infer_pointer_directions for that argument, and
+        # testgen excludes non-output/inout arguments from every comparison -- so one
+        # accepted "input" on a written buffer can leave the oracle comparing nothing
+        # while the whole ladder still reports pass. Widening stays allowed.
+        if proposal.direction is not None:
+            inferred = _inferred_direction(analysis, name)
+            if inferred in {"output", "inout"} and proposal.direction == "input":
+                result.skipped[name] = (
+                    f"rejected direction 'input': analysis found {name} is written "
+                    f"(inferred {inferred!r}); narrowing it would remove it from the oracle"
+                )
+                continue
         result.proposals[name] = proposal
         existing = config.arguments.get(name)
         if existing is None:
