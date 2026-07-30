@@ -257,6 +257,15 @@ def _llm_repair(
         return [], False
     if not is_plausible_translation_unit(new_text, top):
         return [], False
+    oracle_violation = _reference_oracle_violation(new_text, top)
+    if oracle_violation:
+        print(
+            f"c2hlsc repair: rejected the candidate because {oracle_violation}. Delegating to "
+            "the macro-included golden source would pass every ladder phase by construction "
+            "(the DUT would BE the oracle); keeping the deterministic result.",
+            file=sys.stderr,
+        )
+        return [], False
     if _sha256(new_text) in _known_candidate_hashes(history, current):
         return [], True
 
@@ -473,6 +482,47 @@ def _support_include_block(top_name: str) -> str:
 #undef {top_name}
 #endif
 """
+
+
+_ORACLE_ALIAS_SUFFIX = "_c2hlsc_repair_reference"
+_ORACLE_INCLUDE = '#include "../input.c"'
+
+
+def _reference_oracle_violation(candidate: str, top_name: str) -> str:
+    """Reason the candidate would make the DUT delegate to the golden oracle, else "".
+
+    ``_repair_missing_original_support`` injects ``#define <top> <top>_c2hlsc_repair_reference``
+    plus ``#include "../input.c"`` so a preserved top body can call the ORIGINAL HELPER
+    functions. Those helpers keep their own names; the alias is only the renamed top, and
+    exists purely so the include does not collide. So no legitimate HLS-C ever needs to
+    call it -- while a candidate that does (``void top(...) { top_c2hlsc_repair_reference(...); }``)
+    passes host equivalence, CSim, CSynth and CoSim BY CONSTRUCTION, because the DUT *is*
+    the oracle. The ladder cannot detect that; this gate must.
+
+    Deliberately NOT comment- or literal-stripped. A "skip lines that look like comments"
+    heuristic is itself a bypass -- a delegation formatted to resemble a continuation line
+    slips straight through it. Flagging an alias merely mentioned in a comment is a
+    harmless false positive; missing a real delegation is not.
+    """
+
+    alias = f"{top_name}{_ORACLE_ALIAS_SUFFIX}"
+    # Drop ONLY the support block's own rename directive, matched exactly. Whitelisting
+    # "any #define mentioning the alias" would be a trivially widened hole.
+    rename = re.compile(
+        rf"^[ \t]*#[ \t]*define[ \t]+{re.escape(top_name)}[ \t]+{re.escape(alias)}[ \t]*$"
+    )
+    residual = [line for line in candidate.splitlines() if not rename.match(line)]
+    if alias in "\n".join(residual):
+        return f"it references the golden-oracle alias {alias!r}"
+
+    # The support block contains exactly one oracle include; more than one, or one without
+    # the block's guard macro, means the candidate pulled the oracle in on its own terms.
+    includes = candidate.count(_ORACLE_INCLUDE)
+    if includes > 1:
+        return f"it includes the golden oracle {includes} times"
+    if includes == 1 and "C2HLSC_REPAIR_INCLUDE_ORIGINAL_SUPPORT" not in candidate:
+        return "it includes the golden oracle outside the repair support block"
+    return ""
 
 
 def _repair_missing_original_support(
