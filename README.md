@@ -359,7 +359,7 @@ box:
 python -m c2hlsc_agent.cli convert \
   --input examples/vector_add/input.c --top vector_add --out build/vector_add \
   --use-llm --auto-repair --max-iterations 3 \
-  --vitis-ssh luke@linux-box            # implies --run-vitis
+  --vitis-ssh user@vitis-host            # implies --run-vitis
 ```
 
 Per verification pass the project directory is rsynced to
@@ -493,7 +493,7 @@ keeping equivalence locked — the live implementation of the declared
 ```bash
 python -m c2hlsc_agent.cli optimize --project build/vector_add \
   --objective latency --iterations 4 \
-  --vitis-ssh luke@linux-box          # Vitis phases remote, everything else local
+  --vitis-ssh user@vitis-host          # Vitis phases remote, everything else local
 ```
 
 The loop: (1) baseline QoR is read from the project's Vitis synthesis report
@@ -520,7 +520,7 @@ the remaining gaps — until **every** target is met, no candidate makes progres
 ```bash
 python -m c2hlsc_agent.cli optimize --project build/cnn_3x3 \
   --target-latency 150 --target-slack 0.5 --target-area 1000 --target-power 2e-3 \
-  --max-rounds 5 --vitis-ssh luke@linux-box
+  --max-rounds 5 --vitis-ssh user@vitis-host
 ```
 
 - `--target-latency` — max worst-case cycles (from the Vitis csynth report)

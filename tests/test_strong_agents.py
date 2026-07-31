@@ -347,10 +347,10 @@ class RemoteVitisTests(unittest.TestCase):
 
     def test_from_config_reads_env_fallback(self):
         config = AgentConfig()
-        with mock.patch.dict(os.environ, {"C2HLSC_VITIS_SSH": "luke@linux-box"}):
+        with mock.patch.dict(os.environ, {"C2HLSC_VITIS_SSH": "user@vitis-host"}):
             remote = RemoteVitis.from_config(config)
         self.assertIsNotNone(remote)
-        self.assertEqual(remote.host, "luke@linux-box")
+        self.assertEqual(remote.host, "user@vitis-host")
         self.assertIsNone(RemoteVitis.from_config(AgentConfig()))
 
     def test_run_vitis_remote_ladder_pushes_runs_and_pulls(self):
@@ -399,24 +399,24 @@ class RemoteVitisTests(unittest.TestCase):
 
     def test_vitis_ssh_flag_implies_run_vitis(self):
         args = build_parser().parse_args(
-            ["convert", "--input", "x.c", "--top", "f", "--out", "o", "--vitis-ssh", "luke@box"]
+            ["convert", "--input", "x.c", "--top", "f", "--out", "o", "--vitis-ssh", "user@vitis-host"]
         )
         config = merge_cli_config(AgentConfig(), args)
         self.assertTrue(config.run_vitis)
-        self.assertEqual(config.vitis_ssh_host, "luke@box")
+        self.assertEqual(config.vitis_ssh_host, "user@vitis-host")
 
     def test_vitis_ssh_env_var_implies_run_vitis(self):
         args = build_parser().parse_args(["convert", "--input", "x.c", "--top", "f", "--out", "o"])
-        with mock.patch.dict(os.environ, {"C2HLSC_VITIS_SSH": "luke@box"}):
+        with mock.patch.dict(os.environ, {"C2HLSC_VITIS_SSH": "user@vitis-host"}):
             config = merge_cli_config(AgentConfig(), args)
-        self.assertEqual(config.vitis_ssh_host, "luke@box")
+        self.assertEqual(config.vitis_ssh_host, "user@vitis-host")
         self.assertTrue(config.run_vitis)
 
     def test_no_run_vitis_overrides_env_var(self):
         args = build_parser().parse_args(
             ["convert", "--input", "x.c", "--top", "f", "--out", "o", "--no-run-vitis"]
         )
-        with mock.patch.dict(os.environ, {"C2HLSC_VITIS_SSH": "luke@box"}):
+        with mock.patch.dict(os.environ, {"C2HLSC_VITIS_SSH": "user@vitis-host"}):
             config = merge_cli_config(AgentConfig(), args)
         self.assertFalse(config.run_vitis)
 

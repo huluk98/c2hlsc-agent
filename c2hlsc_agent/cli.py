@@ -48,7 +48,7 @@ def _add_llm_arguments(parser: argparse.ArgumentParser) -> None:
 def _add_remote_vitis_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--vitis-ssh",
-        help="run the Vitis phases (csim/csynth/cosim) on this SSH host, e.g. user@linux-box; "
+        help="run the Vitis phases (csim/csynth/cosim) on this SSH host, e.g. user@vitis-host; "
         "everything else (analysis, generation, host equivalence, LLM repair) stays local. "
         "Implies --run-vitis. Also honours C2HLSC_VITIS_SSH.",
     )
