@@ -21,9 +21,21 @@ def _is_unsigned(c_type: str) -> bool:
     return "unsigned" in c_type or c_type.strip().startswith("uint") or "ap_uint" in c_type
 
 
-def _scalar_decl(arg: FunctionArg) -> str:
-    if arg.scalar_range:
-        lo, hi = arg.scalar_range
+def _scalar_bounds(arg: FunctionArg, arrays: list[FunctionArg]) -> tuple[int, int] | None:
+    if arg.scalar_range is not None:
+        return arg.scalar_range
+    lengths = [
+        array.length
+        for array in arrays
+        if array.length is not None and _looks_like_length_name(arg.name, array.name)
+    ]
+    return (0, min(lengths)) if lengths else None
+
+
+def _scalar_decl(arg: FunctionArg, arrays: list[FunctionArg]) -> str:
+    bounds = _scalar_bounds(arg, arrays)
+    if bounds is not None:
+        lo, hi = bounds
         return f"bounded_scalar<{arg.c_type}>(test_idx, rng, {lo}LL, {hi}LL)"
     return f"random_value<{arg.c_type}>(rng)"
 
@@ -119,13 +131,16 @@ def _contract_comment(fn_args: list[FunctionArg], return_type: str, arrays: list
             if arg.direction in {"output", "inout"}:
                 active_len = _active_length_arg(arg, scalars)
                 if active_len:
-                    compare = f"compare first clamp({active_len.name}, {arg.length}) elements"
+                    compare = f"compare all {arg.length} elements; active prefix is clamp({active_len.name}, {arg.length})"
                 else:
                     compare = f"compare all {arg.length} elements"
             lines.append(f"// - {arg.name}: direction={arg.direction} length={arg.length} {compare}")
         elif arg.scalar_range:
             lo, hi = arg.scalar_range
             lines.append(f"// - {arg.name}: scalar range=[{lo}, {hi}] with directed boundary tests")
+        elif (bounds := _scalar_bounds(arg, arrays)) is not None:
+            lo, hi = bounds
+            lines.append(f"// - {arg.name}: inferred scalar range=[{lo}, {hi}] from related pointer capacity")
         else:
             lines.append(f"// - {arg.name}: scalar random stimulus")
     return "\n".join(lines)
@@ -215,7 +230,7 @@ def generate_testbench(analysis: AnalysisResult, config: AgentConfig) -> str:
         declarations.append(f"    {storage_type} hls_{arg.name}[{arg.length}] = {{}};")
         initializers.append("    " + _init_array(arg).replace("\n", "\n    "))
     for arg in scalars:
-        declarations.append(f"    {arg.c_type} {arg.name} = {_scalar_decl(arg)};")
+        declarations.append(f"    {arg.c_type} {arg.name} = {_scalar_decl(arg, arrays)};")
 
     return_compare = ""
     return_capture_ref = ""
@@ -239,12 +254,11 @@ def generate_testbench(analysis: AnalysisResult, config: AgentConfig) -> str:
         if arg.direction in {"output", "inout"}:
             active_len = _active_length_arg(arg, scalars)
             compare_var = f"compare_len_{arg.name}"
+            compare_declarations.append(f"    const int {compare_var} = {arg.length};")
             if active_len:
                 compare_declarations.append(
-                    f"    const int {compare_var} = clamp_count({_value_print(active_len.name)}, {arg.length});"
+                    f"    const int active_len_{arg.name} = clamp_count({_value_print(active_len.name)}, {arg.length});"
                 )
-            else:
-                compare_declarations.append(f"    const int {compare_var} = {arg.length};")
             trace_lines = _array_trace_lines(arg, arrays)
             if trace_lines:
                 trace_lines = "\n" + trace_lines
@@ -255,7 +269,7 @@ def generate_testbench(analysis: AnalysisResult, config: AgentConfig) -> str:
                   << " expected=" << {_value_print(f'ref_{arg.name}[i]')}
                   << " actual=" << {_value_print(f'hls_{arg.name}[i]')}
                   << " seed={config.seed}"
-                  << " compare_len=" << {compare_var}{scalar_context};{trace_lines}
+                  << " compare_len=" << {compare_var}{f' << " active_len=" << active_len_{arg.name}' if active_len else ''}{scalar_context};{trace_lines}
         std::cerr << "\\n";
         return 1;
       }}
