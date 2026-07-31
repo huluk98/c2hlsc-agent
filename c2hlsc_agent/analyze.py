@@ -114,7 +114,10 @@ def _parse_arg(raw: str, metadata: ArgumentConfig | None = None) -> FunctionArg:
     type_tokens = [t for t in tokens[:-1] if t not in {"*", "restrict", "__restrict", "__restrict__"}]
     c_type = " ".join(type_tokens).strip()
     c_type = re.sub(r"\s+", " ", c_type)
-    is_const = "const" in c_type.split()
+    # For a pointer, only const before the first `*` qualifies the pointee.
+    # A top-level qualifier (`int * const p`) does not make `*p` immutable.
+    pointee_type = raw_no_arrays.split("*", 1)[0] if pointer_depth else c_type
+    is_const = "const" in pointee_type.split()
     if metadata is None:
         metadata = ArgumentConfig()
     direction = metadata.direction or ("input" if is_const or pointer_depth == 0 and not array_dims else "inout")
@@ -187,25 +190,18 @@ def _infer_pointer_directions(function: FunctionInfo, config: AgentConfig) -> No
         writes = bool(re.search(write_pattern, body))
         body_without_lhs_writes = re.sub(write_pattern, "", body)
         reads = bool(re.search(rf"(?:\*\s*{name}|{name}\s*\[[^\]]*\]|{name}\s*\+)", body_without_lhs_writes))
-        # A pointer handed to a callee may be written there, and we cannot see the callee
-        # body. Treat that as a possible write unless the parameter is const-qualified.
-        escapes = bool(re.search(rf"\b\w+\s*\([^;{{}}]*\b{name}\b[^;{{}}]*\)", body_without_lhs_writes))
-        is_const = "const" in (arg.c_type or "")
-
-        if is_const:
+        if arg.is_const:
             # const-qualified: cannot be written through, so `input` is provable.
             arg.direction = "input"
         elif writes and reads:
             arg.direction = "inout"
         elif writes:
             arg.direction = "output"
-        elif escapes:
-            # Fail SAFE: over-comparison is free (both sides receive identical stimulus,
-            # so comparing a read-only buffer can never produce a false mismatch), while
-            # under-comparison silently removes the argument from the oracle entirely.
-            arg.direction = "inout"
         else:
-            arg.direction = "input"
+            # Only const qualification proves that a pointer is input-only. A mutable
+            # pointer that appears read-only here may still be changed by generated HLS
+            # code; keep it observable so equivalence checks catch that mutation.
+            arg.direction = "inout"
 
 
 def _unsupported(function: FunctionInfo) -> list[Diagnostic]:

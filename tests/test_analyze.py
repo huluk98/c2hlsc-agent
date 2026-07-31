@@ -70,6 +70,73 @@ class AnalyzeTests(unittest.TestCase):
         self.assertEqual(directions["b"], "input")
         self.assertEqual(directions["out"], "output")
 
+    def test_mutable_read_only_pointer_remains_observable(self):
+        path = self._write(
+            """
+            int sum_values(int *a, int n) {
+              int sum = 0;
+              for (int i = 0; i < n; ++i) sum += a[i];
+              return sum;
+            }
+            """
+        )
+        cfg = AgentConfig(top="sum_values", arguments={"a": ArgumentConfig(length=8)})
+        result = analyze_source(path, "sum_values", cfg)
+        directions = {arg.name: arg.direction for arg in result.function.args}
+        self.assertEqual(directions["a"], "inout")
+
+    def test_explicit_pointer_direction_wins_over_inference(self):
+        path = self._write(
+            """
+            int sum_values(int *a, int n) {
+              int sum = 0;
+              for (int i = 0; i < n; ++i) sum += a[i];
+              return sum;
+            }
+            """
+        )
+        for direction in ("input", "output"):
+            with self.subTest(direction=direction):
+                cfg = AgentConfig(
+                    top="sum_values",
+                    arguments={"a": ArgumentConfig(direction=direction, length=8)},
+                )
+                result = analyze_source(path, "sum_values", cfg)
+                directions = {arg.name: arg.direction for arg in result.function.args}
+                self.assertEqual(directions["a"], direction)
+
+    def test_pointer_const_qualifier_applies_to_pointee(self):
+        path = self._write(
+            """
+            int qualifiers(const int *a, int const *b, int * const c, const int * const d) {
+              return a[0] + b[0] + c[0] + d[0];
+            }
+            """
+        )
+        cfg = AgentConfig(
+            top="qualifiers",
+            arguments={name: ArgumentConfig(length=4) for name in ("a", "b", "c", "d")},
+        )
+        result = analyze_source(path, "qualifiers", cfg)
+        args = {arg.name: arg for arg in result.function.args}
+        self.assertEqual(
+            {name: args[name].direction for name in args},
+            {"a": "input", "b": "input", "c": "inout", "d": "input"},
+        )
+        self.assertEqual(
+            {name: args[name].is_const for name in args},
+            {"a": True, "b": True, "c": False, "d": True},
+        )
+
+    def test_explicit_direction_wins_for_const_pointee(self):
+        path = self._write("int first(const int *a) { return a[0]; }")
+        cfg = AgentConfig(
+            top="first",
+            arguments={"a": ArgumentConfig(direction="output", length=4)},
+        )
+        result = analyze_source(path, "first", cfg)
+        self.assertEqual(result.function.args[0].direction, "output")
+
     def test_restrict_qualifier_is_stripped_from_type(self):
         # Regression: the C `restrict` keyword must not leak into the C++ type,
         # which would produce invalid declarations in the generated testbench.

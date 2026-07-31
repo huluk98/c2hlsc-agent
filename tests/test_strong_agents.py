@@ -25,10 +25,11 @@ from unittest import mock
 
 from c2hlsc_agent import llm as llm_module
 from c2hlsc_agent.analyze import analyze_source
-from c2hlsc_agent.candidates import select_best_candidate
+from c2hlsc_agent.candidates import CandidateScore, select_best_candidate
 from c2hlsc_agent.cli import build_parser, run_convert
 from c2hlsc_agent.config import AgentConfig, merge_cli_config
 from c2hlsc_agent.convert import (
+    GeneratedSource,
     generate_hls_source_candidates,
     generate_hls_sources,
     generate_reference_c,
@@ -339,6 +340,26 @@ class NlSpecTests(unittest.TestCase):
 
 
 class CandidateSelectionTests(unittest.TestCase):
+    @staticmethod
+    def _generated_candidates(count: int) -> list[GeneratedSource]:
+        return [
+            GeneratedSource(
+                header="",
+                source=CANDIDATE_B.replace("#pragma HLS PIPELINE", f"#pragma HLS PIPELINE II={index + 1}"),
+            )
+            for index in range(count)
+        ]
+
+    @staticmethod
+    def _score(index: int, *, passed: bool = False, first_failure: int | None = 0) -> CandidateScore:
+        return CandidateScore(
+            index=index,
+            passed=passed,
+            mismatch_count=0 if passed else (1 if first_failure is not None else 0),
+            first_failure_index=None if passed else first_failure,
+            summary="host equivalence pass" if passed else "host equivalence fail",
+        )
+
     def test_candidates_are_deduplicated(self):
         with tempfile.TemporaryDirectory() as tmp:
             config = AgentConfig(use_llm=True, llm_candidates=3)
@@ -361,7 +382,10 @@ class CandidateSelectionTests(unittest.TestCase):
                 PhaseResult("software_equivalence", "fail", stdout="Mismatch test=0 arg=out index=1 expected=3 actual=4 seed=1"),
                 PhaseResult("software_equivalence", "pass"),
             ]
-            with mock.patch("c2hlsc_agent.candidates.run_software_equivalence", side_effect=results):
+            with mock.patch(
+                "c2hlsc_agent.candidates.run_software_equivalence",
+                side_effect=lambda project: results[int(project.name.removeprefix("cand_"))],
+            ):
                 winner, scores = select_best_candidate(out_dir, analysis, config, llm)
         self.assertIsNotNone(winner)
         self.assertIn("II=1", winner.source)
@@ -381,7 +405,10 @@ class CandidateSelectionTests(unittest.TestCase):
                 PhaseResult("software_equivalence", "fail", stdout="Mismatch test=0 arg=out index=1 expected=3 actual=4 seed=1"),
                 PhaseResult("software_equivalence", "fail", stdout="Mismatch test=57 arg=out index=1 expected=3 actual=4 seed=1"),
             ]
-            with mock.patch("c2hlsc_agent.candidates.run_software_equivalence", side_effect=results):
+            with mock.patch(
+                "c2hlsc_agent.candidates.run_software_equivalence",
+                side_effect=lambda project: results[int(project.name.removeprefix("cand_"))],
+            ):
                 winner, scores = select_best_candidate(out_dir, analysis, config, llm)
         self.assertIsNotNone(winner)
         self.assertIn("UNROLL", winner.source)  # candidate 2 failed at test 57, later than test 0
@@ -398,10 +425,105 @@ class CandidateSelectionTests(unittest.TestCase):
                 PhaseResult("software_equivalence", "fail", stdout="compiler exploded"),  # no mismatch lines
                 PhaseResult("software_equivalence", "fail", stdout="Mismatch test=0 arg=out index=1 expected=3 actual=4 seed=1"),
             ]
-            with mock.patch("c2hlsc_agent.candidates.run_software_equivalence", side_effect=results):
+            with mock.patch(
+                "c2hlsc_agent.candidates.run_software_equivalence",
+                side_effect=lambda project: results[int(project.name.removeprefix("cand_"))],
+            ):
                 winner, _scores = select_best_candidate(out_dir, analysis, config, llm)
         self.assertIsNotNone(winner)
         self.assertIn("UNROLL", winner.source)
+
+    def test_host_scores_actually_overlap(self):
+        candidates = self._generated_candidates(4)
+        barrier = threading.Barrier(3)
+
+        def score(_scratch, _analysis, _candidate, _config, index):
+            if index:
+                barrier.wait(timeout=2)
+            return self._score(index, first_failure=index)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = AgentConfig(use_llm=True, llm_candidates=4, llm_candidate_workers=4)
+            analysis = _analysis(root, config)
+            with mock.patch("c2hlsc_agent.candidates.generate_hls_source_candidates", return_value=candidates), mock.patch(
+                "c2hlsc_agent.candidates._score_candidate", side_effect=score
+            ):
+                _winner, scores = select_best_candidate(root / "out", analysis, config, mock.Mock())
+
+        self.assertEqual([score.index for score in scores], [0, 1, 2, 3])
+
+    def test_out_of_order_completion_keeps_attempt_order_winner(self):
+        candidates = self._generated_candidates(3)
+        later_finished = threading.Event()
+        completion_order: list[int] = []
+        lock = threading.Lock()
+
+        def score(_scratch, _analysis, _candidate, _config, index):
+            if index == 1:
+                self.assertTrue(later_finished.wait(timeout=2))
+            if index == 2:
+                later_finished.set()
+            with lock:
+                completion_order.append(index)
+            return self._score(index, passed=index in {1, 2})
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = AgentConfig(use_llm=True, llm_candidates=3, llm_candidate_workers=3)
+            analysis = _analysis(root, config)
+            with mock.patch("c2hlsc_agent.candidates.generate_hls_source_candidates", return_value=candidates), mock.patch(
+                "c2hlsc_agent.candidates._score_candidate", side_effect=score
+            ):
+                winner, scores = select_best_candidate(root / "out", analysis, config, mock.Mock())
+
+        self.assertEqual(completion_order[0], 0)
+        self.assertGreater(completion_order.index(1), completion_order.index(2))
+        self.assertIs(winner, candidates[1])
+        self.assertEqual([score.index for score in scores], [0, 1])
+
+    def test_first_candidate_pass_avoids_redundant_scoring_and_pool(self):
+        candidates = self._generated_candidates(4)
+        scored: list[int] = []
+
+        def score(_scratch, _analysis, _candidate, _config, index):
+            scored.append(index)
+            return self._score(index, passed=index == 0)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = AgentConfig(use_llm=True, llm_candidates=4, llm_candidate_workers=4)
+            analysis = _analysis(root, config)
+            with mock.patch("c2hlsc_agent.candidates.generate_hls_source_candidates", return_value=candidates), mock.patch(
+                "c2hlsc_agent.candidates._score_candidate", side_effect=score
+            ), mock.patch("c2hlsc_agent.candidates.ThreadPoolExecutor") as executor:
+                winner, scores = select_best_candidate(root / "out", analysis, config, mock.Mock())
+
+        self.assertIs(winner, candidates[0])
+        self.assertEqual([score.index for score in scores], [0])
+        self.assertEqual(scored, [0])
+        executor.assert_not_called()
+
+    def test_one_worker_retains_serial_early_stop(self):
+        candidates = self._generated_candidates(4)
+        scored: list[int] = []
+
+        def score(_scratch, _analysis, _candidate, _config, index):
+            scored.append(index)
+            return self._score(index, passed=index == 1, first_failure=index)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = AgentConfig(use_llm=True, llm_candidates=4, llm_candidate_workers=1)
+            analysis = _analysis(root, config)
+            with mock.patch("c2hlsc_agent.candidates.generate_hls_source_candidates", return_value=candidates), mock.patch(
+                "c2hlsc_agent.candidates._score_candidate", side_effect=score
+            ):
+                winner, scores = select_best_candidate(root / "out", analysis, config, mock.Mock())
+
+        self.assertIs(winner, candidates[1])
+        self.assertEqual(scored, [0, 1])
+        self.assertEqual([score.index for score in scores], [0, 1])
 
 
 class RemoteVitisTests(unittest.TestCase):
