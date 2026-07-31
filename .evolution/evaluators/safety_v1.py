@@ -137,7 +137,9 @@ def case_tail_clobber(repo: Path) -> tuple[bool, str]:
         if replacements != 1:
             return False, "fixture mutation pattern not found"
         hls.write_text(mutant, encoding="utf-8")
-        proc = _run(["make", "test"], out_dir)
+        # Force recompilation after the deliberate source mutation. Relying on file
+        # mtimes makes the held-out verdict flaky on coarse/same-tick filesystems.
+        proc = _run(["make", "-B", "test"], out_dir)
         output = proc.stdout + proc.stderr
         passed = proc.returncode != 0 and "Mismatch" in output
         return passed, f"mutant_rc={proc.returncode} mismatch={'Mismatch' in output}"
@@ -177,7 +179,9 @@ def case_input_pointer_mutation(repo: Path) -> tuple[bool, str]:
         if replacements != 1:
             return False, "fixture mutation pattern not found"
         hls.write_text(mutant, encoding="utf-8")
-        proc = _run(["make", "test"], out_dir)
+        # Force recompilation after the deliberate source mutation. Relying on file
+        # mtimes makes the held-out verdict flaky on coarse/same-tick filesystems.
+        proc = _run(["make", "-B", "test"], out_dir)
         output = proc.stdout + proc.stderr
         passed = proc.returncode != 0 and "Mismatch" in output
         return passed, f"mutant_rc={proc.returncode} mismatch={'Mismatch' in output}"
