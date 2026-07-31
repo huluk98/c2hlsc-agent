@@ -184,6 +184,20 @@ class VitisProcessResult:
     timed_out: bool = False
 
 
+_COSIM_FAILURE_MARKERS = (
+    "co-simulation finished: fail",
+    "cosim design failed",
+    "co-simulation failed",
+    "aborting cosim",
+)
+
+
+def cosim_failure_marker(output: str) -> str | None:
+    """Return an explicit CoSim failure marker from Vitis console output."""
+    lowered = output.lower()
+    return next((marker for marker in _COSIM_FAILURE_MARKERS if marker in lowered), None)
+
+
 def terminate_process_group(proc: subprocess.Popen[str]) -> None:
     try:
         os.killpg(proc.pid, signal.SIGTERM)
@@ -247,7 +261,10 @@ def run_design(vitis_hls: str, design: dict[str, Any], timeout: int, run_full_co
         aggregate_parts.append(f"=== {phase}: {' '.join(command)} ===\n{phase_result.output}")
         rtl = verilog_files(design_dir)
         cosim = cosim_artifacts(design_dir)
-        phase_status = "timeout" if phase_result.timed_out else ("pass" if phase_result.returncode == 0 else "fail")
+        failure_marker = cosim_failure_marker(phase_result.output) if phase == "cosim" else None
+        phase_status = "timeout" if phase_result.timed_out else (
+            "pass" if phase_result.returncode == 0 and failure_marker is None else "fail"
+        )
         phase_row: dict[str, Any] = {
             "name": phase,
             "tcl": tcl,
@@ -258,6 +275,9 @@ def run_design(vitis_hls: str, design: dict[str, Any], timeout: int, run_full_co
         }
         if phase_result.timed_out:
             phase_row["timeout_seconds"] = timeout
+        if failure_marker is not None:
+            phase_row["failure_reason"] = "explicit_cosim_failure_marker"
+            phase_row["failure_marker"] = failure_marker
         if log_tail_lines:
             phase_row["vitis_log_tail"] = text_tail(phase_result.output, log_tail_lines)
         result["phases"][phase] = phase_row
@@ -274,9 +294,12 @@ def run_design(vitis_hls: str, design: dict[str, Any], timeout: int, run_full_co
             result["failed_phase"] = phase
             result["timeout_seconds"] = timeout
             return result
-        if phase_result.returncode != 0:
+        if phase_status == "fail":
             result["status"] = "fail"
             result["failed_phase"] = phase
+            if failure_marker is not None:
+                result["failure_reason"] = "explicit_cosim_failure_marker"
+                result["failure_marker"] = failure_marker
             return result
 
     rtl = verilog_files(design_dir)

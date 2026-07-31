@@ -56,6 +56,59 @@ class HlsNlVitisBatchTests(unittest.TestCase):
         plan = batch.phase_plan(run_full_cosim=True)
         self.assertEqual(plan, [("csim", "run_csim.tcl"), ("csynth", "run_csynth.tcl"), ("cosim", "run_cosim.tcl")])
 
+    def test_explicit_cosim_failure_marker_overrides_zero_exit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            design_dir = Path(tmp)
+            design = {"record_id": 34, "source_file": "34_hls.txt", "top": "tiny", "path": str(design_dir)}
+            original_run = batch.run_vitis_command
+
+            def fake_run(command, cwd, timeout):
+                if command[-1] == "run_csynth.tcl":
+                    rtl = design_dir / "hls_nl_project" / "solution1" / "syn" / "verilog" / "tiny.v"
+                    rtl.parent.mkdir(parents=True)
+                    rtl.write_text("module tiny; endmodule\n", encoding="utf-8")
+                output = (
+                    "C/RTL co-simulation finished: FAIL"
+                    if command[-1] == "run_cosim.tcl"
+                    else "phase completed"
+                )
+                return batch.VitisProcessResult(0, output)
+
+            batch.run_vitis_command = fake_run
+            try:
+                row = batch.run_design("vitis_hls", design, timeout=1, run_full_cosim=True, log_tail_lines=20)
+            finally:
+                batch.run_vitis_command = original_run
+
+            self.assertEqual(row["status"], "fail")
+            self.assertEqual(row["failed_phase"], "cosim")
+            self.assertEqual(row["returncode"], 0)
+            self.assertEqual(row["phases"]["cosim"]["status"], "fail")
+            self.assertEqual(row["failure_reason"], "explicit_cosim_failure_marker")
+            self.assertEqual(row["failure_marker"], "co-simulation finished: fail")
+
+    def test_explicit_cosim_pass_marker_remains_pass(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            design_dir = Path(tmp)
+            design = {"record_id": 35, "source_file": "35_hls.txt", "top": "tiny", "path": str(design_dir)}
+            original_run = batch.run_vitis_command
+
+            def fake_run(command, cwd, timeout):
+                if command[-1] == "run_csynth.tcl":
+                    rtl = design_dir / "hls_nl_project" / "solution1" / "syn" / "verilog" / "tiny.v"
+                    rtl.parent.mkdir(parents=True)
+                    rtl.write_text("module tiny; endmodule\n", encoding="utf-8")
+                return batch.VitisProcessResult(0, "C/RTL co-simulation finished: PASS")
+
+            batch.run_vitis_command = fake_run
+            try:
+                row = batch.run_design("vitis_hls", design, timeout=1, run_full_cosim=True, log_tail_lines=20)
+            finally:
+                batch.run_vitis_command = original_run
+
+            self.assertEqual(row["status"], "pass")
+            self.assertEqual(row["phases"]["cosim"]["status"], "pass")
+
     def test_generated_design_contains_split_tcls(self):
         with tempfile.TemporaryDirectory() as tmp:
             record = {

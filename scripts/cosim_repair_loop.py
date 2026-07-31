@@ -28,7 +28,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -53,7 +52,7 @@ from run_hls_nl_vitis_batch import (  # noqa: E402
     resolve_vitis_hls,
     run_design,
 )
-from c2hlsc_agent.llm import extract_code_blocks  # noqa: E402
+from c2hlsc_agent.llm import extract_code_blocks, is_plausible_translation_unit  # noqa: E402
 
 Completer = Callable[[str, str], str]  # (system, user) -> raw model text
 
@@ -90,14 +89,11 @@ REPAIR_SYSTEM = (
 
 def pick_code(resp: str, top_name: str) -> str | None:
     blocks = extract_code_blocks(resp)
-    candidates = [c for (lang, c) in blocks if lang.lower() in ("cpp", "c++", "c", "")] or [c for (_, c) in blocks]
-    defines = re.compile(rf"\b{re.escape(top_name)}\s*\(")
-    for c in candidates:
-        if defines.search(c):
-            return c.strip() + "\n"
-    if candidates:
-        return candidates[0].strip() + "\n"
-    if defines.search(resp):
+    candidates = [c for lang, c in blocks if lang.lower() in ("cpp", "c++", "c", "")]
+    for candidate in candidates:
+        if is_plausible_translation_unit(candidate, top_name):
+            return candidate.strip() + "\n"
+    if not blocks and is_plausible_translation_unit(resp, top_name):
         return resp.strip() + "\n"
     return None
 
