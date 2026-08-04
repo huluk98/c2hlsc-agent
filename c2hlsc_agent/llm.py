@@ -135,6 +135,24 @@ class OpenAICompatibleLLMClient:
         return _openai_text(body)
 
 
+#: Tools the CLI backend is forbidden to use. ``claude -p`` is an *agent*, not a text
+#: completion endpoint: left unrestricted it inherits the caller's cwd and can read
+#: anything under it. That matters because the callers of this class run benchmarks whose
+#: integrity claim is "the model never sees the oracle" -- and the RTLLM harness stages a
+#: copy of the golden testbench inside its own ``--out-dir`` on every attempt. Verified on
+#: this machine: an unrestricted ``claude -p`` returned the first three lines of a staged
+#: ``testbench.v`` verbatim. A prompt saying "you never see the testbench" is not a control.
+#:
+#: A deny list can only name tools we know about, so it is one of two layers: the other is
+#: the empty per-call working directory in :meth:`ClaudeCLIClient._workdir`. A backend that
+#: gains a new file-reading tool is not covered by either -- re-verify before trusting a
+#: number produced through a CLI you have not checked.
+_CLI_DISALLOWED_TOOLS = (
+    "Task,Bash,Glob,Grep,Read,Edit,MultiEdit,Write,NotebookEdit,WebFetch,WebSearch,"
+    "TodoWrite,BashOutput,KillShell,SlashCommand,Artifact,SendUserFile,Skill"
+)
+
+
 class ClaudeCLIClient:
     """Drive the local Claude Code CLI (``claude -p``) as a completion backend.
 
@@ -142,6 +160,13 @@ class ClaudeCLIClient:
     required and calls are not billed per token. ``cli_cmd`` may be a multi-word command
     (e.g. ``"ssh you@mac claude"``) so the CLI can live on another machine, though the
     intended setup keeps every LLM call local and ships only Vitis over SSH.
+
+    Runs **sandboxed**: every tool is disallowed, the permission mode denies what is left,
+    and the subprocess starts in a private empty directory rather than inheriting the
+    caller's cwd. The point is to make this backend behave like the plain completion API
+    the ``LLMClient`` protocol describes, so that "the model only saw the prompt" is a
+    property of the harness rather than of the prompt's wording. Pass ``sandbox=False``
+    only for interactive/manual use where no measurement depends on the answer.
     """
 
     def __init__(
@@ -149,25 +174,46 @@ class ClaudeCLIClient:
         model: str = DEFAULT_CLI_MODEL,
         cli_cmd: str = "claude",
         timeout: int = _CLI_TIMEOUT,
+        sandbox: bool = True,
     ) -> None:
         import shlex
 
         self._base = shlex.split(cli_cmd) + ["-p", "--model", model]
+        if sandbox:
+            self._base += ["--disallowedTools", _CLI_DISALLOWED_TOOLS, "--permission-mode", "plan"]
         self.model = model
         self._timeout = timeout
+        self.sandboxed = bool(sandbox)
 
     def complete(self, system: str, user: str, *, max_tokens: int = _DEFAULT_MAX_TOKENS) -> str:
         del max_tokens  # the CLI manages its own output budget
-        proc = subprocess.run(
-            self._base,
-            input=f"{system}\n\n{user}",
-            text=True,
-            capture_output=True,
-            timeout=self._timeout,
-        )
+        with self._workdir() as cwd:
+            proc = subprocess.run(
+                self._base,
+                input=f"{system}\n\n{user}",
+                text=True,
+                capture_output=True,
+                timeout=self._timeout,
+                cwd=cwd,
+            )
         if proc.returncode != 0:
             raise RuntimeError(f"claude CLI failed (rc={proc.returncode}): {proc.stderr[-800:]}")
         return proc.stdout
+
+    def _workdir(self):
+        """An empty private directory to run in, or the caller's cwd when unsandboxed.
+
+        Fresh per call and removed afterwards: even a tool-less agent should not be handed
+        a directory it can enumerate, and a per-call directory keeps concurrent workers
+        from sharing state.
+        """
+
+        import contextlib
+        import tempfile
+
+        if not self.sandboxed:
+            return contextlib.nullcontext(None)
+        return tempfile.TemporaryDirectory(prefix="c2hlsc-llm-")
 
 
 def _text_from_response(response: object) -> str:

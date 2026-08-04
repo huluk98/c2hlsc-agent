@@ -19,11 +19,16 @@ lower on the abstraction ladder:
 Benchmark-integrity rules (these are the whole point of the harness; breaking one
 invalidates every number it prints):
 
-1. The model NEVER sees the golden reference RTL (``verified_*.v``) or the testbench
-   source. Its only inputs are the natural-language description, the contract it wrote
-   itself, its own prior RTL, and tool output from its own failing run. No prompt builder
-   in this module reads :attr:`RtllmDesign.testbench` or
-   :attr:`RtllmDesign.reference_files`.
+1. No prompt this module builds contains the golden reference RTL (``verified_*.v``) or the
+   testbench source: the model's inputs are the natural-language description, the contract
+   it wrote itself, its own prior RTL, and tool output from its own failing run. No prompt
+   builder here reads :attr:`RtllmDesign.testbench` or :attr:`RtllmDesign.reference_files`.
+
+   This is a guarantee about *prompts*, and prompts are not the only channel. An agentic
+   backend with filesystem tools can read the oracle off disk no matter what the prompt
+   says, so :class:`c2hlsc_agent.llm.ClaudeCLIClient` runs its subprocess tool-less and in
+   an empty scratch directory. If you add a backend that can call tools, sandbox it the
+   same way or stop calling the numbers clean.
 2. ``evidence_policy="none"`` reduces repair to a blind retry -- no tool output, no failure
    family, no stage -- so a user can measure what the feedback loop is actually worth.
    ``"logs"`` (the default) passes the compile/sim tail. The policy is recorded in every
@@ -31,6 +36,10 @@ invalidates every number it prints):
 3. :func:`extract_verilog` never renames the model's module. If the required module name is
    absent, the candidate goes to the verifier unchanged and is scored as
    ``missing_module`` -- that is a real benchmark failure, not something to paper over.
+   It equally never *edits* the candidate: a module containing ``$display`` or ``$finish``
+   is passed through and refused by the verifier as ``illegal_system_task``, because a
+   candidate able to write to the simulator's stdout can print the oracle's pass marker
+   itself. Rejecting is the honest score; silently stripping would hide a real failure.
 
 The module is deterministic and side-effect-light: it writes only inside the ``workdir``
 it is handed, keeps no global state, and prints nothing (pass a ``log`` callback if you
@@ -48,7 +57,7 @@ import subprocess
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Protocol
 
 from .llm import LLMClient, extract_code_blocks
 from .rtllm_bench import (
@@ -122,9 +131,11 @@ Hard rules:
 - Reset every register to a defined value; do not rely on `initial` blocks for design state.
 - Helper submodules are welcome (e.g. a `full_adder` under an 8-bit adder). Define them in
   the SAME file, below the top module.
-- Do NOT write a testbench, a `testbench`/`*_tb` module, or any `$display`, `$monitor`,
-  `$finish`, or `$dumpvars`: the harness supplies those, and a stray `$finish` truncates the
-  run and fails the design.
+- Do NOT write a testbench, a `testbench`/`*_tb` module, or any simulation output or control
+  system task: no `$display`, `$write`, `$monitor`, `$strobe`, `$fdisplay`, `$finish`,
+  `$stop`, `$dumpvars`. This is enforced, not advisory: the harness refuses such a file
+  without compiling it and scores the design as failed. Only the hidden testbench may print.
+  (`$signed`, `$unsigned`, `$clog2` and friends are fine.)
 - No `include of other files. The file must be self-contained.
 
 Output ONLY the complete Verilog file in ONE ```verilog fenced block. No prose outside it.
@@ -147,7 +158,9 @@ Rules:
   value is usually a width, sign, reset value, or off-by-one-cycle timing bug; a hang is
   usually a state that is never left or a done/valid pulse that is never asserted.
 - Stay in the Verilog-2001 subset Icarus Verilog accepts, keep the file self-contained, and
-  add no `$display`/`$finish`/testbench module.
+  add no testbench module and no simulation output/control system task
+  (`$display`/`$write`/`$monitor`/`$strobe`/`$fdisplay`/`$finish`/`$stop`/`$dump*`). The
+  harness refuses such a file without compiling it.
 - Return the COMPLETE corrected file in a single ```verilog fenced block, and nothing else of
   substance.
 """
@@ -188,6 +201,15 @@ REPAIR_INTENTS: dict[str, str] = {
         "The harness is missing a golden data file it needs; this is a benchmark defect and "
         "no RTL change can fix it."
     ),
+    "illegal_system_task": (
+        "The candidate was refused before compiling: a design file may not contain "
+        "simulation output or control system tasks. Delete every $display/$write/$monitor/"
+        "$strobe/$fdisplay/$finish/$stop/$dump* and drive the outputs with real logic."
+    ),
+    "runaway_output": (
+        "The simulation was killed for flooding its output: find the loop or clock "
+        "generator that never advances simulation time and never terminates."
+    ),
 }
 
 _DEFAULT_INTENT = (
@@ -199,6 +221,13 @@ _DEFAULT_INTENT = (
 # against them burns LLM calls on a design that cannot pass however good the RTL is, so the
 # repair loop stops instead (the failure is still reported, unchanged).
 UNREPAIRABLE_FAMILIES = frozenset({"missing_golden_data"})
+
+
+class StopSignal(Protocol):
+    """Anything answering "should I wind down?" -- :class:`threading.Event` satisfies it."""
+
+    def is_set(self) -> bool:  # pragma: no cover - protocol
+        ...
 
 
 class LlmCallError(RuntimeError):
@@ -325,16 +354,65 @@ class DesignResult:
 
 _VERILOG_LANGS = {"", "verilog", "systemverilog", "sv", "v", "vlog"}
 
+#: Hard cap on the response text handed to the parser. A degenerate model response (the
+#: classic line-repetition loop) is otherwise unbounded, and no RTLLM design needs anything
+#: close to this. Truncation is recorded by the caller and the candidate simply fails.
+MAX_RESPONSE_CHARS = 512_000
+
 # Module units, matched at line starts so the word "module" inside a comment or a $display
-# string cannot open a bogus unit. Verilog modules do not nest, so a non-greedy body that
-# stops at the first line-initial `endmodule` is exact.
-_MODULE_UNIT_RE = re.compile(
-    r"(?ms)^[ \t]*module\b[ \t\r\n]+(?P<name>\\\S+|[A-Za-z_][A-Za-z0-9_$]*)"
-    r".*?^[ \t]*endmodule\b[^\n]*"
+# string cannot open a bogus unit. Verilog modules do not nest, so pairing each line-initial
+# `module` with the next line-initial `endmodule` is exact.
+#
+# Two linear scans, deliberately NOT one `module ... .*? endmodule` regex: a lazy body under
+# (?ms) rescans to end-of-input from every `module` that has no `endmodule` after it, which
+# is quadratic. Measured on the degenerate case (`module foo(...);` repeated, no endmodule):
+# 250/500/1000/2000 repeats took 0.15/0.61/2.27/8.90 s before this change, and a ~1 MB
+# response stalled a worker thread for tens of minutes with no timeout and no cancellation.
+_MODULE_START_RE = re.compile(
+    r"(?m)^[ \t]*module\b[ \t\r\n]+(?P<name>\\\S+|[A-Za-z_][A-Za-z0-9_$]*)"
 )
+_MODULE_END_RE = re.compile(r"(?m)^[ \t]*endmodule\b[^\n]*")
 # Only compiler directives and comments survive from the text before the first module; any
 # other line there is prose the model wrapped around its code.
 _PREAMBLE_KEEP_RE = re.compile(r"^[ \t]*(`|//)")
+
+
+class _ModuleUnit:
+    """One ``module ... endmodule`` span located by :func:`_module_units`."""
+
+    __slots__ = ("name", "start", "end")
+
+    def __init__(self, name: str, start: int, end: int) -> None:
+        self.name = name
+        self.start = start
+        self.end = end
+
+
+def _module_units(text: str) -> list[_ModuleUnit]:
+    """Pair line-initial ``module`` headers with their ``endmodule`` in O(n).
+
+    Reproduces the semantics of scanning with a single non-greedy regex -- each unit runs
+    to the first ``endmodule`` after its header, and headers swallowed by a preceding unit
+    are skipped -- without that pattern's quadratic backtracking.
+    """
+
+    starts = list(_MODULE_START_RE.finditer(text))
+    ends = list(_MODULE_END_RE.finditer(text))
+    units: list[_ModuleUnit] = []
+    start_index = end_index = 0
+    while start_index < len(starts):
+        start = starts[start_index]
+        while end_index < len(ends) and ends[end_index].start() < start.end():
+            end_index += 1
+        if end_index >= len(ends):
+            break  # truncated block: no `endmodule` left to close this header
+        end = ends[end_index]
+        end_index += 1
+        units.append(_ModuleUnit(start.group("name"), start.start(), end.end()))
+        start_index += 1
+        while start_index < len(starts) and starts[start_index].start() < end.end():
+            start_index += 1  # nested/bogus header already inside the unit just closed
+    return units
 
 
 def _looks_like_testbench(name: str, module_name: str) -> bool:
@@ -349,8 +427,14 @@ def _looks_like_testbench(name: str, module_name: str) -> bool:
 
 
 def _code_pool(text: str) -> str:
-    """Concatenate the fenced blocks that plausibly hold Verilog, else the raw text."""
+    """Concatenate the fenced blocks that plausibly hold Verilog, else the raw text.
 
+    The response is capped at :data:`MAX_RESPONSE_CHARS` first: nothing downstream should
+    have to be robust against an unbounded string, and a response that long is degenerate
+    output, not a design.
+    """
+
+    text = (text or "")[:MAX_RESPONSE_CHARS]
     blocks = extract_code_blocks(text)
     pool = [body for lang, body in blocks if lang in _VERILOG_LANGS and "module" in body]
     if not pool:  # mislabeled fence (```text, ```rtl, ...): fall back on content
@@ -379,7 +463,7 @@ def extract_verilog(text: str, module_name: str) -> str:
     if "module" not in pool:
         return ""
 
-    units = list(_MODULE_UNIT_RE.finditer(pool))
+    units = _module_units(pool)
     if not units:
         # `endmodule` was not at a line start (or the block is truncated): coarse slice.
         start = pool.find("module")
@@ -390,15 +474,15 @@ def extract_verilog(text: str, module_name: str) -> str:
 
     kept: dict[str, str] = {}
     for unit in units:
-        name = unit.group("name")
-        if _looks_like_testbench(name, module_name):
+        if _looks_like_testbench(unit.name, module_name):
             continue
-        kept[name] = unit.group(0).strip()  # last definition wins, first position kept
+        # last definition wins, first position kept
+        kept[unit.name] = pool[unit.start : unit.end].strip()
     if not kept:
         return ""
 
     preamble = "\n".join(
-        line for line in pool[: units[0].start()].splitlines() if _PREAMBLE_KEEP_RE.match(line)
+        line for line in pool[: units[0].start].splitlines() if _PREAMBLE_KEEP_RE.match(line)
     ).strip()
     body = "\n\n".join(kept.values())
     return (f"{preamble}\n\n{body}" if preamble else body).strip() + "\n"
@@ -623,6 +707,12 @@ def _verify(
     )
 
 
+def _stopped(stop: "StopSignal | None") -> bool:
+    """True when the caller has asked the loop to wind down (SIGINT, deadline, ...)."""
+
+    return bool(stop is not None and stop.is_set())
+
+
 def _run_sample(
     design: RtllmDesign,
     client: LLMClient | None,
@@ -631,6 +721,7 @@ def _run_sample(
     sample: int,
     *,
     log: Callable[[str], None] | None = None,
+    stop: "StopSignal | None" = None,
 ) -> SampleResult:
     rounds: list[AttemptRecord] = []
     contract: str | None = None
@@ -661,6 +752,11 @@ def _run_sample(
     repairs = max(0, int(config.max_repair_rounds))
     round_index = 0
     while not sim.func_pass and round_index < repairs:
+        if _stopped(stop):
+            # A repair round is one more multi-minute model call; an interrupt must shorten
+            # in-flight work, not merely stop scheduling new designs. What ran is kept.
+            _log(log, f"{design.name}[{sample}]: stop requested; ending after round {round_index}")
+            break
         if sim.failure_family in UNREPAIRABLE_FAMILIES:
             _log(log, f"{design.name}[{sample}]: {sim.failure_family} is a harness defect; not repairing")
             break
@@ -717,17 +813,27 @@ def run_design(
     workdir: Path,
     *,
     log: Callable[[str], None] | None = None,
+    stop: "StopSignal | None" = None,
 ) -> DesignResult:
     """Run the full loop for one design: plan -> generate -> verify -> (analyse -> repair)*.
 
     Repeated ``config.samples`` times, independently, so the driver can compute pass@k the
     way RTLLM's ``auto_run.py`` does: a sample counts once, and it counts if ANY round in it
     reached the outcome.
+
+    ``stop`` (anything with ``is_set()``, typically a :class:`threading.Event`) is checked
+    between samples and between repair rounds. Without it an interrupt cannot shorten an
+    in-flight design, which at the default timeouts is hours of model calls: 900 s CLI
+    timeout x 3 attempts x 4 roles. Samples already finished are still returned, so the
+    partial result is honest about how many samples it represents.
     """
 
     samples: list[SampleResult] = []
     for index in range(max(1, int(config.samples))):
-        samples.append(_run_sample(design, client, config, Path(workdir), index, log=log))
+        if index and _stopped(stop):
+            _log(log, f"{design.name}: stop requested; ran {index} of {config.samples} samples")
+            break
+        samples.append(_run_sample(design, client, config, Path(workdir), index, log=log, stop=stop))
     return DesignResult(
         design=design.name,
         category=design.category,

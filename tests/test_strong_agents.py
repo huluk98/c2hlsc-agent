@@ -147,6 +147,59 @@ class ClaudeCLIBackendTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 client.complete("SYS", "USER")
 
+    def test_cli_client_is_sandboxed_by_default(self):
+        # `claude -p` is an AGENT with filesystem tools, not a completion endpoint. Left
+        # unrestricted it inherits the caller's cwd, and the RTLLM harness stages a copy of
+        # the golden testbench under its own --out-dir on every attempt -- so a benchmark
+        # whose integrity claim is "the model never sees the oracle" would be enforcing that
+        # claim in prose only. Verified before this change: an unrestricted `claude -p`
+        # printed the first lines of a staged testbench.v verbatim.
+        client = ClaudeCLIClient(model="opus", cli_cmd="claude")
+        self.assertTrue(client.sandboxed)
+        completed = subprocess.CompletedProcess(args=[], returncode=0, stdout="ANSWER", stderr="")
+        with mock.patch.object(llm_module.subprocess, "run", return_value=completed) as run:
+            client.complete("SYS", "USER")
+
+        argv = run.call_args.args[0]
+        self.assertIn("--disallowedTools", argv)
+        denied = argv[argv.index("--disallowedTools") + 1]
+        for tool in ("Read", "Bash", "Glob", "Grep", "Write", "Edit", "WebFetch"):
+            self.assertIn(tool, denied)
+        self.assertEqual(argv[argv.index("--permission-mode") + 1], "plan")
+
+        # ... and it runs in a private empty directory, not the caller's cwd.
+        cwd = run.call_args.kwargs["cwd"]
+        self.assertIsNotNone(cwd)
+        self.assertNotEqual(Path(cwd).resolve(), Path.cwd().resolve())
+
+    def test_cli_client_sandbox_directory_is_fresh_and_removed(self):
+        client = ClaudeCLIClient()
+        completed = subprocess.CompletedProcess(args=[], returncode=0, stdout="A", stderr="")
+        seen = []
+        with mock.patch.object(llm_module.subprocess, "run", return_value=completed) as run:
+            client.complete("S", "U")
+            seen.append(run.call_args.kwargs["cwd"])
+            client.complete("S", "U")
+            seen.append(run.call_args.kwargs["cwd"])
+        self.assertNotEqual(seen[0], seen[1])  # per call, so concurrent workers cannot share
+        for path in seen:
+            self.assertFalse(Path(path).exists())  # cleaned up
+
+    def test_cli_client_sandbox_can_be_disabled_explicitly(self):
+        client = ClaudeCLIClient(sandbox=False)
+        self.assertFalse(client.sandboxed)
+        completed = subprocess.CompletedProcess(args=[], returncode=0, stdout="A", stderr="")
+        with mock.patch.object(llm_module.subprocess, "run", return_value=completed) as run:
+            client.complete("S", "U")
+        self.assertNotIn("--disallowedTools", run.call_args.args[0])
+        self.assertIsNone(run.call_args.kwargs["cwd"])
+
+    def test_build_llm_client_returns_a_sandboxed_cli_client(self):
+        config = AgentConfig(use_llm=True, llm_backend="claude-cli")
+        with mock.patch.object(llm_module.shutil, "which", return_value="/usr/local/bin/claude"):
+            client = build_llm_client(config)
+        self.assertTrue(client.sandboxed)
+
 
 class NlSpecTests(unittest.TestCase):
     def test_generator_prompt_includes_nl_spec(self):

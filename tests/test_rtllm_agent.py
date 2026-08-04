@@ -8,6 +8,8 @@ scripted verifier stands in for ``rtllm_bench.evaluate_rtl``, so no ``claude`` C
 from __future__ import annotations
 
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -132,8 +134,11 @@ class FakeLLM:
 class FakeVerifier:
     """Scripted stand-in for ``rtllm_bench.evaluate_rtl`` that records what it was asked to verify."""
 
-    def __init__(self, results) -> None:
+    def __init__(self, results, *, repeat: bool = False) -> None:
+        # `repeat` is accepted for symmetry with FakeLLM; the last scripted result is
+        # returned indefinitely either way, so it documents intent at the call site.
         self.results = list(results)
+        self.repeat = repeat
         self.calls: list[tuple[str, Path]] = []
 
     def __call__(self, design, rtl_text, workdir, **kwargs):
@@ -294,6 +299,55 @@ class BuildEvidenceTests(unittest.TestCase):
         self.assertNotIn("expected 8'h06", evidence)
         self.assertNotIn("functional_mismatch", evidence)
         self.assertIn("blind retry", evidence)
+
+
+class ParserPerformanceTests(unittest.TestCase):
+    """A model response is untrusted input, so parsing it must be bounded."""
+
+    def test_repeated_headers_with_no_endmodule_parse_in_linear_time(self):
+        # The old `module ... .*? endmodule` pattern rescanned to end-of-input from every
+        # unterminated header: 2000 repeats took 8.9 s and 20 000 did not finish in 110 s,
+        # stalling a worker thread with no timeout and no cancellation. Assert the SHAPE
+        # (linear, not quadratic) rather than a wall-clock threshold, so the test is not
+        # flaky on a loaded machine.
+        line = "module adder_8bit(input a, output b);\n"
+
+        def elapsed(count: int) -> float:
+            started = time.perf_counter()
+            extract_verilog(line * count, "adder_8bit")
+            return time.perf_counter() - started
+
+        elapsed(500)  # warm up the regex cache
+        small, large = elapsed(2000), elapsed(8000)
+        # 4x the input: linear predicts ~4x, quadratic ~16x. Allow a wide margin.
+        self.assertLess(large, max(small, 1e-4) * 40 + 0.5)
+        self.assertLess(large, 5.0)
+
+    def test_an_oversized_response_is_capped_before_parsing(self):
+        huge = "x" * (rtllm_agent.MAX_RESPONSE_CHARS * 2)
+        started = time.perf_counter()
+        self.assertEqual(extract_verilog(huge, "adder_8bit"), "")
+        self.assertLess(time.perf_counter() - started, 5.0)
+
+    def test_capping_does_not_disturb_a_normal_response(self):
+        self.assertEqual(extract_verilog(_fenced(DESIGN_RTL), "adder_8bit").strip(), DESIGN_RTL.strip())
+
+    def test_module_pairing_matches_the_previous_semantics(self):
+        text = (
+            "module adder_8bit(input a);\nendmodule\n"
+            "module helper(input b);\nendmodule\n"
+            "module adder_8bit_tb;\nendmodule\n"
+        )
+        kept = extract_verilog(text, "adder_8bit")
+        self.assertIn("module adder_8bit(", kept)
+        self.assertIn("module helper", kept)
+        self.assertNotIn("_tb", kept)  # a volunteered testbench is dropped
+
+    def test_a_truncated_final_block_still_yields_the_complete_modules(self):
+        text = "module adder_8bit(input a);\nendmodule\nmodule cut_off(input b);\n"
+        kept = extract_verilog(text, "adder_8bit")
+        self.assertIn("module adder_8bit", kept)
+        self.assertNotIn("cut_off", kept)
 
 
 # --------------------------------------------------------------------------- #
@@ -465,6 +519,97 @@ class RunDesignTests(unittest.TestCase):
         # ... while the natural-language description is present in every prompt.
         for _system, user in client.calls:
             self.assertIn("8-bit input operand A", user)
+
+    def test_a_stop_signal_ends_the_repair_loop_between_rounds(self):
+        # Without this hook an interrupt cannot shorten an in-flight design: at the default
+        # timeouts one design is up to 900s x 3 attempts x 4 roles of model calls.
+        stop = threading.Event()
+        client = FakeLLM([_fenced(DESIGN_RTL)], repeat=True)
+        verifier = FakeVerifier([_sim(family="functional_mismatch", sim_log="Failed")], repeat=True)
+        original = verifier.__call__
+
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            design = _make_design(tmp / "bench", "adder_8bit")
+
+            def verify_then_stop(*args, **kwargs):
+                stop.set()  # as if SIGINT arrived while round 0 was being verified
+                return original(*args, **kwargs)
+
+            with mock.patch.object(rtllm_agent, "evaluate_rtl", verify_then_stop):
+                result = run_design(
+                    design, client, RtllmAgentConfig(plan=False, max_repair_rounds=5),
+                    tmp / "work", stop=stop,
+                )
+
+        sample = result.samples[0]
+        self.assertEqual([r.role for r in sample.rounds], ["rtl_generator"])  # no repair ran
+        self.assertEqual(len(client.calls), 1)
+
+    def test_a_stop_signal_ends_the_sample_loop_between_samples(self):
+        stop = threading.Event()
+        client = FakeLLM([_fenced(DESIGN_RTL)], repeat=True)
+        verifier = FakeVerifier([_sim(func=True)], repeat=True)
+        original = verifier.__call__
+
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            design = _make_design(tmp / "bench", "adder_8bit")
+
+            def verify_then_stop(*args, **kwargs):
+                stop.set()
+                return original(*args, **kwargs)
+
+            with mock.patch.object(rtllm_agent, "evaluate_rtl", verify_then_stop):
+                result = run_design(
+                    design, client, RtllmAgentConfig(plan=False, samples=5, max_repair_rounds=0),
+                    tmp / "work", stop=stop,
+                )
+
+        # The partial result reports the samples it actually ran, so pass@k is not computed
+        # over a sample budget that never executed.
+        self.assertEqual(len(result.samples), 1)
+        self.assertEqual(result.to_dict()["n_samples"], 1)
+
+    def test_without_a_stop_signal_nothing_changes(self):
+        client = FakeLLM([_fenced(DESIGN_RTL)], repeat=True)
+        verifier = FakeVerifier([_sim(family="functional_mismatch", sim_log="Failed")], repeat=True)
+        result, _design = self._run(client, verifier, RtllmAgentConfig(plan=False, max_repair_rounds=2))
+        self.assertEqual(len(result.samples[0].rounds), 3)
+
+    def test_a_candidate_that_prints_the_pass_banner_is_scored_by_the_real_verifier(self):
+        # End to end through the loop with the REAL verifier gate (no iverilog needed: the
+        # refusal happens before compilation). A response like this used to score a pass.
+        cheating = (
+            "module adder_8bit(input [7:0] a, input [7:0] b, input cin,\n"
+            "                  output [7:0] sum, output cout);\n"
+            "  assign sum = 8'b0;\n"
+            "  assign cout = 1'b0;\n"
+            "  initial begin\n"
+            '    $display("===========Your Design Passed===========");\n'
+            "    $finish;\n"
+            "  end\n"
+            "endmodule\n"
+        )
+        client = FakeLLM([_fenced(cheating)], repeat=True)
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            design = _make_design(tmp / "bench", "adder_8bit")
+            result = run_design(
+                design, client, RtllmAgentConfig(plan=False, max_repair_rounds=1), tmp / "work"
+            )
+
+        sample = result.samples[0]
+        self.assertFalse(sample.func_pass)
+        self.assertFalse(sample.func_pass_strict)
+        self.assertEqual(result.func_success, 0)
+        self.assertEqual(sample.rounds[0].sim.failure_family, "illegal_system_task")
+        # extract_verilog left the module intact -- the verifier is the gate, not the parser.
+        self.assertIn("$display", sample.rounds[0].rtl)
+        # ... and the repair agent is told exactly what to remove.
+        repair_prompt = client.calls[-1][1]
+        self.assertIn("illegal_system_task", repair_prompt)
+        self.assertIn("$display", repair_prompt)
 
     def test_harness_defect_family_is_not_repaired(self):
         client = FakeLLM([_fenced(DESIGN_RTL)], repeat=True)

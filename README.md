@@ -997,12 +997,16 @@ git clone https://github.com/hkust-zhiyao/RTLLM.git ~/benchmarks/RTLLM
 export RTLLM_ROOT=~/benchmarks/RTLLM
 ```
 
-Run the reference/oracle baseline **first** — it scores the benchmark's own verified RTL
-through the identical verifier and tells you the real ceiling on your machine:
+Run the two no-model baselines **first**. They bracket what a score can possibly mean on
+your machine: `--reference` scores the benchmark's own verified RTL (the ceiling) and
+`--empty-baseline` scores a port-only module with no logic at all (the floor):
 
 ```bash
 python3 scripts/run_rtllm_v2.py --benchmark "$RTLLM_ROOT" \
   --out-dir runs/rtllm_reference --reference --workers 4
+
+python3 scripts/run_rtllm_v2.py --benchmark "$RTLLM_ROOT" \
+  --out-dir runs/rtllm_empty --empty-baseline --workers 4
 ```
 
 Then the agent run (`--samples N` is the `n` in pass@k; add `--resume` to continue an
@@ -1014,14 +1018,36 @@ python3 scripts/run_rtllm_v2.py --benchmark "$RTLLM_ROOT" \
   --llm-backend claude-cli --llm-model opus
 ```
 
-Both write `results.jsonl` (one design per line, appended as it finishes), `report.json`
-(syntax/func success, the stricter pass rule, pass@k, failure families), `report.md`
-(human table), and `designs/<name>/` artifacts (`rtl.v`, `compile.log`, `sim.log`,
-`trace.json`). The model never sees the golden RTL or the testbench source; the repair
-evidence policy (`--evidence-policy logs|none`) is recorded in every report.
+All three write `results.jsonl` (one design per line, appended as it finishes, stamped
+with the run's config so `--resume` refuses to merge incompatible sweeps), `report.json`
+(syntax/func success, the stricter pass rule, pass@k, failure families, and the three
+adjustment bases), `report.md` (human table, opening with the run's configuration), and
+`designs/<name>/` artifacts (`rtl.v`, `compile.log`, `sim.log`, `trace.json`).
 
-As shipped, the benchmark's own reference RTL compiles 46/50 and functionally passes
-41/50 under iverilog — nine designs have upstream oracle problems (missing golden data
-files, references that fail their own testbench, SystemVerilog the simulator rejects).
+Two numbers are always reported as a pair, because each alone flatters:
+
+- **`pass@1_round0`** (single generation, comparable to a published RTLLM `pass@1`) next
+  to **`pass@1_with_repair`** (any round of the sample passed — the agent's score, up to
+  three generations at the default `--max-repair-rounds 2`).
+- The raw rate next to the **`adjusted`** rate, which drops both the designs *no* RTL can
+  pass and the designs an *empty* module passes.
+
+Measured here, the benchmark's own reference RTL compiles **50/50** and functionally
+passes **47/50** under iverilog; an empty module passes **4/50**. The three shortfalls
+(`clkgenerator`, `radix2_div`, `ring_counter`) are upstream oracle bugs — the benchmark's
+own verified RTL cannot pass its own testbench. The four free passes (`comparator_3bit`,
+`comparator_4bit`, `sequence_detector`, `square_wave`) are X-optimistic testbenches that
+never check an undriven output. **The informative range is 4/50 to 47/50**, and
+`report.json` reports the raw rate, the both-directions adjusted rate over those 43
+designs, and the older unpassable-only basis over 47.
+
+On integrity: no prompt this harness builds contains the golden RTL or the testbench
+source, and because the default `claude-cli` backend is an *agent* with filesystem tools,
+it is run with every tool disallowed and in an empty scratch directory — a prompt saying
+"you never see the testbench" is not a control. A candidate containing `$display`,
+`$finish` or any other output/simulation-control system task is refused before compiling
+(`illegal_system_task`): the pass oracle is a substring test on a stream the design under
+test shares with the testbench, so a design that can print can score itself.
+
 See **[docs/rtllm_v2_benchmark.md](docs/rtllm_v2_benchmark.md)** for the full flag list,
 the metric definitions, and the known-limitations table.

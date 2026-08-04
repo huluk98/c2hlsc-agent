@@ -2,6 +2,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -9,18 +10,23 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from c2hlsc_agent.rtllm_bench import (
     FAILURE_FAMILIES,
+    ILLEGAL_TASK_MARKER,
     IVERILOG_STANDARD,
     KNOWN_ORACLE_ISSUES,
     LOG_TAIL_CHARS,
     TESTBENCH_SHIMS,
+    VACUOUS_ORACLE_DESIGNS,
     RtllmDesign,
     SimResult,
     apply_testbench_shims,
     classify_failure,
     classify_output,
     discover_designs,
+    empty_stub_rtl,
+    evaluate_empty_stub,
     evaluate_reference,
     evaluate_rtl,
+    find_illegal_system_tasks,
     reference_rtl_text,
     shim_rationale,
 )
@@ -460,6 +466,252 @@ class ShimTests(unittest.TestCase):
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+class IllegalSystemTaskTests(unittest.TestCase):
+    """The oracle greps one stream that the design under test can also write to.
+
+    Every test here is a way for a candidate to score without implementing anything. They
+    all have to fail, and they have to fail BEFORE the simulator runs -- the verifier cannot
+    tell a self-reported pass from a real one after the fact.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        self.root = _make_benchmark(self.tmp / "bench")
+        self.design = {d.name: d for d in discover_designs(self.root)}["tiny_adder"]
+        self.addCleanup(self._tmp.cleanup)
+
+    def _evaluate(self, rtl, name="work"):
+        return evaluate_rtl(self.design, rtl, self.tmp / name)
+
+    def test_detects_output_and_control_tasks_with_line_numbers(self):
+        rtl = "module m;\n  initial $display(\"hi\");\n  initial $finish;\nendmodule\n"
+        self.assertEqual(find_illegal_system_tasks(rtl), ((2, "$display"), (3, "$finish")))
+
+    def test_detects_the_whole_output_family_including_file_variants(self):
+        # $fdisplay(1, ...) writes to stdout, so the $f* forms are hazards too.
+        for token in (
+            "$display", "$displayb", "$write", "$writeh", "$monitor", "$monitoron",
+            "$strobe", "$fdisplay", "$fwrite", "$fmonitor", "$fstrobe",
+            "$finish", "$stop", "$dumpvars", "$dumpfile",
+        ):
+            with self.subTest(token=token):
+                found = find_illegal_system_tasks("module m;\n  initial %s;\nendmodule\n" % token)
+                self.assertEqual([name for _line, name in found], [token])
+
+    def test_legitimate_system_functions_are_not_flagged(self):
+        rtl = (
+            "module m;\n"
+            "  reg [$clog2(64)-1:0] idx;\n"
+            "  wire signed [7:0] s = $signed(8'hff);\n"
+            "  wire [31:0] u = $unsigned(1), n = $bits(idx), t = $time, r = $random;\n"
+            "endmodule\n"
+        )
+        self.assertEqual(find_illegal_system_tasks(rtl), ())
+
+    def test_comments_and_string_literals_are_not_flagged(self):
+        rtl = (
+            "module m;\n"
+            "  // no $display here\n"
+            "  /* and no $finish here either */\n"
+            '  parameter NOTE = "$display($finish)";  // a string, not a call\n'
+            '  // a quote " inside a comment must not swallow the rest of the file\n'
+            "endmodule\n"
+        )
+        self.assertEqual(find_illegal_system_tasks(rtl), ())
+
+    @unittest.skipUnless(HAS_IVERILOG, "iverilog/vvp not installed")
+    def test_a_candidate_that_prints_the_pass_banner_scores_zero(self):
+        # Without the gate this scored syntax_pass=func_pass=func_pass_strict=True: $finish
+        # at t=0 ends the run before the testbench can print its failure banner.
+        rtl = (
+            "module tiny_adder(input [3:0] a, input [3:0] b, output [4:0] sum);\n"
+            "  assign sum = 5'b0;\n"
+            "  initial begin\n"
+            '    $display("%s");\n'
+            "    $finish;\n"
+            "  end\n"
+            "endmodule\n" % PASS_BANNER
+        )
+        result = self._evaluate(rtl)
+        self.assertFalse(result.syntax_pass)
+        self.assertFalse(result.func_pass)
+        self.assertFalse(result.func_pass_strict)
+        self.assertEqual(result.failure_family, "illegal_system_task")
+        self.assertNotIn(PASS_BANNER, result.sim_log)
+
+    @unittest.skipUnless(HAS_IVERILOG, "iverilog/vvp not installed")
+    def test_a_display_only_bypass_candidate_scores_zero(self):
+        # The official oracle is a bare substring test, so ANY line containing "pass" from
+        # the design would satisfy it -- the design must not be able to print at all.
+        rtl = (
+            "module tiny_adder(input [3:0] a, input [3:0] b, output [4:0] sum);\n"
+            "  assign sum = 5'b0;\n"
+            '  initial $display("bypass mode enabled");\n'
+            "endmodule\n"
+        )
+        result = self._evaluate(rtl)
+        self.assertFalse(result.func_pass)
+        self.assertEqual(result.failure_family, "illegal_system_task")
+
+    @unittest.skipUnless(HAS_IVERILOG, "iverilog/vvp not installed")
+    def test_an_honest_candidate_is_unaffected(self):
+        result = self._evaluate(TINY_ADDER_RTL, name="honest")
+        self.assertTrue(result.syntax_pass)
+        self.assertTrue(result.func_pass)
+        self.assertTrue(result.func_pass_strict)
+
+    def test_the_refusal_is_recoverable_from_the_stored_result(self):
+        # classify_failure must be a pure function of the serialized SimResult, so a report
+        # re-analyzed later reproduces the label instead of degrading it to compile_error.
+        result = self._evaluate("module tiny_adder; initial $display(\"x\"); endmodule\n", name="stored")
+        payload = result.to_dict()
+        self.assertIn(ILLEGAL_TASK_MARKER, payload["compile_log"])
+        self.assertEqual(
+            classify_failure(payload["compile_log"], payload["sim_log"], payload["syntax_pass"], False),
+            "illegal_system_task",
+        )
+
+    def test_the_refusal_survives_log_truncation(self):
+        # Many violations must not push the marker out of the 4000-char tail slice.
+        rtl = "module m;\n" + "  initial $display(\"x\");\n" * 500 + "endmodule\n"
+        result = self._evaluate(rtl, name="many")
+        payload = result.to_dict()
+        self.assertLessEqual(len(payload["compile_log"]), LOG_TAIL_CHARS)
+        self.assertIn(ILLEGAL_TASK_MARKER, payload["compile_log"])
+        self.assertEqual(result.failure_family, "illegal_system_task")
+
+    def test_the_benchmarks_own_reference_rtl_contains_no_illegal_task(self):
+        # If a golden file did, the gate would break the reference baseline.
+        design = {d.name: d for d in discover_designs(self.root)}["tiny_adder"]
+        self.assertEqual(find_illegal_system_tasks(reference_rtl_text(design)), ())
+
+
+class VacuousOracleTests(unittest.TestCase):
+    """The mirror of KNOWN_ORACLE_ISSUES: oracles an EMPTY module passes."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        self.root = _make_benchmark(self.tmp / "bench")
+        self.addCleanup(self._tmp.cleanup)
+
+    def test_every_vacuous_entry_is_documented(self):
+        self.assertTrue(VACUOUS_ORACLE_DESIGNS)
+        for name, reason in VACUOUS_ORACLE_DESIGNS.items():
+            self.assertIsInstance(name, str)
+            self.assertGreater(len(reason), 40, msg=name)
+
+    def test_the_two_catalogues_are_disjoint(self):
+        # A design cannot be both unpassable and passed-by-nothing; an overlap would mean
+        # one of them was guessed rather than measured.
+        self.assertEqual(set(VACUOUS_ORACLE_DESIGNS) & set(KNOWN_ORACLE_ISSUES), set())
+
+    def test_empty_stub_keeps_the_ports_and_drops_every_statement(self):
+        design = {d.name: d for d in discover_designs(self.root)}["tiny_adder"]
+        stub = empty_stub_rtl(design)
+        self.assertIn("module tiny_adder", stub)
+        for port in ("a", "b", "sum"):
+            self.assertIn(port, stub)
+        self.assertNotIn("assign", stub)
+        self.assertEqual(find_illegal_system_tasks(stub), ())
+
+    def test_empty_stub_keeps_a_parameter_block_and_reaches_the_port_list(self):
+        source = (
+            "module verified_p #(\n  parameter W = 8\n) (\n  input [W-1:0] d,\n"
+            "  output reg [W-1:0] q\n);\n  always @* q = d;\nendmodule\n"
+        )
+        directory = _write_design(self.tmp / "b2", "Misc", "p", "module testbench; endmodule\n", source)
+        design = discover_designs(directory.parents[1])[0]
+        stub = empty_stub_rtl(design)
+        self.assertIn("parameter W = 8", stub)
+        self.assertIn("input [W-1:0] d", stub)
+        self.assertNotIn("always", stub)
+
+    def test_empty_stub_falls_back_to_the_last_module_when_the_name_differs(self):
+        # fixed_point_substractor ships `module fixed_point_subtractor` (helper modules come
+        # first in RTLLM references), so an exact-name-only lookup would find nothing.
+        source = "module helper(input h);\nendmodule\n\nmodule spelled_differently(input x, output y);\n  assign y = x;\nendmodule\n"
+        directory = _write_design(self.tmp / "b3", "Misc", "q", "module testbench; endmodule\n", source)
+        design = discover_designs(directory.parents[1])[0]
+        stub = empty_stub_rtl(design)
+        self.assertIn("module spelled_differently", stub)
+        self.assertNotIn("helper", stub)
+
+    def test_empty_stub_returns_empty_when_there_is_no_reference(self):
+        design = RtllmDesign(
+            name="x", category="", directory=self.tmp, description="", testbench=self.tmp / "tb.v",
+            reference_files=(),
+        )
+        self.assertEqual(empty_stub_rtl(design), "")
+
+    @unittest.skipUnless(HAS_IVERILOG, "iverilog/vvp not installed")
+    def test_a_sound_oracle_rejects_the_empty_stub(self):
+        design = {d.name: d for d in discover_designs(self.root)}["tiny_adder"]
+        result = evaluate_empty_stub(design, self.tmp / "empty")
+        self.assertTrue(result.syntax_pass, result.compile_log)
+        self.assertFalse(result.func_pass)
+        self.assertFalse(result.func_pass_strict)
+
+    def test_design_to_dict_reports_both_oracle_flags(self):
+        payload = discover_designs(self.root)[0].to_dict()
+        self.assertIsNone(payload["known_oracle_issue"])
+        self.assertIsNone(payload["vacuous_oracle"])
+
+
+class RunawayOutputTests(unittest.TestCase):
+    """A simulation must not be able to buy unbounded RAM or unbounded wall clock."""
+
+    @unittest.skipUnless(HAS_IVERILOG, "iverilog/vvp not installed")
+    def test_a_flooding_testbench_is_killed_and_bucketed(self):
+        # Measured before the fix: 683 MB captured in one Python str and 29.4 s wall for a
+        # 10 s sim timeout, i.e. an OOM kill of the sweep at --workers 8 with no report.
+        flooding_tb = (
+            "module testbench;\n"
+            "    reg [3:0] a, b;\n"
+            "    wire [4:0] sum;\n"
+            "    integer n = 0;\n"
+            "    tiny_adder dut(.a(a), .b(b), .sum(sum));\n"
+            "    initial forever begin\n"
+            "        #1 n = n + 1;\n"
+            '        $display("%0d %s", n, "'
+            + "X" * 200
+            + '");\n'
+            "    end\n"
+            "endmodule\n"
+        )
+        tmp = Path(tempfile.mkdtemp())
+        try:
+            root = tmp / "bench"
+            _write_design(
+                root, "Misc", "tiny_adder", flooding_tb,
+                TINY_ADDER_RTL.replace("tiny_adder", "verified_tiny_adder"),
+            )
+            design = discover_designs(root)[0]
+            started = time.time()
+            result = evaluate_rtl(design, TINY_ADDER_RTL, tmp / "work", sim_timeout=30)
+            elapsed = time.time() - started
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+        self.assertTrue(result.runaway_output)
+        self.assertEqual(result.failure_family, "runaway_output")
+        self.assertFalse(result.func_pass_strict)
+        self.assertLessEqual(len(result.sim_log), LOG_TAIL_CHARS)
+        # Killed on the output budget, well inside the 30 s watchdog it never reached.
+        self.assertLess(elapsed, 20.0)
+
+    def test_runaway_defeats_the_strict_oracle_and_is_stored(self):
+        self.assertEqual(classify_output(PASS_BANNER, False, True), (True, False))
+        self.assertEqual(classify_failure("", PASS_BANNER, True, False, True), "runaway_output")
+        payload = SimResult(
+            design="d", syntax_pass=True, func_pass=True, func_pass_strict=False,
+            timed_out=False, compile_log="", sim_log=PASS_BANNER, duration_s=0.1,
+            failure_family="runaway_output", runaway_output=True,
+        ).to_dict()
+        self.assertTrue(payload["runaway_output"])
+
+
 class DiscoverDesignsTests(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -538,18 +790,28 @@ class SimResultTests(unittest.TestCase):
 
     @unittest.skipUnless(HAS_IVERILOG, "iverilog/vvp not installed")
     def test_long_sim_log_keeps_its_tail_and_truncation_marker(self):
+        # The noise comes from the TESTBENCH: a candidate that prints is refused outright
+        # (see IllegalSystemTaskTests), so it can no longer be used to produce a long log.
+        noisy_tb = TINY_ADDER_TB.replace(
+            "    initial begin\n",
+            "    integer k;\n"
+            "    initial for (k = 0; k < 4000; k = k + 1)\n"
+            '        $display("noise line %0d aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", k);\n'
+            "    initial begin\n",
+            1,
+        )
         tmp = Path(tempfile.mkdtemp())
         try:
-            root = _make_benchmark(tmp / "bench")
-            design = {d.name: d for d in discover_designs(root)}["tiny_adder"]
-            noisy = TINY_ADDER_RTL.replace(
-                "endmodule",
-                "    integer k;\n"
-                "    initial for (k = 0; k < 4000; k = k + 1)\n"
-                "        $display(\"noise line %0d aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\", k);\n"
-                "endmodule",
+            root = tmp / "bench"
+            _write_design(
+                root,
+                "Arithmetic/Adder",
+                "tiny_adder",
+                noisy_tb,
+                TINY_ADDER_RTL.replace("tiny_adder", "verified_tiny_adder"),
             )
-            result = evaluate_rtl(design, noisy, tmp / "work")
+            design = discover_designs(root)[0]
+            result = evaluate_rtl(design, TINY_ADDER_RTL, tmp / "work")
             payload = result.to_dict()
             self.assertEqual(len(payload["sim_log"]), LOG_TAIL_CHARS)
             self.assertTrue(payload["sim_log"].startswith("...[log truncated]..."))

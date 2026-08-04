@@ -16,6 +16,8 @@ import json
 import signal
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from typing import Any, Callable, Sequence
@@ -168,7 +170,11 @@ class DriverTestCase(unittest.TestCase):
     def patch_run_design(self, hook: "Callable[[RtllmDesign], DesignResult] | None" = None) -> Any:
         calls: "list[str]" = []
 
-        def fake_run_design(design, client, config, workdir):
+        # Deliberately the REAL run_design signature, keyword-only `log`/`stop` included. The
+        # driver used to probe for them with inspect.signature so fakes could omit them,
+        # which meant a signature drift silently turned --verbose (and the interrupt hook)
+        # into a no-op instead of raising. Keep these in sync with rtllm_agent.run_design.
+        def fake_run_design(design, client, config, workdir, *, log=None, stop=None):
             calls.append(design.name)
             if hook is not None:
                 return hook(design)
@@ -594,7 +600,7 @@ class LlmModeTests(DriverTestCase):
     def test_samples_flag_drives_k_and_the_agent_config(self):
         seen: "list[rtllm_agent.RtllmAgentConfig]" = []
 
-        def fake_run_design(design, client, config, workdir):
+        def fake_run_design(design, client, config, workdir, *, log=None, stop=None):
             seen.append(config)
             return make_design_result(design.name, design.category, [True, False, False, False])
 
@@ -617,6 +623,497 @@ class LlmModeTests(DriverTestCase):
         self.assertAlmostEqual(report["totals"]["pass@1"], 0.25)
         self.assertAlmostEqual(report["totals"]["pass@k"], 1.0)
         self.assertEqual(report["agent_config"]["samples"], 4)
+
+
+class ArtifactSelectionTests(unittest.TestCase):
+    """``designs/<name>/`` is the evidence a human audits a claimed pass with.
+
+    These are the assertions that survive mutation: replacing ``best_sample`` with
+    ``samples[0]`` and ``winning_round`` with ``rounds[0]`` left the rest of this module
+    green, because every other fixture puts the passing sample/round first.
+    """
+
+    @staticmethod
+    def _sample(name: str, *, func: bool, syntax: bool = True) -> "dict[str, Any]":
+        return {"design": name, "func_pass": func, "syntax_pass": syntax, "rounds": []}
+
+    def test_best_sample_prefers_a_functional_pass_that_is_not_first(self):
+        failing = self._sample("d", func=False)
+        passing = self._sample("d", func=True)
+        self.assertIs(driver.best_sample({"samples": [failing, failing, passing]}), passing)
+
+    def test_best_sample_falls_back_to_a_compiling_sample_then_to_the_first(self):
+        no_compile = self._sample("d", func=False, syntax=False)
+        compiles = self._sample("d", func=False, syntax=True)
+        self.assertIs(driver.best_sample({"samples": [no_compile, compiles]}), compiles)
+        self.assertIs(driver.best_sample({"samples": [no_compile]}), no_compile)
+
+    def test_best_sample_of_no_samples_is_none(self):
+        self.assertIsNone(driver.best_sample({"samples": []}))
+        self.assertIsNone(driver.best_sample({}))
+
+    def test_winning_round_picks_the_passing_round_from_the_middle(self):
+        rounds = [
+            {"round": 0, "sim": {"func_pass": False}},
+            {"round": 1, "sim": {"func_pass": True}},
+            {"round": 2, "sim": {"func_pass": False}},
+        ]
+        self.assertEqual(driver.winning_round({"rounds": rounds})["round"], 1)
+
+    def test_winning_round_falls_back_to_the_last_round_when_none_passed(self):
+        rounds = [{"round": 0, "sim": {"func_pass": False}}, {"round": 1, "sim": {"func_pass": False}}]
+        self.assertEqual(driver.winning_round({"rounds": rounds})["round"], 1)
+        self.assertIsNone(driver.winning_round({"rounds": []}))
+
+    def test_write_artifacts_writes_the_winning_rounds_rtl_and_logs(self):
+        row = {
+            "design": "d",
+            "samples": [
+                {
+                    "func_pass": False,
+                    "syntax_pass": True,
+                    "final_rtl": "// losing sample\n",
+                    "rounds": [{"round": 0, "sim": {"func_pass": False}, "rtl": "// losing\n"}],
+                },
+                {
+                    "func_pass": True,
+                    "syntax_pass": True,
+                    "final_rtl": "// winning sample\n",
+                    "rounds": [
+                        {"round": 0, "sim": {"func_pass": False, "sim_log": "bad"}, "rtl": "// draft\n"},
+                        {
+                            "round": 1,
+                            "sim": {"func_pass": True, "sim_log": "good sim", "compile_log": "good compile"},
+                            "rtl": "// WINNER\n",
+                        },
+                    ],
+                },
+            ],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            directory = driver.write_artifacts(out, row)
+            self.assertEqual((directory / "rtl.v").read_text(encoding="utf-8"), "// WINNER\n")
+            self.assertEqual((directory / "sim.log").read_text(encoding="utf-8"), "good sim")
+            self.assertEqual((directory / "compile.log").read_text(encoding="utf-8"), "good compile")
+            self.assertEqual(json.loads((directory / "trace.json").read_text(encoding="utf-8"))["design"], "d")
+
+
+class ResultsFileTests(unittest.TestCase):
+    def test_repair_trailing_newline_closes_a_torn_final_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "results.jsonl"
+            path.write_text('{"design": "a"}\n{"design": "b"', encoding="utf-8")
+            driver.repair_trailing_newline(path)
+            self.assertTrue(path.read_text(encoding="utf-8").endswith("\n"))
+            # Appending after the repair must not merge into the torn row: without it the
+            # next row lands as `{"design": "b"{"design": "c"}` and BOTH are lost.
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write('{"design": "c"}\n')
+            self.assertEqual(
+                sorted(row["design"] for row in driver.load_prior_rows(path)), ["a", "c"]
+            )
+
+    def test_repair_trailing_newline_is_a_noop_for_missing_or_empty_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = Path(tmp) / "nope.jsonl"
+            driver.repair_trailing_newline(missing)
+            self.assertFalse(missing.exists())
+            empty = Path(tmp) / "empty.jsonl"
+            empty.write_text("", encoding="utf-8")
+            driver.repair_trailing_newline(empty)
+            self.assertEqual(empty.read_text(encoding="utf-8"), "")
+
+    def test_load_prior_rows_keeps_the_last_row_per_design_and_skips_a_torn_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "results.jsonl"
+            path.write_text(
+                '{"design": "a", "n": 1}\n{"design": "a", "n": 2}\n{"design": "b"',
+                encoding="utf-8",
+            )
+            rows = {row["design"]: row for row in driver.load_prior_rows(path)}
+            self.assertEqual(sorted(rows), ["a"])
+            self.assertEqual(rows["a"]["n"], 2)
+
+    def test_atomic_write_replaces_in_place_and_leaves_no_tmp_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "report.json"
+            driver._atomic_write(path, "first")
+            driver._atomic_write(path, "second")
+            self.assertEqual(path.read_text(encoding="utf-8"), "second")
+            self.assertEqual([p.name for p in Path(tmp).iterdir()], ["report.json"])
+
+
+class SelectionTests(DriverTestCase):
+    def _args(self, *extra: str) -> Any:
+        return driver.build_parser().parse_args(
+            ["--benchmark", str(self.bench), "--out-dir", str(self.out), *extra]
+        )
+
+    def test_an_unmatched_design_name_is_fatal_rather_than_a_silent_narrowing(self):
+        # Otherwise `--designs aaa_adder aaa_addr` runs one design and the report says
+        # "1/1 designs func-pass (100.0%)" with nothing recording the 2 that never ran.
+        with self.patch_discovery():
+            with self.assertRaises(SystemExit) as ctx:
+                driver.select_designs(self.bench, self._args("--designs", "aaa_adder", "aaa_addr", "typo"))
+        message = str(ctx.exception)
+        self.assertIn("2 design(s) that do not exist", message)
+        self.assertIn("aaa_addr", message)
+        self.assertIn("typo", message)
+        self.assertIn("Available designs: aaa_adder", message)  # the real names are offered
+
+    def test_matching_design_names_still_select(self):
+        with self.patch_discovery():
+            designs = driver.select_designs(self.bench, self._args("--designs", "aaa_adder", "ccc_fifo"))
+        self.assertEqual([d.name for d in designs], ["aaa_adder", "ccc_fifo"])
+
+    def test_an_unmatched_exclude_warns_but_does_not_abort(self):
+        buffer = io.StringIO()
+        with self.patch_discovery(), contextlib.redirect_stderr(buffer):
+            designs = driver.select_designs(self.bench, self._args("--exclude", "aaa_adder", "nope"))
+        self.assertEqual([d.name for d in designs], ["bbb_counter", "ccc_fifo"])
+        self.assertIn("nope", buffer.getvalue())
+
+    def test_reference_and_empty_baseline_are_mutually_exclusive(self):
+        with self.patch_discovery():
+            with self.assertRaises(SystemExit) as ctx:
+                run_main(["--benchmark", str(self.bench), "--out-dir", str(self.out),
+                          "--reference", "--empty-baseline"])
+        self.assertIn("--empty-baseline", str(ctx.exception))
+
+
+class EmptyBaselineTests(DriverTestCase):
+    def test_empty_baseline_scores_the_stub_and_names_the_vacuous_designs(self):
+        seen: "list[str]" = []
+
+        def fake_evaluate_empty_stub(design, workdir, **kwargs):
+            seen.append(design.name)
+            return make_sim(design.name, func=design.name == "bbb_counter")
+
+        with self.patch_discovery(), mock.patch.object(
+            rtllm_bench, "evaluate_empty_stub", fake_evaluate_empty_stub
+        ), mock.patch.object(rtllm_bench, "empty_stub_rtl", lambda d: f"module {d.name}();\nendmodule\n"), \
+                mock.patch.object(driver, "build_llm_client", mock.Mock(side_effect=AssertionError)), \
+                mock.patch.object(rtllm_bench, "evaluate_reference", mock.Mock(side_effect=AssertionError)):
+            code, output = run_main(
+                ["--benchmark", str(self.bench), "--out-dir", str(self.out), "--empty-baseline"]
+            )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(sorted(seen), sorted(self.design_names))
+        self.assertIn("bbb_counter", output)
+        self.assertIn("passes with NO LOGIC", output)
+        report = json.loads((self.out / "report.json").read_text(encoding="utf-8"))
+        self.assertEqual(report["mode"], "empty")
+        self.assertEqual(report["totals"]["designs_func_success"], 1)
+        self.assertEqual(
+            (self.out / "designs" / "aaa_adder" / "rtl.v").read_text(encoding="utf-8"),
+            "module aaa_adder();\nendmodule\n",
+        )
+
+
+class OracleAdjustmentTests(unittest.TestCase):
+    """``adjusted`` must correct in both directions, not only the flattering one."""
+
+    def setUp(self) -> None:
+        self.assertTrue(rtllm_bench.VACUOUS_ORACLE_DESIGNS)
+        self.vacuous = sorted(rtllm_bench.VACUOUS_ORACLE_DESIGNS)[0]
+        self.broken = sorted(rtllm_bench.KNOWN_ORACLE_ISSUES)[0]
+        rows = [
+            make_design_result("real_design", "Arithmetic", [False]),
+            make_design_result(self.vacuous, "Arithmetic", [True]),  # free pass: empty module wins
+            make_design_result(self.broken, "Misc", [False]),  # unpassable by any RTL
+        ]
+        self.report = driver.build_report(
+            [row.to_dict() for row in rows],
+            mode="llm",
+            k=1,
+            selected=["real_design", self.vacuous, self.broken],
+        )
+
+    def test_totals_keep_every_design(self):
+        self.assertEqual(self.report["totals"]["designs"], 3)
+        self.assertEqual(self.report["totals"]["designs_func_success"], 1)
+
+    def test_adjusted_drops_both_the_unpassable_and_the_vacuous_design(self):
+        adjusted = self.report["adjusted"]
+        self.assertEqual(adjusted["designs"], 1)
+        self.assertEqual(adjusted["excluded_designs"], sorted([self.broken, self.vacuous]))
+        self.assertEqual(adjusted["excluded_vacuous"], [self.vacuous])
+        self.assertEqual(adjusted["excluded_unpassable"], [self.broken])
+        # 0/1, not the flattering 1/2 the one-directional basis reports.
+        self.assertEqual(adjusted["designs_func_success"], 0)
+        self.assertAlmostEqual(adjusted["designs_func_rate"], 0.0)
+
+    def test_the_one_directional_basis_is_kept_but_named_as_such(self):
+        old = self.report["adjusted_unpassable_only"]
+        self.assertEqual(old["designs"], 2)
+        self.assertAlmostEqual(old["designs_func_rate"], 0.5)
+        self.assertIn("vacuous", old["basis"])
+
+    def test_the_oracle_section_and_markdown_name_the_vacuous_designs(self):
+        oracle = self.report["oracle"]
+        self.assertEqual(oracle["vacuous_selected_designs"], [self.vacuous])
+        self.assertIn(self.vacuous, oracle["vacuous_issues"])
+        text = driver.render_markdown(self.report)
+        self.assertIn("vacuous oracle", text)
+        self.assertIn(self.vacuous, text)
+        self.assertIn("--empty-baseline", text)
+        # ... and the per-design table flags them, the way it flags a broken oracle.
+        self.assertIn(f"| {self.vacuous} (vacuous oracle) |", text)
+        self.assertIn(f"| {self.broken} (broken oracle) |", text)
+
+
+class SingleShotMetricTests(unittest.TestCase):
+    """The with-repair rate and the single-shot rate must not share one name."""
+
+    def setUp(self) -> None:
+        # One sample, three rounds, and only the LAST one passes: a repair win, not a
+        # single-shot win.
+        repaired = make_design_result("repaired", "Arithmetic", [True], rounds_per_sample=3)
+        first_try = make_design_result("first_try", "Arithmetic", [True], rounds_per_sample=1)
+        self.report = driver.build_report(
+            [repaired.to_dict(), first_try.to_dict()], mode="llm", k=1,
+            selected=["repaired", "first_try"],
+            agent_config={"samples": 1, "max_repair_rounds": 2, "evidence_policy": "logs"},
+        )
+
+    def test_round0_and_with_repair_differ(self):
+        totals = self.report["totals"]
+        self.assertEqual(totals["designs_func_success"], 2)
+        self.assertEqual(totals["designs_func_success_round0"], 1)
+        self.assertAlmostEqual(totals["pass@1_with_repair"], 1.0)
+        self.assertAlmostEqual(totals["pass@1_round0"], 0.5)
+        self.assertAlmostEqual(totals["pass@1"], totals["pass@1_with_repair"])  # alias
+
+    def test_markdown_prints_both_rates_and_the_configuration(self):
+        text = driver.render_markdown(self.report)
+        self.assertIn("pass@1, with repair", text)
+        self.assertIn("pass@1, round 0 (single-shot, RTLLM-comparable)", text)
+        self.assertIn("## Configuration", text)
+        self.assertIn("max_repair_rounds", text)
+        self.assertIn("evidence_policy", text)
+
+    def test_a_row_without_func_pass_round_falls_back_to_its_rounds(self):
+        sample = {"func_pass": True, "syntax_pass": True,
+                  "rounds": [{"sim": {"func_pass": True}}, {"sim": {"func_pass": False}}]}
+        self.assertTrue(driver._passed_first_round(sample))
+        sample["rounds"] = [{"sim": {"func_pass": False}}, {"sim": {"func_pass": True}}]
+        self.assertFalse(driver._passed_first_round(sample))
+
+
+class BackendOutageTests(DriverTestCase):
+    def _llm_error_row(self, name: str, category: str) -> DesignResult:
+        sample = SampleResult(
+            design=name, sample=0, syntax_pass=False, func_pass=False, func_pass_strict=False,
+            rounds=[
+                AttemptRecord(
+                    round=0,
+                    role="rtl_generator",
+                    sim=SimResult(
+                        design=name, syntax_pass=False, func_pass=False, func_pass_strict=False,
+                        timed_out=False, compile_log="", sim_log="", duration_s=0.0,
+                        failure_family=None,
+                    ),
+                    rtl="",
+                    llm_error="rtl_generator failed after 3 attempt(s): rate limited",
+                )
+            ],
+            contract=None,
+            final_rtl="",
+        )
+        return DesignResult(design=name, category=category, samples=[sample])
+
+    def test_a_backend_outage_is_excluded_from_adjusted_and_reported(self):
+        rows = [
+            make_design_result("ok_design", "Arithmetic", [True]).to_dict(),
+            self._llm_error_row("dead_design", "Arithmetic").to_dict(),
+        ]
+        report = driver.build_report(rows, mode="llm", k=1, selected=["ok_design", "dead_design"])
+        self.assertEqual(report["llm_error_designs"], ["dead_design"])
+        # Raw keeps it (1/2); adjusted must not, because 0 there measures the backend.
+        self.assertEqual(report["totals"]["designs"], 2)
+        self.assertAlmostEqual(report["totals"]["designs_func_rate"], 0.5)
+        self.assertEqual(report["adjusted"]["designs"], 1)
+        self.assertEqual(report["adjusted"]["excluded_backend_failed"], ["dead_design"])
+        self.assertAlmostEqual(report["adjusted"]["designs_func_rate"], 1.0)
+        self.assertIn("LLM backend errored", driver.render_markdown(report))
+
+    def test_main_exits_3_when_the_backend_died_mid_sweep(self):
+        def hook(design: RtllmDesign) -> DesignResult:
+            if design.name == "bbb_counter":
+                return self._llm_error_row(design.name, design.category)
+            return make_design_result(design.name, design.category, [True])
+
+        with self.patch_discovery(), self.patch_run_design(hook), mock.patch.object(
+            driver, "build_llm_client", return_value=object()
+        ):
+            code, output = run_main(["--benchmark", str(self.bench), "--out-dir", str(self.out)])
+
+        self.assertEqual(code, 3)  # not 0: this is not a model result
+        self.assertIn("LLM backend", output)
+        report = json.loads((self.out / "report.json").read_text(encoding="utf-8"))
+        self.assertEqual(report["llm_error_designs"], ["bbb_counter"])
+
+
+class ResumeCompatibilityTests(DriverTestCase):
+    def _argv(self, *extra: str) -> "list[str]":
+        return ["--benchmark", str(self.bench), "--out-dir", str(self.out), *extra]
+
+    def test_rows_carry_the_run_config_fingerprint(self):
+        with self.patch_discovery(), self.patch_run_design(), mock.patch.object(
+            driver, "build_llm_client", return_value=object()
+        ):
+            run_main(self._argv("--designs", "aaa_adder", "--samples", "2"))
+        row = read_jsonl(self.out / "results.jsonl")[0]
+        self.assertEqual(row["run_config"]["samples"], 2)
+        self.assertEqual(row["run_config"]["benchmark"], str(self.bench))
+
+    def test_resume_refuses_rows_scored_under_different_settings(self):
+        with self.patch_discovery(), self.patch_run_design(), mock.patch.object(
+            driver, "build_llm_client", return_value=object()
+        ):
+            run_main(self._argv("--designs", "aaa_adder", "--samples", "1", "--evidence-policy", "none"))
+
+        with self.patch_discovery(), self.patch_run_design(), mock.patch.object(
+            driver, "build_llm_client", return_value=object()
+        ):
+            with self.assertRaises(SystemExit) as ctx:
+                run_main(self._argv("--resume", "--samples", "5", "--evidence-policy", "logs"))
+        message = str(ctx.exception)
+        self.assertIn("config mismatch", message)
+        self.assertIn("samples", message)
+        self.assertIn("evidence_policy", message)
+
+    def test_resume_with_matching_settings_still_works(self):
+        with self.patch_discovery(), self.patch_run_design(), mock.patch.object(
+            driver, "build_llm_client", return_value=object()
+        ):
+            run_main(self._argv("--designs", "aaa_adder"))
+        second = self.patch_run_design()
+        with self.patch_discovery(), second, mock.patch.object(
+            driver, "build_llm_client", return_value=object()
+        ):
+            code, _ = run_main(self._argv("--resume"))
+        self.assertEqual(code, 0)
+        self.assertEqual(second.calls, ["bbb_counter", "ccc_fifo"])  # type: ignore[attr-defined]
+
+    def test_a_different_benchmark_checkout_is_refused(self):
+        rows = [{"design": "aaa_adder", "mode": "llm", "run_config": {"benchmark": "/other/RTLLM"}}]
+        with self.assertRaises(SystemExit) as ctx:
+            driver.check_resume_compatible(rows, "llm", {"benchmark": "/here/RTLLM"}, Path("r.jsonl"))
+        self.assertIn("benchmark", str(ctx.exception))
+
+    def test_legacy_rows_without_a_fingerprint_are_accepted(self):
+        rows = [{"design": "aaa_adder", "mode": "llm"}]
+        driver.check_resume_compatible(rows, "llm", {"samples": 5}, Path("r.jsonl"))
+
+
+class InterruptTests(DriverTestCase):
+    def test_execute_stops_scheduling_once_stop_is_set(self):
+        started: "list[str]" = []
+        stop = threading.Event()
+
+        def worker(design: RtllmDesign) -> "dict[str, Any]":
+            started.append(design.name)
+            stop.set()
+            return {"design": design.name}
+
+        driver.execute(self.designs, worker, lambda row: None, 1, stop)
+        self.assertEqual(started, ["aaa_adder"])
+
+    def test_execute_does_not_join_in_flight_workers_when_aborting(self):
+        # The ThreadPoolExecutor `with` block used to call shutdown(wait=True) on the way
+        # out, so the abort path blocked for the full runtime of every running design --
+        # after the SIGINT handler had already restored SIG_DFL, so the user's second
+        # Ctrl-C killed the process before any report was written.
+        release = threading.Event()
+        self.addCleanup(release.set)
+
+        def worker(design: RtllmDesign) -> "dict[str, Any]":
+            if design.name != "aaa_adder":
+                release.wait(30)
+            return {"design": design.name}
+
+        def record(row: "dict[str, Any]") -> None:
+            raise KeyboardInterrupt
+
+        started = time.monotonic()
+        with self.assertRaises(KeyboardInterrupt):
+            driver.execute(self.designs, worker, record, 3, threading.Event())
+        self.assertLess(time.monotonic() - started, 5.0)
+
+    def test_main_returns_130_and_still_writes_a_report(self):
+        def hook(design: RtllmDesign) -> DesignResult:
+            if design.name == "bbb_counter":
+                raise KeyboardInterrupt
+            return make_design_result(design.name, design.category, [True])
+
+        with self.patch_discovery(), self.patch_run_design(hook), mock.patch.object(
+            driver, "build_llm_client", return_value=object()
+        ):
+            code, _ = run_main(["--benchmark", str(self.bench), "--out-dir", str(self.out)])
+
+        self.assertEqual(code, 130)
+        report = json.loads((self.out / "report.json").read_text(encoding="utf-8"))
+        self.assertTrue(report["interrupted"])
+        self.assertEqual(report["completed_designs"], 1)  # aaa_adder finished before the abort
+        self.assertEqual([row["design"] for row in read_jsonl(self.out / "results.jsonl")], ["aaa_adder"])
+        self.assertIn("interrupted", (self.out / "report.md").read_text(encoding="utf-8"))
+
+    def test_the_agent_loop_receives_the_stop_event(self):
+        seen: "list[Any]" = []
+
+        def fake_run_design(design, client, config, workdir, *, log=None, stop=None):
+            seen.append(stop)
+            return make_design_result(design.name, design.category, [True])
+
+        with self.patch_discovery(), mock.patch.object(
+            rtllm_agent, "run_design", fake_run_design
+        ), mock.patch.object(driver, "build_llm_client", return_value=object()):
+            run_main(["--benchmark", str(self.bench), "--out-dir", str(self.out), "--designs", "aaa_adder"])
+
+        self.assertEqual(len(seen), 1)
+        self.assertIsInstance(seen[0], threading.Event)
+
+    def test_verbose_reaches_the_agent_loop(self):
+        # `log` used to be probed for with inspect.signature, so a signature drift silently
+        # made --verbose a no-op. It is passed unconditionally now.
+        seen: "list[Any]" = []
+
+        def fake_run_design(design, client, config, workdir, *, log=None, stop=None):
+            seen.append(log)
+            return make_design_result(design.name, design.category, [True])
+
+        with self.patch_discovery(), mock.patch.object(
+            rtllm_agent, "run_design", fake_run_design
+        ), mock.patch.object(driver, "build_llm_client", return_value=object()):
+            run_main(["--benchmark", str(self.bench), "--out-dir", str(self.out),
+                      "--designs", "aaa_adder", "--verbose"])
+        self.assertTrue(callable(seen[0]))
+
+    def test_install_sigint_sets_stop_first_then_restores_the_default_handler(self):
+        stop = threading.Event()
+        before = signal.getsignal(signal.SIGINT)
+        previous = driver.install_sigint(stop)
+        try:
+            handler = signal.getsignal(signal.SIGINT)
+            self.assertTrue(callable(handler))
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                handler(signal.SIGINT, None)  # type: ignore[operator]
+            self.assertTrue(stop.is_set())
+            self.assertIn("Ctrl-C again to abort", buffer.getvalue())
+            with self.assertRaises(KeyboardInterrupt):
+                signal.getsignal(signal.SIGINT)(signal.SIGINT, None)  # type: ignore[operator]
+        finally:
+            driver.restore_sigint(previous)
+        self.assertIs(signal.getsignal(signal.SIGINT), before)
+
+    def test_restore_sigint_tolerates_a_missing_previous_handler(self):
+        before = signal.getsignal(signal.SIGINT)
+        driver.restore_sigint(None)
+        self.assertIs(signal.getsignal(signal.SIGINT), before)
 
 
 if __name__ == "__main__":

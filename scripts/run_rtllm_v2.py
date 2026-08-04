@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run the RTLLM v2.0 benchmark end to end: natural-language spec -> RTL -> iverilog verdict.
 
-Two modes:
+Three modes:
 
 ``--reference``
     Evaluate the benchmark's *own* ``verified_*.v`` against its own testbench. No LLM client is
@@ -9,16 +9,29 @@ Two modes:
     cannot pass is a benchmark or simulator defect, not a model failure, so a reference run is
     what tells you whether a red row belongs to the agent or to the harness.
 
+``--empty-baseline``
+    Evaluate a port-only module with NO LOGIC. This is the oracle *floor*, and it is the other
+    half of the same question: a design that passes here is passed by any agent whatsoever, so
+    its score carries no information. Also no LLM.
+
 default (LLM)
     Run the multi-agent loop (``rtl_planner`` -> ``rtl_generator`` -> verify ->
     ``rtl_repair_agent``) over every selected design and score it with the official RTLLM
     oracle, byte for byte the rule from the benchmark's ``auto_run.py``: the simulator printed
     ``Pass``/``pass``.
 
-Every number is reported twice where it can flatter: ``func_pass`` (official) next to
-``func_pass_strict`` (pass banner *and* no failure banner), and raw rates next to rates adjusted
-for :data:`c2hlsc_agent.rtllm_bench.KNOWN_ORACLE_ISSUES`. The adjusted rate never silently
-replaces the raw one.
+Every number is reported twice where it can flatter:
+
+- ``func_pass`` (official) next to ``func_pass_strict`` (pass banner *and* no failure banner);
+- ``pass@1_with_repair`` (any round of the sample passed -- the agent's number) next to
+  ``pass@1_round0`` (the single generation, the number comparable to published RTLLM pass@1);
+- raw rates next to ``adjusted`` rates, which drop the designs no RTL can pass
+  (:data:`c2hlsc_agent.rtllm_bench.KNOWN_ORACLE_ISSUES`) *and* the designs an empty module
+  passes (:data:`c2hlsc_agent.rtllm_bench.VACUOUS_ORACLE_DESIGNS`), so the correction runs in
+  both directions rather than only the flattering one.
+
+No adjusted rate ever silently replaces the raw one, and ``report.md`` prints the run's full
+configuration so no table from it is quotable without its settings.
 
 Outputs into ``--out-dir``:
 
@@ -39,14 +52,14 @@ Agent run through the local Claude Code CLI, 4 designs in parallel, best-of-5 sa
     python scripts/run_rtllm_v2.py --benchmark /path/to/RTLLM --out-dir build/rtllm_opus \
         --workers 4 --samples 5 --max-repair-rounds 2
 
-Exit codes: 0 the sweep completed (whatever the score), 2 the LLM backend is unavailable,
-130 interrupted with SIGINT (a partial report is still written).
+Exit codes: 0 the sweep completed (whatever the score), 2 the LLM backend is unavailable at
+startup, 3 the sweep completed but at least one design scored 0 because the backend errored
+mid-run (not a model result), 130 interrupted with SIGINT (a partial report is still written).
 """
 
 from __future__ import annotations
 
 import argparse
-import inspect
 import json
 import math
 import os
@@ -177,6 +190,37 @@ def load_prior_rows(path: Path) -> "list[dict[str, Any]]":
     return list(by_design.values())
 
 
+#: Row fields that must agree across a resumed sweep. Every one of them changes what the
+#: numbers MEAN, and ``build_report`` stamps the report with the *final* invocation's config
+#: for all rows -- so mixing them produces a report that misdescribes its own contents.
+RESUME_CRITICAL_KEYS = (
+    "benchmark",
+    "samples",
+    "max_repair_rounds",
+    "evidence_policy",
+    "apply_shims",
+    "plan",
+    "sim_timeout",
+    "compile_timeout",
+)
+
+
+def run_config_fingerprint(
+    config: rtllm_agent.RtllmAgentConfig,
+    benchmark: Path,
+    *,
+    backend: "str | None" = None,
+    model: "str | None" = None,
+) -> "dict[str, Any]":
+    """The scoring-relevant configuration stamped into every results row."""
+
+    fingerprint: "dict[str, Any]" = {"benchmark": str(benchmark)}
+    fingerprint.update(config.to_dict())
+    fingerprint["backend"] = backend
+    fingerprint["model"] = model
+    return fingerprint
+
+
 def check_resume_mode(rows: "Sequence[dict[str, Any]]", mode: str, path: Path) -> None:
     """Refuse to mix a reference baseline and an agent run in one results file.
 
@@ -193,6 +237,42 @@ def check_resume_mode(rows: "Sequence[dict[str, Any]]", mode: str, path: Path) -
         )
 
 
+def check_resume_compatible(
+    rows: "Sequence[dict[str, Any]]",
+    mode: str,
+    run_config: "dict[str, Any]",
+    path: Path,
+) -> None:
+    """Refuse a resume whose scoring knobs disagree with the rows already on disk.
+
+    ``mode`` alone is not enough. A sweep started at ``--samples 1 --evidence-policy none``,
+    interrupted, then resumed at ``--samples 5 --evidence-policy logs`` merges into one
+    report that credits some designs a best-of-5 and others a best-of-1, drops the short
+    rows out of pass@5 without saying so in report.md, and stamps ``agent_config`` with the
+    *last* invocation's settings for all of them. Same for a resume against a different
+    ``--benchmark`` checkout. Rows written before this key existed carry no ``run_config``
+    and are accepted, since there is nothing to compare.
+    """
+
+    check_resume_mode(rows, mode, path)
+    for row in rows:
+        prior = row.get("run_config")
+        if not isinstance(prior, dict):
+            continue
+        differing = [
+            (key, prior.get(key), run_config.get(key))
+            for key in RESUME_CRITICAL_KEYS
+            if key in prior and prior.get(key) != run_config.get(key)
+        ]
+        if differing:
+            detail = "; ".join(f"{key}: stored {was!r} vs now {now!r}" for key, was, now in differing)
+            raise SystemExit(
+                f"--resume config mismatch on design {row.get('design')!r} in {path}: {detail}.\n"
+                "Averaging rows scored under different settings would misdescribe every "
+                "headline number. Use a fresh --out-dir, or rerun with the stored settings."
+            )
+
+
 def _atomic_write(path: Path, text: str) -> None:
     # PID-unique tmp name: two runs sharing an out-dir must not race on it.
     tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
@@ -205,13 +285,13 @@ def _atomic_write(path: Path, text: str) -> None:
 # --------------------------------------------------------------------------- #
 
 
-def _supports_log(func: Callable[..., Any]) -> bool:
-    """True when ``func`` accepts the optional ``log`` callback (fakes in tests do not)."""
+def _shutdown(pool: ThreadPoolExecutor, *, wait: bool) -> None:
+    """``pool.shutdown`` with ``cancel_futures`` where the interpreter has it (3.9+)."""
 
     try:
-        return "log" in inspect.signature(func).parameters
-    except (TypeError, ValueError):  # pragma: no cover - builtins / C callables
-        return False
+        pool.shutdown(wait=wait, cancel_futures=True)
+    except TypeError:  # pragma: no cover - Python < 3.9
+        pool.shutdown(wait=wait)
 
 
 def run_llm_design(
@@ -220,14 +300,16 @@ def run_llm_design(
     config: rtllm_agent.RtllmAgentConfig,
     workdir: Path,
     log: "Callable[[str], None] | None" = None,
+    stop: "threading.Event | None" = None,
 ) -> "dict[str, Any]":
-    """One design through the multi-agent loop, as a JSON-ready row."""
+    """One design through the multi-agent loop, as a JSON-ready row.
 
-    run = rtllm_agent.run_design
-    if log is not None and _supports_log(run):
-        result = run(design, client, config, workdir, log=log)
-    else:
-        result = run(design, client, config, workdir)
+    ``log`` and ``stop`` are passed through unconditionally. They used to be probed for
+    with ``inspect.signature`` so that test fakes could omit them, which meant a real
+    signature drift silently turned ``--verbose`` into a no-op instead of raising.
+    """
+
+    result = rtllm_agent.run_design(design, client, config, workdir, log=log, stop=stop)
     return result.to_dict()
 
 
@@ -238,26 +320,41 @@ def _reference_rtl(design: rtllm_bench.RtllmDesign) -> str:
         return ""
 
 
+def _empty_stub_rtl(design: rtllm_bench.RtllmDesign) -> str:
+    try:
+        return rtllm_bench.empty_stub_rtl(design)
+    except Exception:  # noqa: BLE001 - a malformed reference must not kill the baseline
+        return ""
+
+
 def run_reference_design(
     design: rtllm_bench.RtllmDesign,
     config: rtllm_agent.RtllmAgentConfig,
     workdir: Path,
+    *,
+    empty_baseline: bool = False,
 ) -> "dict[str, Any]":
     """One design's golden RTL through its own testbench, shaped like a ``DesignResult``.
 
     The baseline is a single deterministic sample: re-running the same golden file cannot
     produce a different verdict, so ``--samples`` is deliberately ignored here.
+
+    With ``empty_baseline`` the *port-only stub* is run instead of the golden RTL. That is
+    the mirror measurement: the reference gives the oracle's ceiling, the empty stub gives
+    its floor, and a design that passes the floor is one whose score means nothing.
     """
 
-    sim = rtllm_bench.evaluate_reference(
+    evaluate = rtllm_bench.evaluate_empty_stub if empty_baseline else rtllm_bench.evaluate_reference
+    sim = evaluate(
         design,
-        Path(workdir) / "reference",
+        Path(workdir) / ("empty" if empty_baseline else "reference"),
         compile_timeout=config.compile_timeout,
         sim_timeout=config.sim_timeout,
         apply_shims=config.apply_shims,
     )
-    rtl = _reference_rtl(design)
-    attempt = rtllm_agent.AttemptRecord(round=0, role="reference", sim=sim, rtl=rtl)
+    rtl = _empty_stub_rtl(design) if empty_baseline else _reference_rtl(design)
+    role = "empty_stub" if empty_baseline else "reference"
+    attempt = rtllm_agent.AttemptRecord(round=0, role=role, sim=sim, rtl=rtl)
     sample = rtllm_agent.SampleResult(
         design=design.name,
         sample=0,
@@ -288,7 +385,16 @@ def execute(
     """Run ``worker`` over ``designs``, recording each row exactly once as it finishes.
 
     ``record`` is serialized here so callers append without their own locking. When ``stop``
-    is set (SIGINT) nothing new is scheduled; in-flight designs still finish and are recorded.
+    is set (SIGINT) nothing new is scheduled; in-flight designs wind down via the same event
+    (``rtllm_agent.run_design`` checks it between samples and repair rounds) and whatever
+    they return is still recorded.
+
+    The pool is shut down explicitly rather than with a ``with`` block: ``__exit__`` calls
+    ``shutdown(wait=True)``, so an abort raised out of this function would first block for
+    the full remaining runtime of every in-flight design -- measured at the whole 20 s of a
+    sleeping worker, and hours in a real sweep -- after the SIGINT handler has already
+    restored ``SIG_DFL``. The user's second Ctrl-C then kills the process before any report
+    is written, which is exactly what the first Ctrl-C promised not to do.
     """
 
     if workers <= 1:
@@ -305,22 +411,24 @@ def execute(
             return None
         return worker(design)
 
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = [pool.submit(run_one, design) for design in designs]
-        try:
-            for future in as_completed(futures):
-                row = future.result()
-                if row is None:
-                    continue
-                with lock:
-                    record(row)
-        except BaseException:
-            # Don't drain the queue: cancel everything not yet started. Recorded rows are
-            # already on disk for --resume.
-            stop.set()
-            for future in futures:
-                future.cancel()
-            raise
+    pool = ThreadPoolExecutor(max_workers=workers)
+    futures = [pool.submit(run_one, design) for design in designs]
+    aborting = False
+    try:
+        for future in as_completed(futures):
+            row = future.result()
+            if row is None:
+                continue
+            with lock:
+                record(row)
+    except BaseException:
+        # Don't drain the queue: cancel everything not yet started, and do not join what is
+        # already running. Recorded rows are already on disk for --resume.
+        aborting = True
+        stop.set()
+        raise
+    finally:
+        _shutdown(pool, wait=not aborting)
 
 
 # --------------------------------------------------------------------------- #
@@ -425,6 +533,20 @@ def sample_family(sample: "dict[str, Any]") -> "str | None":
     return UNKNOWN_FAMILY
 
 
+def _passed_first_round(sample: "dict[str, Any]") -> bool:
+    """True when the sample's round 0 -- the single generation, before any repair -- passed.
+
+    This is the RTLLM-comparable event. ``sample['func_pass']`` is true if ANY round passed,
+    which after two repair rounds is a three-generation best-of, not a single shot.
+    """
+
+    round_index = sample.get("func_pass_round")
+    if round_index is not None:
+        return round_index == 0
+    rounds = _rounds(sample)  # rows written before func_pass_round existed
+    return bool(rounds) and bool((rounds[0].get("sim") or {}).get("func_pass"))
+
+
 def summarize_row(row: "dict[str, Any]") -> "dict[str, Any]":
     """Flatten one ``DesignResult`` row into a report table row."""
 
@@ -433,6 +555,7 @@ def summarize_row(row: "dict[str, Any]") -> "dict[str, Any]":
     syntax_success = int(row.get("syntax_success") or sum(1 for s in samples if s.get("syntax_pass")))
     func_success = int(row.get("func_success") or sum(1 for s in samples if s.get("func_pass")))
     strict_success = sum(1 for s in samples if s.get("func_pass_strict"))
+    round0_success = sum(1 for s in samples if _passed_first_round(s))
     families = [family for family in (sample_family(s) for s in samples) if family]
     if not samples and row.get("error"):
         families = [DRIVER_ERROR_FAMILY]
@@ -451,6 +574,7 @@ def summarize_row(row: "dict[str, Any]") -> "dict[str, Any]":
                 pass
             shim_applied = shim_applied or bool(sim.get("shim_applied"))
     name = str(row.get("design", "unknown"))
+    llm_error = next((s.get("llm_error") for s in samples if s.get("llm_error")), None)
     return {
         "design": name,
         "category": str(row.get("category") or ""),
@@ -458,41 +582,73 @@ def summarize_row(row: "dict[str, Any]") -> "dict[str, Any]":
         "syntax_success": syntax_success,
         "func_success": func_success,
         "func_success_strict": strict_success,
+        "func_success_round0": round0_success,
         "syntax_pass": syntax_success > 0,
         "func_pass": func_success > 0,
         "func_pass_strict": strict_success > 0,
+        "func_pass_round0": round0_success > 0,
         "repair_rounds_used": rounds_used,
         "failure_family": families[0] if families else None,
         "failure_families": families,
         "shim_applied": shim_applied,
         "known_oracle_issue": rtllm_bench.KNOWN_ORACLE_ISSUES.get(name),
-        "llm_error": next((s.get("llm_error") for s in samples if s.get("llm_error")), None),
+        "vacuous_oracle": rtllm_bench.VACUOUS_ORACLE_DESIGNS.get(name),
+        "llm_error": llm_error,
+        # A design nothing was ever generated for: the backend died, so a 0 here is a
+        # measurement of the backend, not of the model.
+        "backend_failed": bool(llm_error) and func_success == 0,
         "sim_seconds": round(duration, 3),
     }
 
 
 def _totals(table: "Sequence[dict[str, Any]]", k: int) -> "dict[str, Any]":
+    """Aggregate a table of ``summarize_row`` dicts.
+
+    Two different pass@1 numbers are reported, because ``func_success`` counts a sample as a
+    success if ANY of its rounds passed. At the default ``--max-repair-rounds 2`` that is up
+    to three generations with verifier feedback between them:
+
+    ``pass@1_with_repair``
+        the agent's number -- generate, verify, repair, verify, repair, verify.
+    ``pass@1_round0``
+        the single-shot number, the one comparable to published RTLLM pass@1.
+
+    ``pass@1`` remains as an alias of ``pass@1_with_repair`` so existing consumers keep
+    working, but report.md prints both and neither is quotable without the other.
+    """
+
     designs = len(table)
     samples = sum(row["n_samples"] for row in table)
     pass1 = [value for value in (pass_at_k(r["n_samples"], r["func_success"], 1) for r in table) if value is not None]
     passk = [value for value in (pass_at_k(r["n_samples"], r["func_success"], k) for r in table) if value is not None]
+    round0 = [
+        value
+        for value in (pass_at_k(r["n_samples"], r.get("func_success_round0", 0), 1) for r in table)
+        if value is not None
+    ]
     syntax1 = [value for value in (pass_at_k(r["n_samples"], r["syntax_success"], 1) for r in table) if value is not None]
+    with_repair = _mean(pass1)
     return {
         "designs": designs,
         "designs_syntax_success": sum(1 for row in table if row["syntax_pass"]),
         "designs_func_success": sum(1 for row in table if row["func_pass"]),
         "designs_func_success_strict": sum(1 for row in table if row["func_pass_strict"]),
+        "designs_func_success_round0": sum(1 for row in table if row.get("func_pass_round0")),
         "designs_syntax_rate": _rate(sum(1 for row in table if row["syntax_pass"]), designs),
         "designs_func_rate": _rate(sum(1 for row in table if row["func_pass"]), designs),
         "designs_func_rate_strict": _rate(sum(1 for row in table if row["func_pass_strict"]), designs),
+        "designs_func_rate_round0": _rate(sum(1 for row in table if row.get("func_pass_round0")), designs),
         "samples": samples,
         "samples_syntax_success": sum(row["syntax_success"] for row in table),
         "samples_func_success": sum(row["func_success"] for row in table),
         "samples_func_success_strict": sum(row["func_success_strict"] for row in table),
+        "samples_func_success_round0": sum(row.get("func_success_round0", 0) for row in table),
         "samples_syntax_rate": _rate(sum(row["syntax_success"] for row in table), samples),
         "samples_func_rate": _rate(sum(row["func_success"] for row in table), samples),
         "k": k,
-        "pass@1": _mean(pass1),
+        "pass@1_with_repair": with_repair,
+        "pass@1_round0": _mean(round0),
+        "pass@1": with_repair,  # alias: same number, kept so existing consumers do not break
         "pass@k": _mean(passk),
         "syntax@1": _mean(syntax1),
         "pass@1_designs_scored": len(pass1),
@@ -517,14 +673,29 @@ def build_report(
 ) -> "dict[str, Any]":
     """Aggregate finished ``DesignResult`` rows into the report.json payload.
 
-    Both the raw/official numbers and the oracle-adjusted ones are always present: the
-    adjusted rate drops designs listed in ``rtllm_bench.KNOWN_ORACLE_ISSUES``, whose testbench
-    cannot be passed by *any* RTL including the benchmark's own, and it is meaningless without
-    the raw rate beside it.
+    Both the raw/official numbers and the oracle-adjusted ones are always present, and the
+    adjustment corrects in **both** directions:
+
+    - ``rtllm_bench.KNOWN_ORACLE_ISSUES`` -- oracles no RTL can pass, not even the
+      benchmark's own ``verified_*.v``. Dropping them raises the rate.
+    - ``rtllm_bench.VACUOUS_ORACLE_DESIGNS`` -- oracles an EMPTY module passes. Keeping them
+      also raises the rate, by handing every agent four free designs. An "adjusted" number
+      that drops the first set and keeps the second is biased upward from both ends at once,
+      which is what this harness used to print.
+    - designs whose samples all died on an LLM backend error, which measure the backend
+      rather than the model.
+
+    ``adjusted_unpassable_only`` keeps the old one-directional basis for continuity. Neither
+    adjusted view ever replaces ``totals``.
     """
 
     table = sorted((summarize_row(row) for row in rows), key=lambda r: (r["category"], r["design"]))
-    sound = [row for row in table if not row["known_oracle_issue"]]
+    unpassable_only = [row for row in table if not row["known_oracle_issue"]]
+    sound = [
+        row
+        for row in unpassable_only
+        if not row["vacuous_oracle"] and not row["backend_failed"]
+    ]
 
     families: "dict[str, int]" = {}
     for row in table:
@@ -538,8 +709,13 @@ def build_report(
 
     selected_names = list(selected) or [row["design"] for row in table]
     affected = sorted(name for name in selected_names if name in rtllm_bench.KNOWN_ORACLE_ISSUES)
+    vacuous = sorted(name for name in selected_names if name in rtllm_bench.VACUOUS_ORACLE_DESIGNS)
+    backend_failed = sorted(row["design"] for row in table if row["backend_failed"])
     declared_shims = sorted(
         name for name in getattr(rtllm_bench, "TESTBENCH_SHIMS", {}) if name in selected_names
+    )
+    excluded_from_sound = sorted(
+        {row["design"] for row in table} - {row["design"] for row in sound}
     )
     return {
         "mode": mode,
@@ -557,22 +733,45 @@ def build_report(
         "oracle_rule": "official RTLLM auto_run.py rule: simulator stdout contains 'Pass' or 'pass'",
         "totals": _totals(table, k),
         "adjusted": {
-            "basis": "designs whose oracle is believed sound (not in rtllm_bench.KNOWN_ORACLE_ISSUES)",
-            "excluded_designs": affected,
+            "basis": (
+                "designs whose oracle is sound in BOTH directions: not in "
+                "rtllm_bench.KNOWN_ORACLE_ISSUES (unpassable), not in "
+                "rtllm_bench.VACUOUS_ORACLE_DESIGNS (passed by an empty module), and not "
+                "failed by an LLM backend outage"
+            ),
+            "excluded_designs": excluded_from_sound,
+            "excluded_unpassable": affected,
+            "excluded_vacuous": vacuous,
+            "excluded_backend_failed": backend_failed,
             **_totals(sound, k),
+        },
+        "adjusted_unpassable_only": {
+            "basis": (
+                "designs not in rtllm_bench.KNOWN_ORACLE_ISSUES. One-directional: it drops "
+                "the oracles that are too strict and keeps the ones that are vacuous, so it "
+                "reads higher than 'adjusted'. Kept for continuity with earlier reports."
+            ),
+            "excluded_designs": affected,
+            **_totals(unpassable_only, k),
         },
         "failure_families": families,
         "failure_families_by_design": families_by_design,
+        "llm_error_designs": backend_failed,
         "oracle": {
             "known_issues": dict(rtllm_bench.KNOWN_ORACLE_ISSUES),
             "affected_selected_designs": affected,
-            "sound_selected_designs": len(selected_names) - len(affected),
+            "sound_selected_designs": len(selected_names) - len(set(affected) | set(vacuous)),
+            "vacuous_issues": dict(rtllm_bench.VACUOUS_ORACLE_DESIGNS),
+            "vacuous_selected_designs": vacuous,
             "shimmed_designs_declared": declared_shims,
             "shimmed_designs_applied": sorted(row["design"] for row in table if row["shim_applied"]),
             "note": (
-                "Designs listed in affected_selected_designs cannot be passed by any RTL -- the "
-                "benchmark's own verified_*.v fails their testbench under this simulator. The "
-                "'adjusted' section drops them; the 'totals' section does not."
+                "Designs in affected_selected_designs cannot be passed by any RTL -- the "
+                "benchmark's own verified_*.v fails their testbench under this simulator. "
+                "Designs in vacuous_selected_designs are passed by a module with no logic at "
+                "all (X-optimistic checks), so every agent banks them for free. 'adjusted' "
+                "drops both; 'adjusted_unpassable_only' drops only the first; 'totals' drops "
+                "neither. Run --empty-baseline to re-measure the vacuous set on your machine."
             ),
         },
         "designs": table,
@@ -617,6 +816,20 @@ def render_markdown(report: "dict[str, Any]") -> str:
         lines.append("- **interrupted (SIGINT): this report covers only the designs that finished**")
     lines.append(f"- wall clock: {report['wall_clock_s']:.1f}s")
     lines.append("")
+
+    # No report.md is quotable without the configuration that produced it: `samples` and
+    # `max_repair_rounds` alone are the difference between a single-shot number and a
+    # best-of-15 one.
+    config = report.get("agent_config") or {}
+    if config:
+        lines.append("## Configuration")
+        lines.append("")
+        lines.append("| setting | value |")
+        lines.append("| --- | --- |")
+        for key in sorted(config):
+            lines.append(f"| {key} | `{config[key]}` |")
+        lines.append("")
+
     lines.append("## Headline")
     lines.append("")
     lines.append("| metric | raw (all selected) | adjusted (sound oracle only) |")
@@ -641,13 +854,36 @@ def render_markdown(report: "dict[str, Any]") -> str:
         f" ({_pct(totals['samples_func_rate'])}) | {adjusted['samples_func_success']}/{adjusted['samples']}"
         f" ({_pct(adjusted['samples_func_rate'])}) |"
     )
-    lines.append(f"| pass@1 | {_num(totals['pass@1'])} | {_num(adjusted['pass@1'])} |")
+    lines.append(
+        f"| func pass, round 0 only (designs) | {totals['designs_func_success_round0']}/{totals['designs']}"
+        f" ({_pct(totals['designs_func_rate_round0'])}) | {adjusted['designs_func_success_round0']}"
+        f"/{adjusted['designs']} ({_pct(adjusted['designs_func_rate_round0'])}) |"
+    )
+    rounds = (report.get("agent_config") or {}).get("max_repair_rounds")
+    # A reference/empty run has exactly one round per design, so naming a repair budget it
+    # never used would misdescribe the number.
+    repair_note = f" (up to {rounds} repair rounds)" if rounds and mode == "llm" else ""
+    lines.append(
+        f"| pass@1, with repair{repair_note} | {_num(totals['pass@1_with_repair'])} | "
+        f"{_num(adjusted['pass@1_with_repair'])} |"
+    )
+    lines.append(
+        f"| pass@1, round 0 (single-shot, RTLLM-comparable) | {_num(totals['pass@1_round0'])} | "
+        f"{_num(adjusted['pass@1_round0'])} |"
+    )
     if k != 1:  # with one sample per design pass@k IS pass@1; printing it twice invites misreading
-        lines.append(f"| pass@{k} | {_num(totals['pass@k'])} | {_num(adjusted['pass@k'])} |")
+        scored = totals.get("pass@k_designs_scored")
+        over = f" (over {scored}/{totals['designs']} designs)" if scored != totals["designs"] else ""
+        lines.append(f"| pass@{k}, with repair{over} | {_num(totals['pass@k'])} | {_num(adjusted['pass@k'])} |")
     lines.append("")
     lines.append(
         "Official oracle = the benchmark's own rule (stdout contains `Pass`/`pass`). "
-        "Strict additionally requires no failure banner and no timeout."
+        "Strict additionally requires no failure banner, no timeout and no runaway output."
+    )
+    lines.append(
+        "`pass@1, with repair` counts a sample as a success if ANY of its rounds passed, so it "
+        "is the agent's score, not the base model's. Only `pass@1, round 0` is comparable to a "
+        "published single-shot RTLLM pass@1."
     )
     lines.append("")
 
@@ -656,7 +892,11 @@ def render_markdown(report: "dict[str, Any]") -> str:
     lines.append("| design | category | syntax | func | repair rounds | failure family |")
     lines.append("| --- | --- | --- | --- | --- | --- |")
     for row in report["designs"]:
-        note = " (broken oracle)" if row["known_oracle_issue"] else ""
+        note = ""
+        if row["known_oracle_issue"]:
+            note = " (broken oracle)"
+        elif row.get("vacuous_oracle"):
+            note = " (vacuous oracle)"
         syntax = f"{row['syntax_success']}/{row['n_samples']}"
         func = f"{row['func_success']}/{row['n_samples']}"
         family = row["failure_family"] or "-"
@@ -690,6 +930,31 @@ def render_markdown(report: "dict[str, Any]") -> str:
     else:
         lines.append("- No selected design is on the known-broken-oracle list.")
     lines.append("")
+
+    vacuous = oracle.get("vacuous_selected_designs") or []
+    if vacuous:
+        lines.append(
+            "These selected designs have a **vacuous oracle**: a module with the right ports and "
+            "no logic at all passes them, so every agent -- including one that emits an empty "
+            "module -- banks them for free. They are counted in `totals` and excluded from "
+            "`adjusted` (but NOT from `adjusted_unpassable_only`). Re-measure with "
+            "`--empty-baseline`:"
+        )
+        lines.append("")
+        for name in vacuous:
+            lines.append(f"- `{name}`: {(oracle.get('vacuous_issues') or {}).get(name, 'passes an empty module')}")
+        lines.append("")
+
+    backend_failed = report.get("llm_error_designs") or []
+    if backend_failed:
+        lines.append(
+            f"**{len(backend_failed)} design(s) failed because the LLM backend errored**, not "
+            "because the RTL was wrong: "
+            + ", ".join(f"`{name}`" for name in backend_failed)
+            + ". They score 0 in `totals` and are excluded from `adjusted`. A rate that includes "
+            "them measures the backend's uptime, not the model."
+        )
+        lines.append("")
     applied = oracle["shimmed_designs_applied"]
     declared = oracle["shimmed_designs_declared"]
     if declared or applied:
@@ -735,7 +1000,9 @@ def build_parser() -> argparse.ArgumentParser:
         ),
         epilog=(
             "Exit codes: 0 the sweep completed (whatever the score), 2 the LLM backend is "
-            "unavailable, 130 interrupted (a partial report is still written)."
+            "unavailable at startup, 3 the sweep completed but at least one design scored 0 "
+            "because the backend errored mid-run, 130 interrupted (a partial report is still "
+            "written)."
         ),
     )
     parser.add_argument(
@@ -771,6 +1038,15 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Evaluate the benchmark's own verified RTL instead of calling a model: the oracle baseline (no LLM is constructed)",
     )
+    parser.add_argument(
+        "--empty-baseline",
+        action="store_true",
+        help=(
+            "Evaluate a port-only module with NO LOGIC instead of calling a model: the oracle "
+            "floor. Any design it passes has a vacuous oracle and its score means nothing "
+            "(no LLM is constructed)"
+        ),
+    )
     parser.add_argument("--resume", action="store_true", help=f"Skip designs already recorded in <out-dir>/{RESULTS_FILE} and append to it")
     parser.add_argument("--sim-timeout", type=int, default=rtllm_bench.DEFAULT_SIM_TIMEOUT, help="Per-simulation timeout in seconds")
     parser.add_argument("--compile-timeout", type=int, default=rtllm_bench.DEFAULT_COMPILE_TIMEOUT, help="Per-compile timeout in seconds")
@@ -795,13 +1071,45 @@ def make_agent_config(args: argparse.Namespace) -> rtllm_agent.RtllmAgentConfig:
 
 
 def select_designs(root: Path, args: argparse.Namespace) -> "list[rtllm_bench.RtllmDesign]":
+    """Resolve ``--designs``/``--exclude``/``--limit`` into the list of designs to run.
+
+    A ``--designs`` name that matches nothing is fatal. Silently dropping it turns one typo
+    (or one renamed design in a scripted list) into a sweep over whatever survived, reported
+    as ``1/1 designs func-pass (100.0%)`` with nothing anywhere saying the other 49 were
+    never run. Matching in ``discover_designs`` is exact and case-sensitive, so "matched
+    nothing" always means the caller asked for something that is not there.
+    """
+
+    discovered = {design.name for design in rtllm_bench.discover_designs(root)}
     designs = rtllm_bench.discover_designs(root, include=args.designs, exclude=args.exclude)
+
+    unmatched = [name for name in dict.fromkeys(args.designs or ()) if name not in discovered]
+    if unmatched:
+        raise SystemExit(
+            f"--designs named {len(unmatched)} design(s) that do not exist under {root}: "
+            + ", ".join(unmatched)
+            + "\nNames are matched exactly and case-sensitively. Available designs: "
+            + (", ".join(sorted(discovered)) if discovered else "(none discovered)")
+        )
+
     if not designs:
         raise SystemExit(
             f"no RTLLM designs found under {root}"
             + (f" matching --designs {' '.join(args.designs)}" if args.designs else "")
             + ". A design directory needs both design_description.txt and testbench.v."
         )
+
+    # An --exclude that matches nothing removed nothing, so it cannot corrupt a score the way
+    # an unmatched --designs can; it is still a typo the user should hear about.
+    stale = [name for name in dict.fromkeys(args.exclude or ()) if name not in discovered]
+    if stale:
+        print(
+            "warning: --exclude named design(s) that do not exist and excluded nothing: "
+            + ", ".join(stale),
+            file=sys.stderr,
+            flush=True,
+        )
+
     if args.limit is not None:
         designs = designs[: max(0, args.limit)]
     return designs
@@ -848,14 +1156,21 @@ def main(argv: "list[str] | None" = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
+    if args.reference and args.empty_baseline:
+        raise SystemExit(
+            "--reference and --empty-baseline are two different measurements (the oracle's "
+            "ceiling and its floor). Run them into separate --out-dirs."
+        )
+
     root = resolve_benchmark(args)
     designs = select_designs(root, args)
-    mode = "reference" if args.reference else "llm"
+    harness_mode = args.reference or args.empty_baseline
+    mode = "reference" if args.reference else ("empty" if args.empty_baseline else "llm")
     config = make_agent_config(args)
 
     client = None
     backend = model = None
-    if not args.reference:
+    if not harness_mode:
         # Built once and shared by every worker. The CLI client shells out per call and the
         # API clients are stateless, so sharing is safe as long as nothing mutates them.
         llm_config = AgentConfig(
@@ -883,11 +1198,12 @@ def main(argv: "list[str] | None" = None) -> int:
     work_root = out_dir / "work"
 
     selected_names = [design.name for design in designs]
+    run_config = run_config_fingerprint(config, root, backend=backend, model=model)
     rows: "list[dict[str, Any]]" = []
     pending = designs
     if args.resume:
         prior = load_prior_rows(results_path)
-        check_resume_mode(prior, mode, results_path)
+        check_resume_compatible(prior, mode, run_config, results_path)
         done = {row["design"] for row in prior}
         wanted = set(selected_names)
         # Rows for designs outside this selection stay in the file but out of the report.
@@ -915,23 +1231,30 @@ def main(argv: "list[str] | None" = None) -> int:
         began = time.time()
         workdir = work_root / design.name
         try:
-            if args.reference:
-                row = run_reference_design(design, config, workdir)
+            if harness_mode:
+                row = run_reference_design(
+                    design, config, workdir, empty_baseline=args.empty_baseline
+                )
             else:
-                row = run_llm_design(design, client, config, workdir, log if args.verbose else None)
+                row = run_llm_design(
+                    design, client, config, workdir, log if args.verbose else None, stop
+                )
         except Exception as exc:  # noqa: BLE001 - one bad design must not kill the sweep
             # n_samples is the sample budget, not 0: a design that blew up is a failure with
             # c=0, and reporting n=0 would drop it out of the pass@k average instead.
             row = {
                 "design": design.name,
                 "category": design.category,
-                "n_samples": 1 if args.reference else max(1, args.samples),
+                "n_samples": 1 if harness_mode else max(1, args.samples),
                 "syntax_success": 0,
                 "func_success": 0,
                 "samples": [],
                 "error": f"{type(exc).__name__}: {exc}",
             }
         row["mode"] = mode
+        # Stamped per row so --resume can refuse to average rows scored under different
+        # settings, and so a stray results.jsonl is self-describing.
+        row["run_config"] = run_config
         row["wall_s"] = round(time.time() - began, 3)
         return row
 
@@ -970,9 +1293,9 @@ def main(argv: "list[str] | None" = None) -> int:
         mode=mode,
         benchmark=str(root),
         out_dir=str(out_dir),
-        # A reference run has exactly one deterministic sample per design; a pass@5 over n=1
-        # would be undefined for every row, so k is pinned to 1 there.
-        k=1 if args.reference else max(1, args.samples),
+        # A reference/empty run has exactly one deterministic sample per design; a pass@5
+        # over n=1 would be undefined for every row, so k is pinned to 1 there.
+        k=1 if harness_mode else max(1, args.samples),
         backend=backend,
         model=model,
         agent_config=config.to_dict() if hasattr(config, "to_dict") else {},
@@ -993,11 +1316,30 @@ def main(argv: "list[str] | None" = None) -> int:
         f"{adjusted['designs_func_success']}/{adjusted['designs']} adjusted "
         f"({_pct(adjusted['designs_func_rate'])}), "
         f"syntax {totals['designs_syntax_success']}/{totals['designs']}, "
-        f"pass@1={_num(totals['pass@1'])}{at_k}",
+        f"pass@1(with repair)={_num(totals['pass@1_with_repair'])}, "
+        f"pass@1(round 0)={_num(totals['pass@1_round0'])}{at_k}",
         flush=True,
     )
+    if mode == "empty":
+        vacuous = sorted(row["design"] for row in report["designs"] if row["func_pass"])
+        print(
+            "empty-baseline: a design listed here passes with NO LOGIC, so its score is "
+            "meaningless -- " + (", ".join(vacuous) if vacuous else "(none)"),
+            flush=True,
+        )
+    backend_failed = report.get("llm_error_designs") or []
+    if backend_failed:
+        print(
+            f"\nwarning: {len(backend_failed)} design(s) scored 0 because the LLM backend "
+            f"errored, not because the RTL was wrong: {', '.join(backend_failed)}.\n"
+            "Those are not model results. Rerun them with --resume once the backend is back.",
+            file=sys.stderr,
+            flush=True,
+        )
     print(f"report: {out_dir / REPORT_MD}", flush=True)
-    return 130 if interrupted else 0
+    if interrupted:
+        return 130
+    return 3 if backend_failed else 0
 
 
 if __name__ == "__main__":
