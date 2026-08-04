@@ -77,9 +77,10 @@ def _storage_type(arg: FunctionArg) -> str:
     return " ".join(token for token in arg.c_type.split() if token not in {"const", "volatile"})
 
 
-def _scalar_decl(arg: FunctionArg) -> str:
-    if arg.scalar_range:
-        lo, hi = arg.scalar_range
+def _scalar_decl(arg: FunctionArg, pointer_args: list[FunctionArg]) -> str:
+    bounds = _inferred_scalar_bounds(arg, pointer_args)
+    if bounds is not None:
+        lo, hi = bounds
         return f"bounded_scalar<{arg.c_type}>(cycle, rng, {lo}LL, {hi}LL)"
     return f"random_value<{arg.c_type}>(rng)"
 
@@ -134,8 +135,8 @@ def _array_declarations(arrays: list[FunctionArg]) -> list[str]:
     return declarations
 
 
-def _scalar_declarations(scalars: list[FunctionArg]) -> list[str]:
-    return [f"  {arg.c_type} {arg.name} = {_scalar_decl(arg)};" for arg in scalars]
+def _scalar_declarations(scalars: list[FunctionArg], pointer_args: list[FunctionArg]) -> list[str]:
+    return [f"  {arg.c_type} {arg.name} = {_scalar_decl(arg, pointer_args)};" for arg in scalars]
 
 
 def _array_initializers(arrays: list[FunctionArg]) -> list[str]:
@@ -237,7 +238,7 @@ def _render_trace_tb(
     arrays = [arg for arg in fn.args if arg.is_pointer_like]
     scalars = [arg for arg in fn.args if not arg.is_pointer_like]
     headers, roles = _header_and_roles(fn.args, fn.return_type)
-    declarations = _array_declarations(arrays) + _scalar_declarations(scalars)
+    declarations = _array_declarations(arrays) + _scalar_declarations(scalars, arrays)
     initializers = _array_initializers(arrays)
     row_lines = _write_row_lines(fn.args, fn.return_type)
     return_prefix = f"{fn.return_type} dut_return = " if fn.return_type != "void" else ""
@@ -360,10 +361,10 @@ if __name__ == "__main__":
 """
 
 
-_KLEE_LENGTH_NAMES = {"n", "len", "length", "size", "count", "num", "limit", "samples", "elements"}
+_LENGTH_SCALAR_NAMES = {"n", "len", "length", "size", "count", "num", "limit", "samples", "elements"}
 
 
-def _klee_scalar_bounds(arg: FunctionArg, pointer_args: list[FunctionArg]) -> tuple[int, int] | None:
+def _inferred_scalar_bounds(arg: FunctionArg, pointer_args: list[FunctionArg]) -> tuple[int, int] | None:
     if arg.scalar_range is not None:
         return arg.scalar_range
     name = arg.name.lower()
@@ -372,7 +373,7 @@ def _klee_scalar_bounds(arg: FunctionArg, pointer_args: list[FunctionArg]) -> tu
         for pointer in pointer_args
         if pointer.length is not None
         and (
-            name in _KLEE_LENGTH_NAMES
+            name in _LENGTH_SCALAR_NAMES
             or name in {
                 f"{pointer.name.lower()}_n",
                 f"n_{pointer.name.lower()}",
@@ -552,7 +553,7 @@ def _klee_driver(analysis: AnalysisResult) -> str:
             setup.append(
                 f'  klee_make_symbolic(&shared_{arg.name}, sizeof(shared_{arg.name}), "{arg.name}");'
             )
-            bounds = _klee_scalar_bounds(arg, pointer_args)
+            bounds = _inferred_scalar_bounds(arg, pointer_args)
             if bounds is not None:
                 lo, hi = bounds
                 setup.append(f"  klee_assume(shared_{arg.name} >= static_cast<{scalar_type}>({lo}));")
@@ -1100,7 +1101,7 @@ def _manifest(
     scalar_ranges = {
         arg.name: list(bounds)
         for arg in fn.args
-        if not arg.is_pointer_like and (bounds := _klee_scalar_bounds(arg, pointer_args)) is not None
+        if not arg.is_pointer_like and (bounds := _inferred_scalar_bounds(arg, pointer_args)) is not None
     }
     bounded_lengths = {
         arg.name: arg.length for arg in pointer_args if arg.length is not None

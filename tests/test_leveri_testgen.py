@@ -99,6 +99,49 @@ class LeVeriTestgenTests(unittest.TestCase):
         self.assertIn("dynamic_output_consistency", bundle.manifest_json)
         self.assertIn("HLS-LeVeri consistency check passed", bundle.compare_script)
 
+    def test_unconfigured_length_scalar_is_bounded_by_inferred_array_length(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = Path(tmp.name) / "input.c"
+        path.write_text(
+            """
+            void vector_add(const int *a, const int *b, int *out, int n) {
+              for (int i = 0; i < n; ++i) out[i] = a[i] + b[i];
+            }
+            """,
+            encoding="utf-8",
+        )
+        cfg = AgentConfig(top="vector_add", num_tests=8)
+        analysis = analyze_source(path, "vector_add", cfg)
+        bundle = generate_leveri_testbenches(analysis, cfg)
+        for tb in (bundle.golden_tb, bundle.hls_tb):
+            self.assertIn("int n = bounded_scalar<int>(cycle, rng, 0LL, 16LL);", tb)
+            self.assertNotIn("int n = random_value<int>(rng);", tb)
+
+    def test_non_length_scalar_without_config_stays_random(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = Path(tmp.name) / "input.c"
+        path.write_text(
+            """
+            void scale_all(const int *a, int *out, int gain) {
+              for (int i = 0; i < 4; ++i) out[i] = a[i] * gain;
+            }
+            """,
+            encoding="utf-8",
+        )
+        cfg = AgentConfig(
+            top="scale_all",
+            num_tests=8,
+            arguments={
+                "a": ArgumentConfig(direction="input", length=4),
+                "out": ArgumentConfig(direction="output", length=4),
+            },
+        )
+        analysis = analyze_source(path, "scale_all", cfg)
+        bundle = generate_leveri_testbenches(analysis, cfg)
+        self.assertIn("int gain = random_value<int>(rng);", bundle.golden_tb)
+
     def test_klee_driver_clones_shared_state_and_checks_all_pointer_poststate(self):
         analysis, cfg = self._analysis()
         driver = generate_leveri_testbenches(analysis, cfg).klee_driver
