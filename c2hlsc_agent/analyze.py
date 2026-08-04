@@ -45,29 +45,72 @@ class AnalysisResult:
     unsupported_constructs: list[Diagnostic]
 
 
+_CODE = "c"
+_COMMENT = "m"
+_LITERAL = "s"
+
+
+def classify_source(source: str) -> list[str]:
+    """Classify each source character as code, comment, or string/char literal."""
+
+    classes = [_CODE] * len(source)
+    idx = 0
+    size = len(source)
+    while idx < size:
+        ch = source[idx]
+        nxt = source[idx + 1] if idx + 1 < size else ""
+        if ch == "/" and nxt == "*":
+            end = source.find("*/", idx + 2)
+            end = size if end < 0 else end + 2
+            for pos in range(idx, end):
+                if source[pos] != "\n":
+                    classes[pos] = _COMMENT
+            idx = end
+            continue
+        if ch == "/" and nxt == "/":
+            end = source.find("\n", idx + 2)
+            end = size if end < 0 else end
+            for pos in range(idx, end):
+                classes[pos] = _COMMENT
+            idx = end
+            continue
+        if ch in {'"', "'"}:
+            quote = ch
+            classes[idx] = _LITERAL
+            idx += 1
+            while idx < size:
+                cur = source[idx]
+                if cur == "\n":
+                    # A raw newline terminates recovery from an invalid literal instead
+                    # of letting one unmatched quote hide the rest of the translation unit.
+                    break
+                classes[idx] = _LITERAL
+                if cur == "\\":
+                    if idx + 1 < size and source[idx + 1] != "\n":
+                        classes[idx + 1] = _LITERAL
+                    idx += 2
+                    continue
+                idx += 1
+                if cur == quote:
+                    break
+            continue
+        idx += 1
+    return classes
+
+
 def strip_comments(source: str) -> str:
-    source = re.sub(r"/\*.*?\*/", "", source, flags=re.S)
-    source = re.sub(r"//.*", "", source)
-    return source
+    classes = classify_source(source)
+    return "".join(" " if cls == _COMMENT else ch for ch, cls in zip(source, classes))
 
 
 def _find_matching_brace(source: str, open_index: int) -> int:
+    classes = classify_source(source)
     depth = 0
-    in_string: str | None = None
-    escape = False
     for idx in range(open_index, len(source)):
-        ch = source[idx]
-        if in_string:
-            if escape:
-                escape = False
-            elif ch == "\\":
-                escape = True
-            elif ch == in_string:
-                in_string = None
+        if classes[idx] != _CODE:
             continue
-        if ch in {'"', "'"}:
-            in_string = ch
-        elif ch == "{":
+        ch = source[idx]
+        if ch == "{":
             depth += 1
         elif ch == "}":
             depth -= 1
@@ -141,6 +184,25 @@ def _parse_arg(raw: str, metadata: ArgumentConfig | None = None) -> FunctionArg:
     )
 
 
+_RETURN_TYPE_QUALIFIERS = {
+    "static",
+    "inline",
+    "extern",
+    "__inline__",
+    "__inline",
+    "_Noreturn",
+}
+
+
+def _normalize_return_type(raw: str) -> str:
+    tokens = [
+        token
+        for token in re.sub(r"\s+", " ", raw).strip().split()
+        if token not in _RETURN_TYPE_QUALIFIERS
+    ]
+    return " ".join(tokens) if tokens else "int"
+
+
 def _extract_function(source: str, top: str, source_path: Path, config: AgentConfig) -> FunctionInfo:
     pattern = re.compile(
         rf"(?P<ret>[A-Za-z_][\w\s\*\d]*?)\s+{re.escape(top)}\s*\((?P<params>[^;{{}}]*)\)\s*\{{",
@@ -153,7 +215,7 @@ def _extract_function(source: str, top: str, source_path: Path, config: AgentCon
     close_brace = _find_matching_brace(source, open_brace)
     params = match.group("params")
     args = [_parse_arg(part, config.arguments.get(_guess_arg_name(part))) for part in _split_params(params)]
-    return_type = re.sub(r"\s+", " ", match.group("ret")).strip()
+    return_type = _normalize_return_type(match.group("ret"))
     signature = f"{return_type} {top}({', '.join(arg.raw for arg in args)})"
     definition = source[match.start() : close_brace + 1].strip()
     body = source[open_brace + 1 : close_brace]
@@ -220,6 +282,18 @@ def _unsupported(function: FunctionInfo) -> list[Diagnostic]:
             diagnostics.append(Diagnostic("error", code, message, function.source_path.name, suggestion))
     if re.search(rf"\b{re.escape(function.name)}\s*\(", body):
         diagnostics.append(Diagnostic("error", "recursion", "recursive top function call detected", function.source_path.name, "Refactor recursion into bounded iteration."))
+    for arg in function.args:
+        if len(arg.array_dims) > 1:
+            dims = "".join(f"[{dim.strip()}]" for dim in arg.array_dims)
+            diagnostics.append(
+                Diagnostic(
+                    "error",
+                    "multi-dimensional-parameter",
+                    f"multi-dimensional array parameter {arg.name!r} ({arg.c_type}{dims}) is not supported",
+                    function.source_path.name,
+                    "Flatten the parameter to one dimension (e.g. in[ROWS * COLS]) and index it linearly.",
+                )
+            )
     for arg in function.args:
         if not arg.is_pointer_like:
             continue

@@ -98,13 +98,14 @@ class ConvertTests(unittest.TestCase):
         testbench = generate_testbench(analysis, cfg)
         self.assertIn("// - out: direction=output length=4 compare all 4 elements; active prefix is clamp(n, 4)", testbench)
         self.assertIn("const int compare_len_out = 4;", testbench)
-        self.assertIn("const int active_len_out = clamp_count(static_cast<long long>(n), 4);", testbench)
+        self.assertIn("const int active_len_out = clamp_count(print_value(n), 4);", testbench)
         self.assertIn("for (int i = 0; i < compare_len_out; ++i)", testbench)
         self.assertIn("if (!values_equal(ref_out[i], hls_out[i]))", testbench)
         self.assertIn('<< " compare_len=" << compare_len_out', testbench)
         self.assertIn('<< " active_len=" << active_len_out', testbench)
-        self.assertIn('<< " n=" << static_cast<long long>(n)', testbench)
+        self.assertIn('<< " n=" << print_value(n)', testbench)
         self.assertIn('"Mismatch test=" << test_idx << " arg=out index="', testbench)
+        self.assertIn("std::cerr.precision(17);", testbench)
 
     def test_generated_testbench_uses_vitis_friendly_stimulus(self):
         analysis, cfg = self._analysis()
@@ -113,6 +114,10 @@ class ConvertTests(unittest.TestCase):
         self.assertIn("output_sentinel<int32_t>(test_idx, i)", testbench)
         self.assertIn("if (std::numeric_limits<T>::is_integer)", testbench)
         self.assertNotIn("if constexpr", testbench)
+        self.assertIn("static_cast<long long>(rng() % 20001) - 10000", testbench)
+        self.assertIn("if (std::isnan(", testbench)
+        self.assertIn("!std::isfinite(", testbench)
+        self.assertIn("struct print_as", testbench)
 
     def test_generated_testbench_bounds_unconfigured_length_from_pointer_capacity(self):
         analysis, cfg = self._analysis()

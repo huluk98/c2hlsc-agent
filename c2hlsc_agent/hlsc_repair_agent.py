@@ -3,6 +3,7 @@ from __future__ import annotations
 import difflib
 import hashlib
 import json
+import os
 import re
 import sys
 from dataclasses import dataclass
@@ -29,6 +30,8 @@ class RepairFileChange:
     before_sha256: str
     after_sha256: str
     diff: str
+    before_norm_sha256: str = ""
+    after_norm_sha256: str = ""
 
     def to_dict(self) -> dict[str, str]:
         return {
@@ -37,6 +40,8 @@ class RepairFileChange:
             "before_sha256": self.before_sha256,
             "after_sha256": self.after_sha256,
             "diff": self.diff,
+            "before_norm_sha256": self.before_norm_sha256,
+            "after_norm_sha256": self.after_norm_sha256,
         }
 
 
@@ -74,38 +79,80 @@ class RepairOutcome:
         }
 
 
-def load_repair_audit(project_dir: Path) -> list[RepairOutcome]:
-    audit_path = project_dir / REPAIR_AUDIT_FILENAME
+def _read_audit_entries(audit_path: Path) -> list[object]:
+    """Return ledger entries, recovering from a torn or malformed ledger."""
+
     if not audit_path.exists():
         return []
-    raw = json.loads(audit_path.read_text(encoding="utf-8"))
+    try:
+        raw = json.loads(audit_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        print(
+            f"c2hlsc repair: ignoring unreadable {audit_path} "
+            f"({type(exc).__name__}: {exc}); treating repair history as empty.",
+            file=sys.stderr,
+        )
+        return []
+    if not isinstance(raw, list):
+        print(
+            f"c2hlsc repair: ignoring malformed {audit_path} (expected a JSON list); "
+            "treating repair history as empty.",
+            file=sys.stderr,
+        )
+        return []
+    return raw
+
+
+def load_repair_audit(project_dir: Path) -> list[RepairOutcome]:
+    audit_path = project_dir / REPAIR_AUDIT_FILENAME
+    raw = _read_audit_entries(audit_path)
     outcomes: list[RepairOutcome] = []
-    for item in raw:
-        changes = tuple(
-            RepairFileChange(
-                path=str(change["path"]),
-                action=str(change["action"]),
-                before_sha256=str(change["before_sha256"]),
-                after_sha256=str(change["after_sha256"]),
-                diff=str(change["diff"]),
+    for index, item in enumerate(raw):
+        try:
+            if not isinstance(item, dict):
+                raise TypeError("entry is not an object")
+            raw_changes = item.get("changes", [])
+            raw_targets = item.get("target_files", [])
+            if not isinstance(raw_changes, list):
+                raise TypeError("changes is not a list")
+            if not isinstance(raw_targets, list):
+                raise TypeError("target_files is not a list")
+            changes: list[RepairFileChange] = []
+            for change in raw_changes:
+                if not isinstance(change, dict):
+                    raise TypeError("change entry is not an object")
+                changes.append(
+                    RepairFileChange(
+                        path=str(change["path"]),
+                        action=str(change["action"]),
+                        before_sha256=str(change["before_sha256"]),
+                        after_sha256=str(change["after_sha256"]),
+                        diff=str(change["diff"]),
+                        before_norm_sha256=str(change.get("before_norm_sha256", "")),
+                        after_norm_sha256=str(change.get("after_norm_sha256", "")),
+                    )
+                )
+            outcomes.append(
+                RepairOutcome(
+                    iteration=int(item["iteration"]),
+                    stage=item.get("stage"),
+                    family=str(item["family"]),
+                    owner_agent=str(item["owner_agent"]),
+                    status=str(item["status"]),
+                    summary=str(item["summary"]),
+                    target_files=tuple(str(path) for path in raw_targets),
+                    changes=tuple(changes),
+                    evidence_excerpt=str(item.get("evidence_excerpt", "")),
+                    next_action=str(item.get("next_action", "")),
+                    repair_scope=str(item.get("repair_scope", "")),
+                )
             )
-            for change in item.get("changes", [])
-        )
-        outcomes.append(
-            RepairOutcome(
-                iteration=int(item["iteration"]),
-                stage=item.get("stage"),
-                family=str(item["family"]),
-                owner_agent=str(item["owner_agent"]),
-                status=str(item["status"]),
-                summary=str(item["summary"]),
-                target_files=tuple(str(path) for path in item.get("target_files", [])),
-                changes=changes,
-                evidence_excerpt=str(item.get("evidence_excerpt", "")),
-                next_action=str(item.get("next_action", "")),
-                repair_scope=str(item.get("repair_scope", "")),
+        except (KeyError, TypeError, ValueError) as exc:
+            print(
+                f"c2hlsc repair: ignoring malformed {audit_path} entry {index} "
+                f"({type(exc).__name__}: {exc}).",
+                file=sys.stderr,
             )
-        )
     return outcomes
 
 
@@ -141,7 +188,11 @@ def repair_project(
         changes.extend(_repair_restrict_for_cpp(project_dir, evidence))
         changes.extend(_repair_missing_original_support(project_dir, analysis, evidence))
         changes.extend(_repair_invalid_interface_pragmas(project_dir, phase, decision.family, evidence))
-        if changes:
+        # A header-only include repair does not overlap the LLM-owned source file. Let the
+        # LLM repair the source in the same iteration instead of spending an iteration on
+        # an include which may be incidental to the actual diagnostic.
+        header_only = bool(changes) and all(_is_generated_header(change.path) for change in changes)
+        if changes and not header_only:
             status = "applied"
             summary = f"Applied {len(changes)} auditable mechanical repair(s); rerun verification from software equivalence."
         elif llm is not None and getattr(config, "use_llm", False):
@@ -161,6 +212,17 @@ def repair_project(
                     f"Applied LLM repair to {', '.join(c.path for c in llm_changes)}; "
                     "rerun verification from software equivalence."
                 )
+            elif changes:
+                status = "applied"
+                detail = (
+                    "the LLM proposal was rejected by the oscillation guard"
+                    if oscillated
+                    else "no LLM patch was accepted"
+                )
+                summary = (
+                    f"Applied {len(changes)} auditable mechanical repair(s); {detail}; "
+                    "rerun verification from software equivalence."
+                )
             elif oscillated:
                 status = "oscillation_rejected"
                 summary = (
@@ -170,6 +232,9 @@ def repair_project(
             else:
                 status = "no_change"
                 summary = f"No conservative or LLM repair matched family {decision.family!r} at stage {phase!r}."
+        elif changes:
+            status = "applied"
+            summary = f"Applied {len(changes)} auditable mechanical repair(s); rerun verification from software equivalence."
         else:
             status = "no_change"
             summary = f"No conservative mechanical repair matched family {decision.family!r} at stage {phase!r}."
@@ -192,6 +257,10 @@ def repair_project(
     return outcome
 
 
+def _is_generated_header(relative_path: str) -> bool:
+    return relative_path.replace("\\", "/") == "src/hls_top.hpp"
+
+
 def _known_candidate_hashes(history: list[RepairOutcome], current: str) -> set[str]:
     """Every source state already visited (before/after of prior changes + current)."""
 
@@ -200,6 +269,18 @@ def _known_candidate_hashes(history: list[RepairOutcome], current: str) -> set[s
         for change in outcome.changes:
             seen.add(change.before_sha256)
             seen.add(change.after_sha256)
+    return seen
+
+
+def _known_normalized_hashes(history: list[RepairOutcome], current: str) -> set[str]:
+    """Whitespace-normalized source states already visited by the repair loop."""
+
+    seen = {_norm_sha256(current)}
+    for outcome in history:
+        for change in outcome.changes:
+            for digest in (change.before_norm_sha256, change.after_norm_sha256):
+                if digest:
+                    seen.add(digest)
     return seen
 
 
@@ -221,8 +302,9 @@ def _llm_repair(
     verifier ladder stays the equivalence gate even when the model is wrong. The candidate
     patch is structurally validated before it is accepted, so a prose/log response cannot
     be written as source. Prior attempts from the audit ledger are summarized in the
-    prompt, and a candidate whose hash matches ANY previously visited source state is
-    rejected (A->B->A oscillation guard). Returns ``(changes, oscillation_rejected)``.
+    prompt, and a candidate whose exact or whitespace-normalized hash matches ANY
+    previously visited source state is rejected (A->B->A oscillation guard). Returns
+    ``(changes, oscillation_rejected)``.
     """
 
     path = project_dir / "src" / "hls_top.cpp"
@@ -268,6 +350,8 @@ def _llm_repair(
         return [], False
     if _sha256(new_text) in _known_candidate_hashes(history, current):
         return [], True
+    if _norm_sha256(new_text) in _known_normalized_hashes(history, current):
+        return [], True
 
     change = _rewrite_file(
         project_dir,
@@ -295,17 +379,21 @@ def _phase_evidence(state: VerificationState, phase: str | None) -> str:
 
 def _append_audit(project_dir: Path, outcome: RepairOutcome) -> None:
     audit_path = project_dir / REPAIR_AUDIT_FILENAME
-    existing: list[object] = []
-    if audit_path.exists():
-        existing_raw = json.loads(audit_path.read_text(encoding="utf-8"))
-        if isinstance(existing_raw, list):
-            existing = existing_raw
+    # Canonicalize through the tolerant decoder so malformed historical entries are not
+    # copied forward into the newly written atomic ledger.
+    existing = [entry.to_dict() for entry in load_repair_audit(project_dir)]
     existing.append(outcome.to_dict())
-    audit_path.write_text(json.dumps(existing, indent=2), encoding="utf-8")
+    tmp_path = audit_path.with_name(f".{audit_path.name}.tmp")
+    tmp_path.write_text(json.dumps(existing, indent=2), encoding="utf-8")
+    os.replace(tmp_path, audit_path)
 
 
 def _sha256(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _norm_sha256(text: str) -> str:
+    return _sha256(re.sub(r"\s+", " ", text).strip())
 
 
 def _relative(project_dir: Path, path: Path) -> str:
@@ -334,6 +422,8 @@ def _rewrite_file(project_dir: Path, path: Path, action: str, new_text: str) -> 
         before_sha256=_sha256(old_text),
         after_sha256=_sha256(new_text),
         diff=diff,
+        before_norm_sha256=_norm_sha256(old_text),
+        after_norm_sha256=_norm_sha256(new_text),
     )
 
 
@@ -356,6 +446,12 @@ def _ensure_includes(text: str, includes: list[str]) -> str:
     return "\n".join(lines) + suffix
 
 
+_MISSING_DECLARATION_RE = re.compile(
+    r"not declared|not been declared|unknown type name|does not name a type|fatal error|undeclared",
+    re.I,
+)
+
+
 def _includes_needed_from_evidence(evidence: str) -> list[str]:
     checks = [
         (r"\b(size_t|NULL)\b", "<stddef.h>"),
@@ -364,12 +460,13 @@ def _includes_needed_from_evidence(evidence: str) -> list[str]:
         (r"\b(sqrt|fabs|sin|cos|tan|pow|floor|ceil)\b", "<math.h>"),
         (r"\b(ap_int|ap_uint)\b|ap_int\.h", "<ap_int.h>"),
     ]
-    lowered = evidence.lower()
-    if not re.search(r"not declared|not been declared|unknown type name|does not name a type|fatal error|undeclared", lowered):
+    diagnostic_lines = [line for line in evidence.splitlines() if _MISSING_DECLARATION_RE.search(line)]
+    if not diagnostic_lines:
         return []
+    scope = "\n".join(diagnostic_lines)
     needed: list[str] = []
     for pattern, header in checks:
-        if re.search(pattern, evidence):
+        if re.search(pattern, scope):
             needed.append(header)
     return list(dict.fromkeys(needed))
 
@@ -392,8 +489,18 @@ def _repair_missing_standard_includes(project_dir: Path, evidence: str) -> list[
     return [change] if change else []
 
 
+_PREPROC_CONDITIONAL_LINE_RE = re.compile(r"\s*#\s*(?:define|undef|ifdef|ifndef|if|elif)\b")
+
+
 def _replace_restrict_tokens(text: str) -> str:
-    return re.sub(r"(?<!_)\brestrict\b(?!__)", "__restrict__", text)
+    """Rewrite C99 restrict in code without corrupting support-block macros."""
+
+    return "\n".join(
+        line
+        if _PREPROC_CONDITIONAL_LINE_RE.match(line)
+        else re.sub(r"(?<!_)\brestrict\b(?!__)", "__restrict__", line)
+        for line in text.split("\n")
+    )
 
 
 def _ensure_testbench_restrict_macro(text: str) -> str:

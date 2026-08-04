@@ -629,6 +629,10 @@ def render(spec: dict) -> str:
     add("  wire ap_done, ap_idle, ap_ready;")
     add("  integer errors = 0;")
     add("  integer warns = 0;")
+    # Fail closed when vectors are absent or the design has nothing observable. A missing
+    # $readmemh file otherwise leaves an X loop bound, which silently executes zero times.
+    add("  integer checked_compares = 0;")
+    add("  integer advisory_compares = 0;")
     add("  integer t, i;")
 
     for scalar in scalars:
@@ -764,28 +768,50 @@ def render(spec: dict) -> str:
         advisory = bool(array.get("advisory"))
         kind = "WARN" if advisory else "MISMATCH"
         counter = "warns" if advisory else "errors"
-        add(f"      for (i = 0; i < {name}_cmp[t]; i = i + 1) begin")
-        add(f"        if ({name}_ram[i] !== {name}_exp[t*{depth} + i]) begin")
-        add(f'          $display("RTL_TB: {kind} test=%0d {name}[%0d] expected=%h actual=%h", t, i, {name}_exp[t*{depth} + i], {name}_ram[i]);')
-        add(f"          {counter} = {counter} + 1;")
+        compare_counter = "advisory_compares" if advisory else "checked_compares"
+        add(f"      if (^{name}_cmp[t] === 1'bx) begin")
+        add(f'        $display("RTL_TB: FAIL test=%0d {name} compare-count is X ({vdir}/rtl_cmp_{name}.mem missing or short)", t);')
+        add("        errors = errors + 1;")
+        add("      end else begin")
+        add(f"        for (i = 0; i < {name}_cmp[t]; i = i + 1) begin")
+        add(f"          if (^{name}_exp[t*{depth} + i] === 1'bx) begin")
+        add(f'            $display("RTL_TB: FAIL test=%0d {name}[%0d] expected word is X ({vdir}/rtl_exp_{name}.mem missing or short)", t, i);')
+        add("            errors = errors + 1;")
+        add("          end else begin")
+        add(f"            {compare_counter} = {compare_counter} + 1;")
+        add(f"            if ({name}_ram[i] !== {name}_exp[t*{depth} + i]) begin")
+        add(f'              $display("RTL_TB: {kind} test=%0d {name}[%0d] expected=%h actual=%h", t, i, {name}_exp[t*{depth} + i], {name}_ram[i]);')
+        add(f"              {counter} = {counter} + 1;")
+        add("            end")
+        add("          end")
         add("        end")
         add("      end")
     if ret is not None:
         advisory = bool(ret.get("advisory"))
         kind = "WARN" if advisory else "MISMATCH"
         counter = "warns" if advisory else "errors"
-        add("      if (ret_actual !== ret_exp[t]) begin")
-        add(f'        $display("RTL_TB: {kind} test=%0d return expected=%h actual=%h", t, ret_exp[t], ret_actual);')
-        add(f"        {counter} = {counter} + 1;")
+        compare_counter = "advisory_compares" if advisory else "checked_compares"
+        add("      if (^ret_exp[t] === 1'bx) begin")
+        add(f'        $display("RTL_TB: FAIL test=%0d expected return is X ({vdir}/rtl_exp_return.mem missing or short)", t);')
+        add("        errors = errors + 1;")
+        add("      end else begin")
+        add(f"        {compare_counter} = {compare_counter} + 1;")
+        add("        if (ret_actual !== ret_exp[t]) begin")
+        add(f'          $display("RTL_TB: {kind} test=%0d return expected=%h actual=%h", t, ret_exp[t], ret_actual);')
+        add(f"          {counter} = {counter} + 1;")
+        add("        end")
         add("      end")
     add("    end")
     has_observable = any(a["dir"] in ("output", "inout") for a in arrays) or ret is not None
     if not has_observable:
-        # A void top with no output/inout array has nothing observable to check, so a bare
-        # "PASS" would be vacuous. Say so explicitly instead of implying equivalence.
-        add('    $display("RTL_TB: NOTE no observable outputs to compare; PASS means the design only reached ap_done");')
-    add('    if (errors == 0) $display("RTL_TB: PASS %0d tests (%0d advisory warnings)", NUM_TESTS, warns);')
-    add('    else $display("RTL_TB: FAIL %0d mismatches (%0d advisory warnings)", errors, warns);')
+        add('    $display("RTL_TB: NOTE no observable outputs to compare; this cannot prove anything about the design");')
+    add("    if (checked_compares == 0 && advisory_compares == 0) begin")
+    add('      $display("RTL_TB: FAIL no comparisons were performed (compares=0); golden vectors are missing or nothing is observable");')
+    add("      errors = errors + 1;")
+    add("    end")
+    add('    if (errors != 0) $display("RTL_TB: FAIL %0d mismatches (%0d advisory warnings)", errors, warns);')
+    add('    else if (checked_compares == 0) $display("RTL_TB: ADVISORY %0d advisory comparisons only, %0d warnings; outputs were not effectively checked", advisory_compares, warns);')
+    add('    else $display("RTL_TB: PASS %0d tests (%0d checked comparisons, %0d advisory warnings)", NUM_TESTS, checked_compares, warns);')
     add("    $finish;")
     add("  end")
 
@@ -875,11 +901,34 @@ def find_rtl_dir() -> Path | None:
     return None
 
 
+def required_vectors(spec: dict) -> list[str]:
+    names: list[str] = []
+    for array in spec.get("arrays", []):
+        if array.get("dir") in ("input", "inout"):
+            names.append(f"rtl_vec_{array['name']}.mem")
+        if array.get("dir") in ("output", "inout"):
+            names.append(f"rtl_exp_{array['name']}.mem")
+            names.append(f"rtl_cmp_{array['name']}.mem")
+    for scalar in spec.get("scalars", []):
+        names.append(f"rtl_scalar_{scalar['name']}.mem")
+    if spec.get("ret") is not None:
+        names.append("rtl_exp_return.mem")
+    return names
+
+
+def missing_vectors(spec: dict) -> list[str]:
+    vdir = ROOT / spec.get("vectors_dir", "rtl_vectors")
+    return [
+        name
+        for name in required_vectors(spec)
+        if not (vdir / name).is_file() or (vdir / name).stat().st_size == 0
+    ]
+
+
 def ensure_vectors(spec: dict, logs: list) -> bool:
     vdir = ROOT / spec.get("vectors_dir", "rtl_vectors")
-    top = spec["top"]
-    needed = vdir.exists() and any(vdir.glob("rtl_*.mem"))
-    if needed and not os.environ.get("C2HLSC_RTL_FORCE_VECTORS"):
+    missing = missing_vectors(spec)
+    if not missing and not os.environ.get("C2HLSC_RTL_FORCE_VECTORS"):
         return True
     cxx = os.environ.get("CXX", "g++")
     if shutil.which(cxx) is None:
@@ -894,7 +943,13 @@ def ensure_vectors(spec: dict, logs: list) -> bool:
         return False
     ran = run([str(exe)])
     logs.append({"cmd": [str(exe)], "returncode": ran.returncode, "stdout": ran.stdout[-2000:], "stderr": ran.stderr[-2000:]})
-    return ran.returncode == 0
+    if ran.returncode != 0:
+        return False
+    still_missing = missing_vectors(spec)
+    if still_missing:
+        logs.append({"missing_vectors": still_missing})
+        return False
+    return True
 
 
 def generate_sv(spec: dict, rtl_dir: Path | None, logs: list) -> Path:
@@ -981,8 +1036,14 @@ def main() -> int:
         return 0
 
     passed = "RTL_TB: PASS" in stdout
+    advisory = "RTL_TB: ADVISORY" in stdout
     failed = "RTL_TB: FAIL" in stdout or "RTL_TB: MISMATCH" in stdout
-    status = "pass" if (passed and not failed) else "fail"
+    if failed or not (passed or advisory):
+        status = "fail"
+    elif passed:
+        status = "pass"
+    else:
+        status = "advisory"
     write_report({
         "status": status,
         "policy_id": spec.get("policy_id"),
@@ -993,7 +1054,7 @@ def main() -> int:
         "commands": logs,
     })
     print(f"RTL cosim {status}: report written to {REPORT_PATH}")
-    return 0 if status == "pass" else 1
+    return 0 if status in ("pass", "advisory") else 1
 
 
 if __name__ == "__main__":

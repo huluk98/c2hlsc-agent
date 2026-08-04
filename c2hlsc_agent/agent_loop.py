@@ -202,8 +202,21 @@ def _phase_text(state: VerificationState, phase: str) -> str:
     return "\n".join(part for part in (result.summary, result.stdout, result.stderr) if part)
 
 
+# This wording is authored by the verifier in ``PhaseResult.summary``. Looking only at
+# the summary prevents an arbitrary tool log that happens to mention a timeout from
+# spoofing the infrastructure classification.
+_TOOL_TIMEOUT_RE = re.compile(r"timed out after \d+(?:\.\d+)?", re.IGNORECASE)
+
+
+def _is_tool_timeout(state: VerificationState, phase: str) -> bool:
+    result = state.phases.get(phase)
+    return result is not None and bool(_TOOL_TIMEOUT_RE.search(result.summary or ""))
+
+
 def classify_log_family(phase: str, text: str) -> str:
     lowered = text.lower()
+    if "make not found" in lowered:
+        return "host_toolchain_unavailable"
     if "local-hls backend" in lowered:
         # A local-hls (Bambu) csynth/cosim failure: the backend synthesizes the
         # golden C, so this is a backend/toolchain limitation, not a repairable
@@ -212,6 +225,7 @@ def classify_log_family(phase: str, text: str) -> str:
     if (
         "vitis_hls not found" in lowered
         or "remote vitis unavailable" in lowered
+        or "vitis toolchain unavailable" in lowered
         or ("vitis" in lowered and "not found" in lowered)
     ):
         return "toolchain_unavailable"
@@ -256,6 +270,18 @@ def classify_failure(
     if software_status == "fail":
         text = _phase_text(state, "software_equivalence")
         family = classify_log_family("software_equivalence", text)
+        if family == "host_toolchain_unavailable":
+            return FailureAnalysis(
+                family=family,
+                owner_agent="cosim_operator",
+                next_action=(
+                    "Install the host build toolchain (make plus a C++17 compiler), "
+                    "then rerun host equivalence."
+                ),
+                evidence_needed=("PATH", "make lookup result", "compiler version"),
+                repair_scope="host build environment",
+                status="blocked",
+            )
         if family == "behavioral_mismatch":
             return FailureAnalysis(
                 family="host_behavior_mismatch",
@@ -361,8 +387,26 @@ def classify_failure(
                 family=family,
                 owner_agent="cosim_operator",
                 next_action="Install or activate Vitis HLS on PATH, then rerun the verifier from CSim.",
-                evidence_needed=("PATH", "vitis_hls lookup result", "tool version"),
+                evidence_needed=("PATH", "Vitis launcher lookup result", "tool version"),
                 repair_scope="local toolchain environment",
+                status="blocked",
+            )
+        if phase in {"csim", "csynth"} and _is_tool_timeout(state, phase):
+            return FailureAnalysis(
+                family="tool_timeout",
+                owner_agent="cosim_operator",
+                next_action=(
+                    f"{phase} hit its wall-clock deadline; no verdict was reached. Raise "
+                    "the phase timeout or free the machine/licence and rerun the verifier "
+                    "from CSim. The HLS-C is left untouched — a timeout is not evidence "
+                    "of a code defect."
+                ),
+                evidence_needed=(
+                    "partial phase log",
+                    "phase timeout value",
+                    "tool and host load state",
+                ),
+                repair_scope="tool invocation and timeouts (no HLS-C mutation)",
                 status="blocked",
             )
         if phase == "cosim" and family in {"behavioral_mismatch", "cosim_failure", "timeout_or_deadlock"}:

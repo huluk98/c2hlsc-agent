@@ -167,10 +167,18 @@ def _parse_cosim(stdout: str, returncode: int) -> tuple[bool, str]:
     """Bambu returns a non-zero exit code on any failure, including a C/RTL
     mismatch (its generated testbench self-checks each vector against the C
     reference). A clean exit with an "executions" summary is a real cosim pass."""
+    # Fatal Bambu markers override both the process code and a later execution summary.
+    # Successful container runs may contain the benign text
+    # ``Warning: Returned error code!``; that is intentionally not part of this gate.
+    for line in stdout.splitlines():
+        lowered = line.lower()
+        if (
+            "error ->" in lowered
+            or "co-simulation main aborted" in lowered
+            or "simulation not correct" in lowered
+        ):
+            return False, line.strip()[:200]
     if returncode != 0:
-        for line in stdout.splitlines():
-            if "error ->" in line.lower():  # Bambu's fatal-error prefix
-                return False, line.strip()[:200]
         return False, f"Bambu exited {returncode} during synthesis/co-simulation"
     # Require POSITIVE evidence that vectors actually ran. Exit 0 alone is not a cosim
     # pass: if --simulate degrades (rejected testbench XML, a simulator Bambu accepts but
@@ -190,6 +198,23 @@ def _parse_cosim(stdout: str, returncode: int) -> tuple[bool, str]:
         f"{BACKEND_LOG_TAG} Bambu exited 0 but produced no co-simulation summary "
         "('Number of executions' absent) — cannot confirm any C/RTL comparison ran"
     )
+
+
+def _publish_rtl(project_dir: Path, produced: list[Path]) -> None:
+    """Publish exactly this Bambu run's signed-off Verilog into ``rtl/``.
+
+    A failed run must leave no prior netlist behind for the PPA or optimization paths to
+    mistake for current evidence.
+    """
+
+    rtl_dir = project_dir / "rtl"
+    if not produced and not rtl_dir.exists():
+        return
+    rtl_dir.mkdir(exist_ok=True)
+    for stale in rtl_dir.glob("*.v"):
+        stale.unlink()
+    for verilog in produced:
+        shutil.copy2(verilog, rtl_dir / verilog.name)
 
 
 @dataclass
@@ -232,6 +257,11 @@ class LocalHlsCosim:
         verification ladder the Vitis path fills.
         """
         work = project_dir / ".bambu"
+        # ``--no-clean`` otherwise lets a prior invocation's netlist certify the next
+        # design. Recreate the private work tree before every run so all discovered RTL
+        # belongs to this invocation.
+        if work.exists():
+            shutil.rmtree(work)
         work.mkdir(parents=True, exist_ok=True)
         spec = work / "spec.c"
         spec.write_text(Path(self.golden_c).read_text(encoding="utf-8"), encoding="utf-8")
@@ -267,33 +297,41 @@ class LocalHlsCosim:
             output = (exc.output or "") + f"\n[timed out after {self.timeout}s]"
             log = self._write_report(project_dir, "cosim", output)
             fail = PhaseResult("cosim", "fail", log_path=log, summary=f"{BACKEND_LOG_TAG} Bambu timed out after {self.timeout}s")
+            _publish_rtl(project_dir, [])
             return {
                 "csim": PhaseResult("csim", "pass", summary="covered by host software_equivalence (local-hls)"),
                 "csynth": PhaseResult("csynth", "fail", summary=f"{BACKEND_LOG_TAG} Bambu synthesis timed out"),
                 "cosim": fail,
             }
 
-        # Collect the synthesized RTL into the project's rtl/ dir for inspection/reuse.
         produced = sorted(work.glob("*.v"))
-        synth_ok = bool(produced)
-        if synth_ok:
-            rtl_dir = project_dir / "rtl"
-            rtl_dir.mkdir(exist_ok=True)
-            for verilog in produced:
-                shutil.copy2(verilog, rtl_dir / verilog.name)
-
+        # A partial netlist plus a non-zero process status is not synthesis evidence.
+        synth_ok = bool(produced) and returncode == 0
         csynth_log = self._write_report(project_dir, "csynth", output)
         if not synth_ok:
+            if produced:
+                _, detail = _parse_cosim(output, returncode)
+                reason = (
+                    f"Bambu exited {returncode} (synthesis and/or co-simulation failed): "
+                    f"{detail}"
+                )
+            else:
+                reason = "Bambu produced no Verilog (synthesis failed)"
+            _publish_rtl(project_dir, [])
             return {
                 "csim": PhaseResult("csim", "pass", summary="covered by host software_equivalence (local-hls)"),
                 "csynth": PhaseResult(
                     "csynth", "fail", returncode, output[-4000:], "", csynth_log,
-                    f"{BACKEND_LOG_TAG} Bambu produced no Verilog (synthesis failed)",
+                    f"{BACKEND_LOG_TAG} {reason}",
                 ),
                 "cosim": PhaseResult("cosim", "blocked", summary="csynth failed"),
             }
 
         cosim_ok, cosim_summary = _parse_cosim(output, returncode)
+        # A netlist is reusable evidence only after the same invocation's C/RTL check
+        # passes. Some wrapped tools return zero while printing a mismatch marker, so the
+        # process code alone cannot authorize publication.
+        _publish_rtl(project_dir, produced if cosim_ok else [])
         if not cosim_ok:
             cosim_summary = f"{BACKEND_LOG_TAG} {cosim_summary}"
         cosim_log = self._write_report(project_dir, "cosim", output)

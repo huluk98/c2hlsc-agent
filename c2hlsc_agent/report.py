@@ -95,6 +95,13 @@ def write_reports(
     report_files = ["conversion_report.md", "conversion_report.json", KNOWLEDGE_GRAPH_FILENAME]
     if repairs:
         report_files.append(REPAIR_AUDIT_FILENAME)
+    ppa_phase = state.phases.get("ppa")
+    ppa_phase_line = ""
+    if ppa_phase is not None:
+        # A failing PPA criterion changes final_status, so expose its verdict and reason
+        # beside the other gates instead of leaving a headline FAIL unexplained.
+        detail = f" — {ppa_phase.summary}" if ppa_phase.summary else ""
+        ppa_phase_line = f'- PPA workflow criteria: `{ppa_phase.status}`{detail}'
 
     md = f"""# c2hlsc_agent Conversion Report
 
@@ -159,6 +166,7 @@ def write_reports(
 - C simulation: `{state.status_for("csim")}`
 - C synthesis: `{state.status_for("csynth")}`
 - C/RTL co-simulation: `{state.status_for("cosim")}`
+{ppa_phase_line}
 - Iterations: {iterations}
 
 ## Multi-Agent Loop Assessment

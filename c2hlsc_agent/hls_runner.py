@@ -13,6 +13,10 @@ from .vitis_command import find_vitis_executable, vitis_tcl_command
 SHIFT_LEFT_PHASES = ("shift_left_trace", "coverage_gcov", "symbolic_klee")
 PHASE_ORDER = ("software_equivalence", *SHIFT_LEFT_PHASES, "csim", "csynth", "cosim")
 PHASE_TIMEOUTS = {"csim": 600, "csynth": 1200, "cosim": 600}
+# Runner-authored timeout summaries use this phrase.  ``agent_loop`` keys on the
+# summary (not arbitrary tool output) so a killed process is treated as missing
+# infrastructure evidence rather than proof that the current HLS-C is defective.
+TOOL_TIMEOUT_MARKER = "timed out after"
 _RELATIONAL_KLEE_SCHEMA = "c2hlsc-klee-report-v1"
 _RELATIONAL_KLEE_SCOPE = "golden_hlsc_relational"
 _RELATIONAL_KLEE_NAME_RE = re.compile(
@@ -70,7 +74,10 @@ def _timeout_result(project_dir: Path, phase: str, exc: subprocess.TimeoutExpire
         stdout=str(exc.output or ""),
         stderr=str(exc.stderr or ""),
         log_path=log_path if log_path.exists() else None,
-        summary=f"{label} timed out after {exc.timeout}s",
+        summary=(
+            f"{label} {TOOL_TIMEOUT_MARKER} {exc.timeout}s "
+            "(killed at the deadline; no equivalence verdict was reached)"
+        ),
     )
 
 
@@ -78,7 +85,11 @@ def run_software_equivalence(project_dir: Path, verbose: bool = False) -> PhaseR
     try:
         result = run_command(["make", "test"], project_dir, "software_equivalence", timeout=120)
     except FileNotFoundError:
-        return PhaseResult("software_equivalence", "fail", summary="make not found")
+        return PhaseResult(
+            "software_equivalence",
+            "fail",
+            summary="make not found on PATH — install the host build toolchain (make plus a C++17 compiler)",
+        )
     except subprocess.TimeoutExpired as exc:
         return _timeout_result(project_dir, "software_equivalence", exc, "host equivalence")
     if verbose and result.stdout:
@@ -427,6 +438,18 @@ def _run_vitis_phase(
         )
     except subprocess.TimeoutExpired as exc:
         return _timeout_result(project_dir, phase, exc, f"Vitis {phase}")
+    except OSError as exc:
+        # Missing/unexecutable local launchers and SSH invocation failures are
+        # infrastructure faults. Return a phase result so the report and repair loop can
+        # block safely instead of losing the run to an uncaught exception.
+        if remote is not None:
+            message = f"remote vitis unavailable: running {phase} on {remote.host} failed: {exc}"
+        else:
+            message = (
+                f"Vitis toolchain unavailable: launcher {vitis_bin!r} is not runnable "
+                f"for {phase}: {exc}"
+            )
+        return PhaseResult(phase, "fail", summary=message)
 
 
 def run_vitis(
@@ -516,6 +539,10 @@ _COSIM_FAILURE_MARKERS = (
     "cosim design failed",
     "co-simulation failed",
     "aborting cosim",
+    "aborting co-simulation",
+    "error: [cosim",
+    "error: [sim",
+    "mismatch test=",
 )
 
 VITIS_COSIM_SUCCESS_MARKERS = (

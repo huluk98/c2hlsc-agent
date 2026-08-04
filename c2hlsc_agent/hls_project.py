@@ -154,8 +154,10 @@ rtl-cosim:
 ppa:
 \tpython3 -m c2hlsc_agent.cli ppa --project . {ppa_flags}
 
+# run_all.sh invokes this native launcher and applies the positive CoSim evidence
+# gate: {vitis_command}
 vitis:
-\t{vitis_command}
+\tbash run_all.sh --vitis-only
 
 clean:
 \trm -f $(TB_EXE) $(LEVERI_GOLDEN_EXE) $(LEVERI_HLS_EXE) $(RTL_VECTORS_EXE)
@@ -173,9 +175,35 @@ def render_run_all(config: AgentConfig | None = None) -> str:
     command = shlex.join(vitis_tcl_command(config.vitis_bin, "run_hls.tcl"))
     return f"""#!/usr/bin/env bash
 set -euo pipefail
-make test
+
+VITIS_LOG="${{VITIS_LOG:-vitis_hls_run.log}}"
+
+gate_cosim_log() {{
+  local log="$1"
+  if grep -qiE 'co-simulation finished: fail|cosim design failed|co-simulation failed|aborting co-simulation|aborting cosim|error: \\[(cosim|sim)|mismatch test=' "$log"; then
+    echo "CoSim gate: FAIL - $log reports a co-simulation failure." >&2
+    return 1
+  fi
+  if ! grep -qi 'co-simulation finished: pass' "$log"; then
+    echo "CoSim gate: FAIL - $log carries no positive C/RTL co-simulation PASS verdict." >&2
+    return 1
+  fi
+  echo "CoSim gate: PASS ($log)."
+}}
+
+vitis_only=0
+if [ "${{1:-}}" = "--vitis-only" ]; then
+  vitis_only=1
+else
+  make test
+fi
+
 if command -v {executable} >/dev/null 2>&1; then
-  {command}
+  {command} 2>&1 | tee "$VITIS_LOG"
+  gate_cosim_log "$VITIS_LOG"
+elif [ "$vitis_only" = "1" ]; then
+  echo "Vitis HLS launcher not found; the requested Vitis ladder did not run." >&2
+  exit 127
 else
   echo "Vitis HLS launcher not found; host equivalence completed, Vitis phases skipped." >&2
 fi
