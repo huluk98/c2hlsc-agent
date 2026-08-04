@@ -73,7 +73,24 @@ constructs; the default (`--keep-going`) matches CHStone's own Vitis flow, which
 | --- | --- |
 | native self-check (calibration) | **12/12 pass** |
 | agent, deterministic converter → host equivalence | **0/12** |
+| agent, LLM generator → host equivalence | **2/4** (`dfadd`, `dfmul` pass; `mips`, `sha` fail) |
 | Vitis CSim / CSynth / CoSim | not attempted (no `vitis_hls`) |
+
+The LLM generator is the headline: it clears a bar the deterministic converter cannot reach
+at all. On `dfmul` it emitted a self-contained 566-line translation — the SoftFloat call
+graph inlined into a namespace, `printf` guarded behind `#ifndef __SYNTHESIS__`, the
+256-entry `countLeadingZeros32` table replaced by a branchless cascade — and passed host
+equivalence with `all 100 tests passed`. Each run took 9–13 minutes per benchmark.
+
+The two LLM failures are **not** wrong logic. Both are link-time symbol collisions: the
+golden reference and the generated HLS-C are compiled into one binary, and both define the
+same file-scope globals (`sha_info_count_lo`, `sha_info_data`, `main_result`), so the link
+fails with `multiple definition of ...`. The repo's equivalence testbench macro-renames the
+golden *function* but not its globals. `dfadd` and `dfmul` passed precisely because the
+model chose to wrap its output in a namespace; nothing instructs it to. Two clean fixes:
+tell the generator to namespace unconditionally, or compile the golden as a separate
+translation unit with renamed symbols. Until one lands, treat `mips`/`sha` as a harness
+limitation, not a model result.
 
 The 0/12 is a single, consistent cause, not twelve different failures. Every benchmark
 reaches `generated` and then fails to compile with family
@@ -99,6 +116,23 @@ A second, quieter limitation worth knowing before reading too much into any CHSt
 calling both versions once and comparing a single return value. There are no stimuli to
 vary. It is a genuine check, but a far weaker one than the argument-driven equivalence the
 repo performs on ordinary kernels.
+
+### A harness bug that masked a real result
+
+Worth recording, because it is the exact failure mode this documentation exists to prevent.
+CHStone tops `#include` their sibling sources (`softfloat.c`, `softfloat-macros`,
+`softfloat-specialize`), and the converter copies only `--input` into the project as
+`input.c`. The **golden reference** therefore could not compile, and the first version of
+this harness attributed that to the generated HLS-C — reporting the LLM path as 0/4 when
+`dfmul` and `dfadd` in fact passed. The harness now stages sibling files next to `input.c`,
+re-runs host equivalence, and treats the equivalence log as authoritative over
+`conversion_report.json`'s phase field, which records the state from before staging.
+
+The deterministic converter's 0/12 survived the fix unchanged, and its failures are
+provably on the generated side (`hls_top.cpp` referencing `float64`, `N`, `x1`). `adpcm` is
+single-file, so it had no siblings to stage and failed that way all along — which is why
+the original result looked coherent enough to trust. Calibration is what catches this: if
+the reference cannot build, no candidate result from that run means anything.
 
 ---
 
@@ -170,6 +204,9 @@ nothing to do with the code under test.
 **Does show.** CHStone's 12 programs all self-check clean natively, giving a solid
 calibration rung. The repo's deterministic converter cannot take a whole-program,
 globals-closing top through to compiling HLS-C, and the reason is identical across all 12.
+The LLM generator can: it produced self-contained, documented translations that pass host
+equivalence on 2 of the 4 benchmarks tried, with the other 2 blocked by a fixable
+golden-vs-candidate symbol collision rather than by wrong logic.
 Rosetta's software path builds and runs for all 5 buildable apps, and one of the three
 judgeable apps reproduces its golden output exactly.
 
