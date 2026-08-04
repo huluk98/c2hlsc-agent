@@ -1,0 +1,522 @@
+"""Offline tests for the natural-language -> RTL multi-agent loop.
+
+Everything here is hermetic: a scripted :class:`FakeLLM` stands in for the model and a
+scripted verifier stands in for ``rtllm_bench.evaluate_rtl``, so no ``claude`` CLI, no
+``iverilog``, and no benchmark checkout is required.
+"""
+
+from __future__ import annotations
+
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+from c2hlsc_agent import rtllm_agent
+from c2hlsc_agent.rtllm_agent import (
+    EVIDENCE_LIMIT,
+    RtllmAgentConfig,
+    build_evidence,
+    extract_verilog,
+    run_design,
+)
+from c2hlsc_agent.rtllm_bench import RtllmDesign, SimResult
+
+
+DESCRIPTION = """Please act as a professional verilog designer.
+
+Implement a module of an 8-bit adder with multiple bit-level adders in combinational logic.
+
+Module name:
+    adder_8bit
+Input ports:
+    a[7:0]: 8-bit input operand A.
+    b[7:0]: 8-bit input operand B.
+    cin: Carry-in input.
+Output ports:
+    sum[7:0]: 8-bit output representing the sum of A and B.
+    cout: Carry-out output.
+
+Give me the complete code.
+"""
+
+GOLDEN_TB_MARKER = "GOLDEN_TESTBENCH_MARKER_DO_NOT_LEAK"
+GOLDEN_REF_MARKER = "GOLDEN_REFERENCE_MARKER_DO_NOT_LEAK"
+
+DESIGN_RTL = """module adder_8bit(
+  input  [7:0] a,
+  input  [7:0] b,
+  input        cin,
+  output [7:0] sum,
+  output       cout
+);
+  assign {cout, sum} = a + b + cin;
+endmodule
+"""
+
+
+def _make_design(tmp: Path, name: str = "adder_8bit") -> RtllmDesign:
+    directory = tmp / name
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "design_description.txt").write_text(DESCRIPTION, encoding="utf-8")
+    testbench = directory / "testbench.v"
+    testbench.write_text(
+        f"`timescale 1ns / 1ps\nmodule testbench;\n  // {GOLDEN_TB_MARKER}\n  initial $display(\"Pass\");\nendmodule\n",
+        encoding="utf-8",
+    )
+    reference = directory / "verified_adder_8bit.v"
+    reference.write_text(f"// {GOLDEN_REF_MARKER}\n{DESIGN_RTL}", encoding="utf-8")
+    return RtllmDesign(
+        name=name,
+        category="Arithmetic/Adder",
+        directory=directory,
+        description=DESCRIPTION,
+        testbench=testbench,
+        reference_files=(reference,),
+    )
+
+
+def _sim(
+    design: str = "adder_8bit",
+    *,
+    syntax: bool = True,
+    func: bool = False,
+    family: str | None = "functional_mismatch",
+    compile_log: str = "",
+    sim_log: str = "",
+    timed_out: bool = False,
+) -> SimResult:
+    return SimResult(
+        design=design,
+        syntax_pass=syntax,
+        func_pass=func,
+        func_pass_strict=func,
+        timed_out=timed_out,
+        compile_log=compile_log,
+        sim_log=sim_log,
+        duration_s=0.25,
+        failure_family=None if func else family,
+    )
+
+
+class FakeLLM:
+    """Deterministic scripted stand-in for an :class:`~c2hlsc_agent.llm.LLMClient`.
+
+    Each scripted item is either a response string or an exception instance to raise, so a
+    flaky/dead backend can be simulated per call. ``repeat`` keeps returning the last item
+    once the script runs out.
+    """
+
+    def __init__(self, responses, *, repeat: bool = False, model: str = "fake-model") -> None:
+        self.responses = list(responses)
+        self.repeat = repeat
+        self.model = model
+        self.calls: list[tuple[str, str]] = []
+
+    @property
+    def prompts(self) -> str:
+        """Every system+user prompt handed to the client, concatenated."""
+
+        return "\n".join(system + "\n" + user for system, user in self.calls)
+
+    def complete(self, system: str, user: str, *, max_tokens: int = 8000) -> str:
+        self.calls.append((system, user))
+        if not self.responses:
+            raise AssertionError("FakeLLM ran out of scripted responses")
+        item = self.responses[0] if (self.repeat and len(self.responses) == 1) else self.responses.pop(0)
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+
+class FakeVerifier:
+    """Scripted stand-in for ``rtllm_bench.evaluate_rtl`` that records what it was asked to verify."""
+
+    def __init__(self, results) -> None:
+        self.results = list(results)
+        self.calls: list[tuple[str, Path]] = []
+
+    def __call__(self, design, rtl_text, workdir, **kwargs):
+        self.calls.append((rtl_text, Path(workdir)))
+        result = self.results.pop(0) if len(self.results) > 1 else self.results[0]
+        return result
+
+
+def _fenced(body: str, lang: str = "verilog") -> str:
+    return f"```{lang}\n{body}\n```"
+
+
+# --------------------------------------------------------------------------- #
+# extract_verilog
+# --------------------------------------------------------------------------- #
+
+
+class ExtractVerilogTests(unittest.TestCase):
+    def test_fenced_block(self):
+        text = f"Here is the design.\n\n{_fenced(DESIGN_RTL)}\n\nWant a testbench?"
+        code = extract_verilog(text, "adder_8bit")
+        self.assertIn("module adder_8bit", code)
+        self.assertIn("assign {cout, sum}", code)
+        self.assertNotIn("Want a testbench", code)
+        self.assertTrue(code.endswith("endmodule\n"))
+
+    def test_unfenced_module(self):
+        code = extract_verilog(DESIGN_RTL, "adder_8bit")
+        self.assertIn("module adder_8bit", code)
+        self.assertIn("endmodule", code)
+
+    def test_prose_around_unfenced_code(self):
+        text = (
+            "Sure! I will build a ripple-carry adder.\n"
+            "The carry chain propagates from bit 0 upward.\n\n"
+            "`timescale 1ns / 1ps\n"
+            f"{DESIGN_RTL}\n"
+            "Note that this is purely combinational, so no clock is needed.\n"
+        )
+        code = extract_verilog(text, "adder_8bit")
+        self.assertIn("`timescale 1ns / 1ps", code)  # directives survive the preamble filter
+        self.assertIn("module adder_8bit", code)
+        self.assertNotIn("Sure!", code)
+        self.assertNotIn("purely combinational", code)
+
+    def test_volunteered_testbench_is_stripped(self):
+        tb = (
+            "module testbench;\n"
+            "  reg [7:0] a;\n"
+            "  initial begin $display(\"Pass\"); $finish; end\n"
+            "endmodule\n"
+        )
+        alt_tb = "module adder_8bit_tb;\n  initial $finish;\nendmodule\n"
+        text = _fenced(DESIGN_RTL + "\n" + tb + "\n" + alt_tb)
+        code = extract_verilog(text, "adder_8bit")
+        self.assertIn("module adder_8bit", code)
+        self.assertNotIn("module testbench", code)
+        self.assertNotIn("adder_8bit_tb", code)
+        self.assertNotIn("$finish", code)
+        self.assertEqual(code.count("endmodule"), 1)
+
+    def test_helper_submodule_is_kept(self):
+        text = _fenced(
+            "module adder_8bit(input [7:0] a, input [7:0] b, input cin, output [7:0] sum, output cout);\n"
+            "  wire [8:0] c;\n"
+            "  assign c[0] = cin;\n"
+            "  full_adder fa0(a[0], b[0], c[0], sum[0], c[1]);\n"
+            "  assign cout = c[8];\n"
+            "endmodule\n"
+            "\n"
+            "module full_adder(input x, input y, input cin, output s, output cout);\n"
+            "  assign {cout, s} = x + y + cin;\n"
+            "endmodule\n"
+        )
+        code = extract_verilog(text, "adder_8bit")
+        self.assertIn("module adder_8bit", code)
+        self.assertIn("module full_adder", code)
+        self.assertEqual(code.count("endmodule"), 2)
+
+    def test_refusal_and_empty_yield_empty_string(self):
+        self.assertEqual(extract_verilog("", "adder_8bit"), "")
+        self.assertEqual(extract_verilog("I'm sorry, I can't help with that request.", "adder_8bit"), "")
+        # A response with only a testbench leaves nothing to verify.
+        self.assertEqual(
+            extract_verilog(_fenced("module testbench;\ninitial $finish;\nendmodule"), "adder_8bit"),
+            "",
+        )
+
+    def test_wrong_module_name_is_not_silently_renamed(self):
+        wrong = DESIGN_RTL.replace("adder_8bit", "adder8")
+        code = extract_verilog(_fenced(wrong), "adder_8bit")
+        self.assertIn("module adder8", code)
+        self.assertNotIn("adder_8bit", code)  # the verifier must report missing_module
+
+    def test_mislabeled_fence_still_parsed(self):
+        code = extract_verilog(_fenced(DESIGN_RTL, lang="text"), "adder_8bit")
+        self.assertIn("module adder_8bit", code)
+
+    def test_duplicate_definition_keeps_the_last(self):
+        draft = DESIGN_RTL.replace("a + b + cin", "a + b /* DRAFT */")
+        final = DESIGN_RTL.replace("a + b + cin", "a + b + cin /* FINAL */")
+        code = extract_verilog(f"Draft:\n{_fenced(draft)}\nFixed:\n{_fenced(final)}", "adder_8bit")
+        self.assertIn("FINAL", code)
+        self.assertNotIn("DRAFT", code)
+        self.assertEqual(code.count("endmodule"), 1)
+
+    def test_endmodule_not_at_line_start_falls_back_to_slice(self):
+        text = _fenced("module adder_8bit(input a, output b); assign b = a; endmodule")
+        code = extract_verilog(text, "adder_8bit")
+        self.assertIn("module adder_8bit", code)
+        self.assertIn("endmodule", code)
+
+
+# --------------------------------------------------------------------------- #
+# build_evidence (failure_analyst)
+# --------------------------------------------------------------------------- #
+
+
+class BuildEvidenceTests(unittest.TestCase):
+    def test_uses_compile_log_when_it_did_not_compile(self):
+        sim = _sim(
+            syntax=False,
+            family="compile_error",
+            compile_log="adder_8bit.v:3: syntax error near 'assgn'",
+            sim_log="SIM LOG SHOULD NOT APPEAR",
+        )
+        evidence = build_evidence(sim, RtllmAgentConfig())
+        self.assertIn("compile (iverilog)", evidence)
+        self.assertIn("syntax error", evidence)
+        self.assertIn("compile_error", evidence)
+        self.assertIn(rtllm_agent.REPAIR_INTENTS["compile_error"], evidence)
+        self.assertNotIn("SIM LOG SHOULD NOT APPEAR", evidence)
+
+    def test_uses_sim_log_once_it_compiles(self):
+        sim = _sim(compile_log="COMPILE NOISE", sim_log="Failed: sum=8'h05 expected 8'h06")
+        evidence = build_evidence(sim, RtllmAgentConfig())
+        self.assertIn("simulate (vvp)", evidence)
+        self.assertIn("expected 8'h06", evidence)
+        self.assertNotIn("COMPILE NOISE", evidence)
+
+    def test_tail_slices_a_long_log(self):
+        log = ("head marker\n" + "x" * (EVIDENCE_LIMIT * 2)) + "\ntail marker"
+        evidence = build_evidence(_sim(sim_log=log), RtllmAgentConfig())
+        self.assertIn("tail marker", evidence)
+        self.assertNotIn("head marker", evidence)
+        self.assertLess(len(evidence), EVIDENCE_LIMIT + 1000)
+
+    def test_timeout_is_flagged(self):
+        evidence = build_evidence(
+            _sim(family="timeout", timed_out=True, sim_log="still running"), RtllmAgentConfig()
+        )
+        self.assertIn("WATCHDOG", evidence)
+        self.assertIn("timeout", evidence)
+
+    def test_evidence_policy_none_withholds_everything(self):
+        sim = _sim(family="functional_mismatch", sim_log="Failed: sum=8'h05 expected 8'h06")
+        evidence = build_evidence(sim, RtllmAgentConfig(evidence_policy="none"))
+        self.assertNotIn("expected 8'h06", evidence)
+        self.assertNotIn("functional_mismatch", evidence)
+        self.assertIn("blind retry", evidence)
+
+
+# --------------------------------------------------------------------------- #
+# run_design (the loop)
+# --------------------------------------------------------------------------- #
+
+
+class RunDesignTests(unittest.TestCase):
+    def _run(self, client, verifier, config, *, design_name: str = "adder_8bit"):
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            design = _make_design(tmp / "bench", design_name)
+            with mock.patch.object(rtllm_agent, "evaluate_rtl", verifier):
+                return run_design(design, client, config, tmp / "work"), design
+
+    def test_repair_loop_stops_on_first_pass(self):
+        client = FakeLLM([_fenced(DESIGN_RTL), _fenced(DESIGN_RTL.replace("cin;", "cin; // fixed"))])
+        verifier = FakeVerifier([_sim(family="functional_mismatch", sim_log="Failed"), _sim(func=True)])
+        config = RtllmAgentConfig(plan=False, max_repair_rounds=3)
+        result, _design = self._run(client, verifier, config)
+
+        sample = result.samples[0]
+        self.assertEqual([r.role for r in sample.rounds], ["rtl_generator", "rtl_repair_agent"])
+        self.assertTrue(sample.func_pass)
+        self.assertTrue(sample.syntax_pass)
+        self.assertEqual(sample.to_dict()["func_pass_round"], 1)
+        self.assertEqual(len(client.calls), 2)  # no third round once it passes
+        self.assertEqual(len(verifier.calls), 2)
+        self.assertIn("// fixed", sample.final_rtl)
+        self.assertEqual(result.func_success, 1)
+        self.assertEqual(result.syntax_success, 1)
+
+    def test_loop_exhausts_max_repair_rounds(self):
+        client = FakeLLM([_fenced(DESIGN_RTL)], repeat=True)
+        verifier = FakeVerifier([_sim(family="functional_mismatch", sim_log="Failed")])
+        config = RtllmAgentConfig(plan=False, max_repair_rounds=2)
+        result, _design = self._run(client, verifier, config)
+
+        sample = result.samples[0]
+        self.assertEqual([r.round for r in sample.rounds], [0, 1, 2])
+        self.assertEqual(len(verifier.calls), 3)
+        self.assertFalse(sample.func_pass)
+        self.assertTrue(sample.syntax_pass)  # it compiled every round, it just computed wrong
+        self.assertEqual(result.func_success, 0)
+        self.assertEqual(result.syntax_success, 1)
+        self.assertIsNone(sample.to_dict()["func_pass_round"])
+
+    def test_each_round_gets_its_own_workdir(self):
+        # A stale simv/sim binary from a previous round must never be able to fake a
+        # syntax pass, so every attempt verifies in a fresh directory that already exists.
+        client = FakeLLM([_fenced(DESIGN_RTL)], repeat=True)
+        seen: list[bool] = []
+
+        class _DirCheckingVerifier(FakeVerifier):
+            def __call__(self, design, rtl_text, workdir, **kwargs):
+                seen.append(Path(workdir).is_dir())
+                return super().__call__(design, rtl_text, workdir, **kwargs)
+
+        verifier = _DirCheckingVerifier([_sim(syntax=False, family="compile_error", compile_log="err")])
+        config = RtllmAgentConfig(plan=False, max_repair_rounds=1)
+        self._run(client, verifier, config)
+        dirs = [path for _rtl, path in verifier.calls]
+        self.assertEqual(len(set(dirs)), 2)
+        self.assertEqual([d.name for d in dirs], ["round0", "round1"])
+        self.assertEqual(seen, [True, True])
+
+    def test_llm_error_when_the_client_always_fails(self):
+        client = FakeLLM([RuntimeError("claude CLI failed (rc=1)")], repeat=True)
+        verifier = FakeVerifier([_sim(func=True)])
+        config = RtllmAgentConfig(plan=False, max_repair_rounds=2, llm_retries=2)
+        with mock.patch.object(rtllm_agent.time, "sleep") as sleep:
+            result, _design = self._run(client, verifier, config)
+
+        sample = result.samples[0]
+        self.assertEqual(len(sample.rounds), 1)
+        self.assertEqual(sample.rounds[0].role, "rtl_generator")
+        self.assertIn("claude CLI failed", sample.rounds[0].llm_error or "")
+        self.assertFalse(sample.syntax_pass)
+        self.assertFalse(sample.func_pass)
+        self.assertEqual(sample.final_rtl, "")
+        self.assertEqual(len(client.calls), 3)  # 1 + llm_retries
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [2.0, 4.0])
+        self.assertEqual(verifier.calls, [])  # nothing was ever verified
+        self.assertEqual(result.func_success, 0)
+
+    def test_repair_llm_error_keeps_the_generated_candidate(self):
+        client = FakeLLM([_fenced(DESIGN_RTL), OSError("socket hung up")], repeat=True)
+        verifier = FakeVerifier([_sim(family="functional_mismatch", sim_log="Failed")])
+        config = RtllmAgentConfig(plan=False, max_repair_rounds=2, llm_retries=0)
+        result, _design = self._run(client, verifier, config)
+
+        sample = result.samples[0]
+        self.assertEqual([r.role for r in sample.rounds], ["rtl_generator", "rtl_repair_agent"])
+        self.assertIn("socket hung up", sample.rounds[1].llm_error or "")
+        self.assertIn("module adder_8bit", sample.final_rtl)
+        self.assertTrue(sample.syntax_pass)
+        self.assertFalse(sample.func_pass)
+
+    def test_planner_failure_is_not_fatal(self):
+        client = FakeLLM([RuntimeError("planner down"), _fenced(DESIGN_RTL)])
+        verifier = FakeVerifier([_sim(func=True)])
+        config = RtllmAgentConfig(plan=True, max_repair_rounds=0, llm_retries=0)
+        result, _design = self._run(client, verifier, config)
+
+        sample = result.samples[0]
+        self.assertIsNone(sample.contract)
+        self.assertIn("planner down", sample.plan_error or "")
+        self.assertTrue(sample.func_pass)
+
+    def test_contract_from_planner_reaches_the_generator(self):
+        contract = "Module: adder_8bit\nPorts: a | input | [7:0] | operand A"
+        client = FakeLLM([contract, _fenced(DESIGN_RTL)])
+        verifier = FakeVerifier([_sim(func=True)])
+        config = RtllmAgentConfig(plan=True, max_repair_rounds=0)
+        result, _design = self._run(client, verifier, config)
+
+        self.assertEqual(result.samples[0].contract, contract)
+        generator_prompt = client.calls[1][1]
+        self.assertIn("Ports: a | input | [7:0] | operand A", generator_prompt)
+        self.assertIn("rtl_planner", generator_prompt)
+
+    def test_evidence_policy_none_withholds_tool_output_from_the_repair_prompt(self):
+        client = FakeLLM([_fenced(DESIGN_RTL)], repeat=True)
+        verifier = FakeVerifier(
+            [_sim(family="functional_mismatch", sim_log="Failed: sum=8'h05 expected 8'h06")]
+        )
+        config = RtllmAgentConfig(plan=False, max_repair_rounds=1, evidence_policy="none")
+        result, _design = self._run(client, verifier, config)
+
+        repair_prompt = client.calls[1][1]
+        self.assertNotIn("expected 8'h06", repair_prompt)
+        self.assertNotIn("functional_mismatch", repair_prompt)
+        self.assertIn("blind retry", repair_prompt)
+        # The candidate itself is still shown -- only the tool output is withheld.
+        self.assertIn("module adder_8bit", repair_prompt)
+        # And the setting is recorded, so a report cannot claim the logs were used.
+        self.assertEqual(result.samples[0].to_dict()["evidence_policy"], "none")
+
+    def test_evidence_policy_logs_passes_tool_output(self):
+        client = FakeLLM([_fenced(DESIGN_RTL)], repeat=True)
+        verifier = FakeVerifier(
+            [_sim(family="functional_mismatch", sim_log="Failed: sum=8'h05 expected 8'h06")]
+        )
+        config = RtllmAgentConfig(plan=False, max_repair_rounds=1)
+        result, _design = self._run(client, verifier, config)
+
+        repair_prompt = client.calls[1][1]
+        self.assertIn("expected 8'h06", repair_prompt)
+        self.assertIn("functional_mismatch", repair_prompt)
+        self.assertEqual(result.samples[0].to_dict()["evidence_policy"], "logs")
+
+    def test_golden_rtl_and_testbench_never_reach_the_model(self):
+        client = FakeLLM(
+            ["Module: adder_8bit", _fenced(DESIGN_RTL), _fenced(DESIGN_RTL), _fenced(DESIGN_RTL)]
+        )
+        verifier = FakeVerifier(
+            [_sim(syntax=False, family="compile_error", compile_log="adder_8bit.v:3: syntax error")]
+        )
+        config = RtllmAgentConfig(plan=True, max_repair_rounds=2)
+        _result, design = self._run(client, verifier, config)
+
+        prompts = client.prompts
+        self.assertEqual(len(client.calls), 4)  # plan + generate + 2 repairs
+        self.assertNotIn(GOLDEN_TB_MARKER, prompts)
+        self.assertNotIn(GOLDEN_REF_MARKER, prompts)
+        self.assertNotIn("verified_adder_8bit", prompts)
+        self.assertNotIn(str(design.testbench), prompts)
+        self.assertNotIn("testbench.v", prompts)
+        # ... while the natural-language description is present in every prompt.
+        for _system, user in client.calls:
+            self.assertIn("8-bit input operand A", user)
+
+    def test_harness_defect_family_is_not_repaired(self):
+        client = FakeLLM([_fenced(DESIGN_RTL)], repeat=True)
+        verifier = FakeVerifier(
+            [_sim(family="missing_golden_data", sim_log="ERROR: cannot open reference.dat")]
+        )
+        config = RtllmAgentConfig(plan=False, max_repair_rounds=3)
+        result, _design = self._run(client, verifier, config)
+
+        self.assertEqual(len(result.samples[0].rounds), 1)
+        self.assertEqual(len(client.calls), 1)
+
+    def test_samples_are_counted_the_way_pass_at_k_expects(self):
+        client = FakeLLM([_fenced(DESIGN_RTL)], repeat=True)
+        results = [_sim(func=True), _sim(syntax=False, family="compile_error", compile_log="err")]
+        verifier = FakeVerifier(results + [results[-1]])
+        config = RtllmAgentConfig(plan=False, max_repair_rounds=0, samples=2)
+        result, _design = self._run(client, verifier, config)
+
+        self.assertEqual(len(result.samples), 2)
+        self.assertEqual([s.sample for s in result.samples], [0, 1])
+        self.assertEqual(result.func_success, 1)
+        self.assertEqual(result.syntax_success, 1)
+        payload = result.to_dict()
+        self.assertEqual(payload["n_samples"], 2)
+        self.assertEqual(payload["design"], "adder_8bit")
+        self.assertEqual(payload["category"], "Arithmetic/Adder")
+
+    def test_log_callback_is_the_only_output_channel(self):
+        client = FakeLLM([_fenced(DESIGN_RTL)], repeat=True)
+        verifier = FakeVerifier([_sim(func=True)])
+        messages: list[str] = []
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            design = _make_design(tmp / "bench")
+            with mock.patch.object(rtllm_agent, "evaluate_rtl", verifier):
+                run_design(
+                    design,
+                    client,
+                    RtllmAgentConfig(plan=False, max_repair_rounds=0),
+                    tmp / "work",
+                    log=messages.append,
+                )
+        self.assertTrue(any("round 0" in m for m in messages))
+
+    def test_missing_client_is_reported_as_an_llm_error(self):
+        verifier = FakeVerifier([_sim(func=True)])
+        config = RtllmAgentConfig(plan=False, max_repair_rounds=1)
+        result, _design = self._run(None, verifier, config)
+        self.assertIn("no LLM client", result.samples[0].rounds[0].llm_error or "")
+        self.assertEqual(verifier.calls, [])
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -32,6 +32,11 @@ Simulator notes (measured on this benchmark checkout with iverilog 12.0):
   a small, semantics-preserving rewrite to a *copy* of the testbench -- see
   ``TESTBENCH_SHIMS``. Each shim was verified to (a) compile and pass with the benchmark's
   own reference RTL and (b) still fail on obviously wrong RTL.
+
+With both of those in place the **oracle ceiling** measured on RTLLM v2.0 with iverilog 12.0
+is 50/50 syntax and 47/50 functional, for the official and the strict oracle alike; the
+three shortfalls are listed in ``KNOWN_ORACLE_ISSUES``. An agent cannot beat 47/50 here, so
+report agent scores against that ceiling rather than against 50.
 """
 
 from __future__ import annotations
@@ -95,20 +100,28 @@ FAILURE_FAMILIES = (
 )
 
 #: Designs whose oracle is broken independently of the RTL under test. Measured on this
-#: checkout by running the benchmark's own ``verified_*.v`` through its own testbench.
+#: checkout by running the benchmark's own ``verified_*.v`` through its own testbench with
+#: this module: 50/50 compile, 47/50 pass, and these three are the whole remainder.
+#:
+#: Note what is *not* here: ``alu``, ``calendar`` and ``signal_generator`` look unpassable
+#: if the sandbox only copies ``testbench.v``, because their ``$readmemh`` golden data
+#: ships as ``reference.dat`` / ``reference.txt`` / ``tri_gen.txt`` inside the design
+#: directory. ``evaluate_rtl`` copies those support files, and all three then pass.
 KNOWN_ORACLE_ISSUES = {
     "clkgenerator": (
         "Upstream oracle bug: the benchmark's own verified_clkgenerator.v fails its own "
-        "testbench under iverilog (20 'Failed at' lines, no pass banner), so no RTL can score."
+        "testbench under iverilog ('Test completed with 20 failures'), so no RTL can score."
     ),
     "radix2_div": (
         "Upstream oracle bug: the benchmark's own verified_radix2_div.v fails its own "
-        "testbench under iverilog (3 'Error: dividend=...' lines), so no RTL can score."
+        "testbench under iverilog (3 'Error: dividend=...' lines then "
+        "'===========Failed==========='), so no RTL can score."
     ),
     "ring_counter": (
         "Simulator-ordering bug: the testbench's two always @(posedge clk) blocks race, and "
         "iverilog runs the 'i = i + 1' block before the 'if (i == 9)' pass check, so the "
-        "banner never prints -- the reference RTL matches all 10 expected values yet scores 0."
+        "banner never prints -- the reference RTL matches all 10 expected values (no 'Failed "
+        "at' line) yet the run ends silently at t=100 and scores 0."
     ),
 }
 
@@ -458,11 +471,18 @@ def shim_rationale(design_name: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+#: Prefix stamped on a truncated log. Fixed length so ``_tail`` output is exactly
+#: ``LOG_TAIL_CHARS`` and ``SimResult.to_dict``'s defensive re-slice cannot eat the marker.
+_TRUNCATION_MARKER = "...[log truncated]...\n"
+
+
 def _tail(text: str, limit: int = LOG_TAIL_CHARS) -> str:
+    """Keep the last ``limit`` characters: a tool's failure signature is at the END."""
+
     text = text or ""
     if len(text) <= limit:
         return text
-    return "...[%d chars truncated]...\n" % (len(text) - limit) + text[-limit:]
+    return _TRUNCATION_MARKER + text[-(limit - len(_TRUNCATION_MARKER)) :]
 
 
 def _run(command: "list[str]", cwd: Path, timeout: int) -> "tuple[int | None, str, str, bool]":
@@ -553,22 +573,42 @@ def evaluate_rtl(
 
     workdir = Path(workdir)
     started = time.time()
-    shim_applied = False
     try:
-        shim_applied = _prepare_workdir(design, rtl_text, workdir, apply_shims)
-    except OSError as exc:
+        return _evaluate_rtl(
+            design,
+            rtl_text,
+            workdir,
+            started,
+            compile_timeout=compile_timeout,
+            sim_timeout=sim_timeout,
+            apply_shims=apply_shims,
+        )
+    except Exception as exc:  # pragma: no cover - a harness crash must not kill a sweep
         return SimResult(
             design=design.name,
             syntax_pass=False,
             func_pass=False,
             func_pass_strict=False,
             timed_out=False,
-            compile_log="failed to prepare sandbox %s: %s" % (workdir, exc),
+            compile_log="rtllm_bench failed to evaluate %s in %s: %r" % (design.name, workdir, exc),
             sim_log="",
             duration_s=time.time() - started,
             failure_family="compile_error",
             shim_applied=False,
         )
+
+
+def _evaluate_rtl(
+    design: RtllmDesign,
+    rtl_text: str,
+    workdir: Path,
+    started: float,
+    *,
+    compile_timeout: int,
+    sim_timeout: int,
+    apply_shims: bool,
+) -> SimResult:
+    shim_applied = _prepare_workdir(design, rtl_text, workdir, apply_shims)
 
     compile_cmd = [
         "iverilog",

@@ -981,3 +981,47 @@ its Claude repair call, another record's Vitis ladder keeps the machine busy. Bo
 output files are appended and flushed per record, so an interrupted run keeps all
 finished records — rerun with `--resume` to skip record_ids already in
 `results.jsonl` instead of overwriting it and starting over.
+
+## RTLLM-V2 Benchmark
+
+[RTLLM v2.0](https://github.com/hkust-zhiyao/RTLLM) is 50 natural-language RTL design
+tasks, each shipping its own Verilog testbench. `scripts/run_rtllm_v2.py` runs the same
+verifier-closed loop this repo uses for C→HLS-C — `rtl_planner` → `rtl_generator` →
+verifier → `failure_analyst` → `rtl_repair_agent` — with **Icarus Verilog**
+(`iverilog -g2012` + `vvp`) standing in for the Vitis ladder, so no Vitis, VCS, or API
+key is required:
+
+```bash
+sudo apt-get install -y iverilog
+git clone https://github.com/hkust-zhiyao/RTLLM.git ~/benchmarks/RTLLM
+export RTLLM_ROOT=~/benchmarks/RTLLM
+```
+
+Run the reference/oracle baseline **first** — it scores the benchmark's own verified RTL
+through the identical verifier and tells you the real ceiling on your machine:
+
+```bash
+python3 scripts/run_rtllm_v2.py --benchmark "$RTLLM_ROOT" \
+  --out-dir runs/rtllm_reference --reference --workers 4
+```
+
+Then the agent run (`--samples N` is the `n` in pass@k; add `--resume` to continue an
+interrupted sweep):
+
+```bash
+python3 scripts/run_rtllm_v2.py --benchmark "$RTLLM_ROOT" \
+  --out-dir runs/rtllm_opus --samples 5 --max-repair-rounds 2 --workers 4 \
+  --llm-backend claude-cli --llm-model opus
+```
+
+Both write `results.jsonl` (one design per line, appended as it finishes), `report.json`
+(syntax/func success, the stricter pass rule, pass@k, failure families), `report.md`
+(human table), and `designs/<name>/` artifacts (`rtl.v`, `compile.log`, `sim.log`,
+`trace.json`). The model never sees the golden RTL or the testbench source; the repair
+evidence policy (`--evidence-policy logs|none`) is recorded in every report.
+
+As shipped, the benchmark's own reference RTL compiles 46/50 and functionally passes
+41/50 under iverilog — nine designs have upstream oracle problems (missing golden data
+files, references that fail their own testbench, SystemVerilog the simulator rejects).
+See **[docs/rtllm_v2_benchmark.md](docs/rtllm_v2_benchmark.md)** for the full flag list,
+the metric definitions, and the known-limitations table.
