@@ -70,7 +70,7 @@ def _add_remote_vitis_arguments(parser: argparse.ArgumentParser) -> None:
         "--vitis-bin",
         help=(
             "local/remote HLS launcher name or absolute path: vitis-run (Unified IDE) "
-            "or vitis_hls (legacy)"
+            "or vitis_hls/vivado_hls (legacy)"
         ),
     )
 
@@ -164,6 +164,13 @@ def build_parser() -> argparse.ArgumentParser:
     convert.add_argument("--max-iterations", type=int, help="max verification iterations (default 1); repaired reruns require --auto-repair")
     convert.add_argument("--auto-repair", action="store_true", help="apply mechanical and LLM repairs automatically between verification attempts")
     convert.add_argument("--keep-going", action="store_true", help="emit project even when static diagnostics contain errors")
+    convert.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="allow regeneration into an --out directory that already holds a project "
+        "generated from a different source; without it the run refuses because "
+        "write_project replaces the golden input.c plus src/ and tb/",
+    )
     ppa_criteria = convert.add_argument_group(
         "PPA workflow criteria",
         "process node + slack gate for the local synthesis/STA step (config `ppa:` block); "
@@ -303,7 +310,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def run_convert(args: argparse.Namespace) -> int:
-    config = merge_cli_config(load_config(Path(args.config).resolve() if args.config else None), args)
+    config = merge_cli_config(load_config(_config_path(args)), args)
     nl_only = bool(config.nl_spec) and not config.input_files
     if not config.input_files and not config.nl_spec:
         raise SystemExit("--input (or config input_files) or --spec/--spec-file is required")
@@ -321,6 +328,16 @@ def run_convert(args: argparse.Namespace) -> int:
         else:
             config.use_llm = True
     out_dir = Path(args.out).resolve()
+    if not nl_only and not config.input_files[0].exists():
+        raise SystemExit(f"--input {config.input_files[0]} does not exist")
+    # Refuse before anything is written: write_project replaces input.c (the golden
+    # oracle) together with generated sources, testbenches, and scripts.
+    _guard_output_dir(
+        out_dir,
+        None if nl_only else config.input_files[0],
+        bool(getattr(args, "overwrite", False)),
+    )
+    _invalidate_stale_reports(out_dir)
     llm = build_llm_client(config)
     if config.use_llm and llm is None:
         if nl_only:
@@ -338,6 +355,9 @@ def run_convert(args: argparse.Namespace) -> int:
     # Resolve the backend before materializing the project so generated Makefile and
     # run_all.sh helpers use the exact same native launcher as the verifier.
     explicit_backend = (config.cosim_backend or "auto").lower() != "auto"
+    # ``run_vitis`` defaults to False, so True means the RTL ladder was requested by
+    # CLI/config (or a configured remote host).
+    rtl_requested = bool(config.run_vitis)
     backend = resolve_cosim_backend(config, remote)
     config.cosim_backend = backend
     if backend == "vitis":
@@ -362,7 +382,12 @@ def run_convert(args: argparse.Namespace) -> int:
         if args.verbose:
             print(f"Golden C reference generated from the NL spec: {reference_path}")
 
-    analysis = analyze_source(config.input_files[0], config.top, config)
+    try:
+        analysis = analyze_source(config.input_files[0], config.top, config)
+    except ValueError as exc:
+        raise SystemExit(f"static analysis of {config.input_files[0]} failed: {exc}")
+    except OSError as exc:
+        raise SystemExit(f"could not read --input {config.input_files[0]}: {exc}")
     plan = None
     if config.plan_contracts and config.use_llm and llm is not None:
         # Live contract_planner (runs BEFORE the nl-only unbounded warning below, so
@@ -431,6 +456,14 @@ def run_convert(args: argparse.Namespace) -> int:
         print(f"Static analysis failed; report written to {out_dir / 'conversion_report.md'}", file=sys.stderr)
         return 1
 
+    if analysis.diagnostics.has_errors and config.keep_going:
+        errors = len(analysis.diagnostics.by_severity("error"))
+        print(
+            f"--keep-going: {errors} static diagnostic error(s) remain fail-closed; "
+            "the project and verification evidence will still be emitted.",
+            file=sys.stderr,
+        )
+
     # Choose who runs the csynth/cosim ladder. local-hls replaces Vitis entirely
     # (local Bambu); vitis/vitis-ssh keep the Xilinx path; none skips it.
     local = None
@@ -451,7 +484,25 @@ def run_convert(args: argparse.Namespace) -> int:
         remote = None
     elif backend == "none":
         remote = None
-        config.run_vitis = False
+        if rtl_requested and not explicit_backend:
+            # Auto-resolution found no backend even though RTL verification was requested.
+            # Keep run_vitis set so verification records a missing toolchain instead of
+            # returning a host-equivalence-only false pass.
+            print(
+                "the RTL ladder was requested but no cosim backend is available (no "
+                "--vitis-ssh host, native Vitis launcher, or local Bambu); the run will "
+                "report the missing toolchain instead of passing. Pass --no-run-vitis "
+                "to accept host equivalence only.",
+                file=sys.stderr,
+            )
+        else:
+            if rtl_requested:
+                print(
+                    f"--cosim-backend {config.cosim_backend}: skipping the RTL ladder even "
+                    "though it was requested; the run is graded on host equivalence only.",
+                    file=sys.stderr,
+                )
+            config.run_vitis = False
     if args.verbose:
         print(f"cosim backend: {backend}" + (" (running local Bambu ladder)" if local is not None else ""))
 
@@ -498,9 +549,13 @@ def run_convert(args: argparse.Namespace) -> int:
         # decides whether a repair functionally worked. The chain rule inside
         # promote_run keeps ineffective intermediate repairs out of the card store.
         functional_status = final_status(state, config.run_vitis, analysis.diagnostics.has_errors)
-        promoted = promote_run(audit_store, repair_history, out_dir.name, functional_status)
-        if args.verbose and promoted:
-            print(f"audit_memory: promoted {len(promoted)} repair-success card(s) to {audit_store}")
+        try:
+            promoted = promote_run(audit_store, repair_history, out_dir.name, functional_status)
+        except OSError as exc:
+            print(f"warning: audit_memory promotion to {audit_store} failed: {exc}", file=sys.stderr)
+        else:
+            if args.verbose and promoted:
+                print(f"audit_memory: promoted {len(promoted)} repair-success card(s) to {audit_store}")
     # PPA workflow criteria run only on a functionally-signed-off design, so the slack
     # numbers always describe RTL that already passed the equivalence ladder. config
     # parsing guarantees run_local_ppa is True whenever any hard criterion is declared,
@@ -511,11 +566,21 @@ def run_convert(args: argparse.Namespace) -> int:
         # testbench does not match, so drive PPA off the Bambu netlist with the
         # right clock and no gate sim (Bambu's own cosim already checked function).
         local_hls_rtl = backend == "local-hls"
-        ppa_phase = _ppa_gate_phase(
-            out_dir, config, verbose=args.verbose,
-            clock_port="clock" if local_hls_rtl else "ap_clk",
-            gate_sim=not local_hls_rtl,
-        )
+        try:
+            ppa_phase = _ppa_gate_phase(
+                out_dir, config, verbose=args.verbose,
+                clock_port="clock" if local_hls_rtl else "ap_clk",
+                gate_sim=not local_hls_rtl,
+            )
+        except Exception as exc:  # noqa: BLE001 - preserve the conversion evidence boundary
+            from .equivalence import PhaseResult
+            from .qor import targets_from_config
+
+            ppa_phase = PhaseResult(
+                "ppa",
+                "fail" if targets_from_config(config).specified else "skipped",
+                summary=f"local PPA step raised {type(exc).__name__}: {exc}",
+            )
         state.add_phase(ppa_phase)
         print(f"PPA[{config.node}]: {ppa_phase.status} — {ppa_phase.summary}")
     # final_status now accounts for a present ppa phase, so the headline status, the
@@ -617,14 +682,69 @@ def _ppa_gate_phase(
     return PhaseResult("ppa", "pass", summary="; ".join(parts))
 
 
+def _config_path(args: argparse.Namespace) -> Path | None:
+    """Resolve --config with a concise user error instead of a traceback."""
+
+    raw = getattr(args, "config", None)
+    if not raw:
+        return None
+    path = Path(raw).expanduser().resolve()
+    if not path.is_file():
+        raise SystemExit(f"--config {path} does not exist")
+    return path
+
+
+def _guard_output_dir(out_dir: Path, source: Path | None, overwrite: bool) -> None:
+    """Refuse to overwrite a generated project or its golden input accidentally."""
+
+    existing_input = out_dir / "input.c"
+    if source is not None and (source == existing_input or source.is_relative_to(out_dir)):
+        raise SystemExit(
+            f"--input {source} is inside --out {out_dir}: conversion would overwrite its "
+            "own golden oracle. Choose an --out directory outside the input directory."
+        )
+    if overwrite or not out_dir.is_dir():
+        return
+    existing_top = out_dir / "src" / "hls_top.cpp"
+    if not existing_input.exists() and not existing_top.exists():
+        return
+    if source is not None and existing_input.exists():
+        try:
+            if existing_input.read_bytes() == source.read_bytes():
+                return
+        except OSError:
+            pass
+    occupied = existing_input if existing_input.exists() else existing_top
+    raise SystemExit(
+        f"--out {out_dir} already holds a generated project from a different source "
+        f"({occupied}); conversion would overwrite the golden input.c and generated src/ "
+        "and tb/. Use a fresh --out directory or pass --overwrite deliberately."
+    )
+
+
+def _invalidate_stale_reports(out_dir: Path) -> None:
+    """Remove a previous verdict before regenerating sources into the same project."""
+
+    for name in ("conversion_report.md", "conversion_report.json"):
+        path = out_dir / name
+        if not path.exists():
+            continue
+        try:
+            path.unlink()
+        except OSError as exc:
+            print(f"warning: could not remove the stale report {path}: {exc}", file=sys.stderr)
+
+
 def _project_signature(project_dir: Path) -> str:
     import hashlib
 
     digest = hashlib.sha256()
-    for rel in ("src/hls_top.cpp", "src/hls_top.hpp"):
+    for rel in ("src/hls_top.cpp", "src/hls_top.hpp", "tb/testbench.cpp"):
         path = project_dir / rel
         if path.exists():
-            digest.update(path.read_bytes())
+            data = path.read_bytes()
+            digest.update(f"{rel}:{len(data)}\0".encode("utf-8"))
+            digest.update(data)
     return digest.hexdigest()
 
 
@@ -885,7 +1005,7 @@ def _external_failure_state(
 
 def run_repair(args: argparse.Namespace) -> int:
     project_dir = Path(args.project).resolve()
-    config = merge_cli_config(load_config(Path(args.config).resolve() if args.config else None), args)
+    config = merge_cli_config(load_config(_config_path(args)), args)
     if not config.input_files:
         config.input_files = [(project_dir / "input.c").resolve()]
     if not config.input_files[0].exists():
@@ -1002,7 +1122,7 @@ def run_optimize(args: argparse.Namespace) -> int:
     project_dir = Path(args.project).resolve()
     if not (project_dir / "src" / "hls_top.cpp").exists():
         raise SystemExit(f"{project_dir} does not look like a generated project (no src/hls_top.cpp)")
-    config = merge_cli_config(load_config(Path(args.config).resolve() if args.config else None), args)
+    config = merge_cli_config(load_config(_config_path(args)), args)
     # CLI target flags override the config's hardwired `ppa:` criteria; unset flags
     # fall back to the config so the workflow criteria apply without re-typing them.
     targets = PPATargets(
@@ -1082,7 +1202,7 @@ def run_ppa(args: argparse.Namespace) -> int:
     """Standalone PPA criteria check: the edit-RTL -> `make ppa` -> read-headroom loop."""
 
     project_dir = Path(args.project).resolve()
-    config = merge_cli_config(load_config(Path(args.config).resolve() if args.config else None), args)
+    config = merge_cli_config(load_config(_config_path(args)), args)
     if getattr(args, "clock", None) is not None:
         config.clock = float(args.clock)
     if not config.top:

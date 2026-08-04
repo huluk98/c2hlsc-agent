@@ -172,7 +172,8 @@ T random_value(std::mt19937_64& rng) {{
   if (std::numeric_limits<T>::is_integer) {{
     return static_cast<T>(rng());
   }}
-  return static_cast<T>((rng() % 20001) - 10000) / static_cast<T>(100);
+  // rng() is unsigned, so subtract in signed arithmetic to generate negative floats.
+  return static_cast<T>(static_cast<long long>(rng() % 20001) - 10000) / static_cast<T>(100);
 }}
 
 template <typename T>
@@ -284,6 +285,7 @@ def _compare_script() -> str:
 from __future__ import annotations
 
 import csv
+import math
 import sys
 from pathlib import Path
 
@@ -308,6 +310,12 @@ def values_match(golden: str, hls: str) -> bool:
         gf = float(golden)
         hf = float(hls)
     except ValueError:
+        return False
+    if gf != gf and hf != hf:
+        return True
+    if gf == hf:
+        return True
+    if not math.isfinite(gf) or not math.isfinite(hf):
         return False
     diff = abs(gf - hf)
     scale = max(abs(gf), abs(hf), 1.0)

@@ -12,6 +12,10 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from c2hlsc_agent.cli import (
+    _config_path,
+    _guard_output_dir,
+    _invalidate_stale_reports,
+    _project_signature,
     _read_relational_klee_evidence,
     build_parser,
     run_convert,
@@ -28,6 +32,90 @@ def _state(*phases: PhaseResult) -> VerificationState:
 
 
 class CliRepairLoopTests(unittest.TestCase):
+    def test_convert_overwrite_flag_is_explicit(self):
+        base = ["convert", "--input", "input.c", "--top", "kernel", "--out", "out"]
+        self.assertFalse(build_parser().parse_args(base).overwrite)
+        self.assertTrue(build_parser().parse_args([*base, "--overwrite"]).overwrite)
+
+    def test_output_guard_preserves_a_different_golden_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "new.c"
+            source.write_text("int new_source;\n", encoding="utf-8")
+            out = root / "out"
+            out.mkdir()
+            (out / "input.c").write_text("int old_source;\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(SystemExit, "different source"):
+                _guard_output_dir(out, source, overwrite=False)
+            _guard_output_dir(out, source, overwrite=True)
+
+    def test_output_guard_allows_same_source_but_rejects_source_inside_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "out"
+            out.mkdir()
+            existing = out / "input.c"
+            existing.write_text("int same;\n", encoding="utf-8")
+            source = Path(tmp) / "source.c"
+            source.write_text(existing.read_text(encoding="utf-8"), encoding="utf-8")
+
+            _guard_output_dir(out, source, overwrite=False)
+            with self.assertRaisesRegex(SystemExit, "inside --out"):
+                _guard_output_dir(out, existing, overwrite=True)
+
+    def test_stale_reports_are_invalidated_and_signature_covers_testbench(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            for relative in ("src/hls_top.cpp", "src/hls_top.hpp", "tb/testbench.cpp"):
+                path = project / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(relative, encoding="utf-8")
+            before = _project_signature(project)
+            (project / "tb/testbench.cpp").write_text("changed", encoding="utf-8")
+            self.assertNotEqual(before, _project_signature(project))
+
+            for name in ("conversion_report.md", "conversion_report.json"):
+                (project / name).write_text("stale", encoding="utf-8")
+            _invalidate_stale_reports(project)
+            self.assertFalse((project / "conversion_report.md").exists())
+            self.assertFalse((project / "conversion_report.json").exists())
+
+    def test_missing_config_has_a_clean_user_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = Path(tmp) / "missing.yaml"
+            with self.assertRaisesRegex(SystemExit, "does not exist"):
+                _config_path(type("Args", (), {"config": str(missing)})())
+
+    def test_keep_going_emits_evidence_but_static_errors_remain_nonzero(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "input.c"
+            source.write_text(
+                '#include <stdio.h>\nint bump(int n) { printf("%s", ""); return n + 1; }\n',
+                encoding="utf-8",
+            )
+            out = root / "out"
+            args = build_parser().parse_args(
+                [
+                    "convert",
+                    "--input",
+                    str(source),
+                    "--top",
+                    "bump",
+                    "--out",
+                    str(out),
+                    "--no-run-vitis",
+                    "--keep-going",
+                ]
+            )
+
+            passing_host = _state(PhaseResult("software_equivalence", "pass"))
+            with patch("c2hlsc_agent.cli.verify_project", return_value=passing_host):
+                self.assertEqual(run_convert(args), 1)
+            report = json.loads((out / "conversion_report.json").read_text(encoding="utf-8"))
+            self.assertEqual(report["status"], "fail")
+            self.assertEqual(report["phases"]["software_equivalence"]["status"], "pass")
+
     def test_manual_symbolic_repair_rejects_inline_or_legacy_evidence(self):
         with self.assertRaisesRegex(SystemExit, "evidence-text is not accepted"):
             _read_relational_klee_evidence([], "KLEE assertion failure")

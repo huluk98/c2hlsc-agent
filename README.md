@@ -1,5 +1,41 @@
 # c2hlsc_agent
 
+## Windows Vivado/Vitis HLS Verification
+
+The Windows workflow is `.github/workflows/vivado-windows-verify.yml`. It requires a
+licensed self-hosted Windows x64 runner with the custom label `vivado-hls`, Python
+3.9 or newer, GNU Make, and a C++17-capable `g++` or `clang++`. The runner must have
+one native AMD HLS launcher:
+
+- `vitis-run` (preferred unified launcher);
+- `vitis_hls` (legacy Vitis HLS); or
+- `vivado_hls` (legacy Vivado HLS on Windows).
+
+Configure the runner with these optional repository variables when the AMD tools are
+not already on `PATH`:
+
+- `VIVADO_WINDOWS_SETTINGS`: full path to `settings64.bat`;
+- `VIVADO_WINDOWS_HLS_BIN`: full path to the HLS launcher; and
+- `VIVADO_WINDOWS_ROOT`: an AMD/Xilinx product or install root.
+
+Set `C2HLSC_VIVADO_WINDOWS_CI=true` only when push-triggered runs should use that
+licensed runner. Manual dispatch does not require the variable. The equivalent local
+PowerShell command is:
+
+```powershell
+.\scripts\run_vitis_windows.ps1 `
+  -Config "examples\vector_add\config.yaml" `
+  -Out "build\vitis-windows-vector-add"
+```
+
+The job runs host equivalence, paired shift-left traces, optional gcov/KLEE evidence,
+native CSim/CSynth/CoSim, and the fail-closed Vitis evidence validator. It uploads the
+conversion report, knowledge graph, toolchain provenance, HLS reports, and generated
+RTL. Plain `vivado -mode batch` is not used by this workflow: HLS CSynth metrics are
+estimates, not post-route device QoR. Final-device timing/utilization claims require a
+separate Vivado implementation flow with matching tool version, part, clock, and
+constraints.
+
 ## Ubuntu Server Vitis Quick Triage
 
 Use this workflow on the Ubuntu machine where Vitis HLS is installed. Keep it

@@ -52,6 +52,13 @@ class ParseCosimTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("Front-end compiler", summary)
 
+    def test_failure_marker_overrides_positive_execution_summary(self):
+        ok, summary = _parse_cosim(
+            "error -> co-simulation main aborted\nNumber of executions : 16\n", 0
+        )
+        self.assertFalse(ok)
+        self.assertIn("aborted", summary)
+
 
 class ResolveBackendTests(unittest.TestCase):
     def test_explicit_choice_wins(self):
@@ -122,6 +129,81 @@ class RunLadderTests(unittest.TestCase):
                  mock.patch.object(local_hls.subprocess, "run", side_effect=fake):
                 backend.run(project)
         self.assertIn("--experimental-setup=BAMBU-AREA-MP", captured["cmd"])
+
+    def test_stale_netlist_cannot_pass_csynth_for_a_failing_run(self):
+        def fail(cmd, capture_output, text, timeout):
+            return subprocess.CompletedProcess(
+                cmd, 1, stdout="error -> synthesis blew up\n", stderr=""
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            (project / "golden.c").write_text("void vector_add(){}\n")
+            stale_work = project / ".bambu"
+            stale_work.mkdir()
+            (stale_work / "vector_add.v").write_text("// netlist from an earlier run\n")
+            (project / "rtl").mkdir()
+            (project / "rtl" / "vector_add.v").write_text("// prior published netlist\n")
+            backend = LocalHlsCosim(
+                golden_c=project / "golden.c", top="vector_add",
+                function_args=_vector_add_args(), num_tests=1, seed=7,
+            )
+            with mock.patch.object(local_hls.subprocess, "run", side_effect=fail):
+                phases = backend.run(project)
+
+            self.assertEqual(phases["csynth"].status, "fail")
+            self.assertEqual(phases["cosim"].status, "blocked")
+            self.assertEqual(list((project / "rtl").glob("*.v")), [])
+
+    def test_partial_rtl_with_nonzero_exit_is_not_a_csynth_pass(self):
+        def fail_after_rtl(cmd, capture_output, text, timeout):
+            work = next(Path(arg) for arg in cmd if Path(arg).is_dir())
+            (work / "vector_add.v").write_text("module vector_add(); endmodule\n")
+            return subprocess.CompletedProcess(
+                cmd, 1, stdout="error -> simulation not correct\n", stderr=""
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            (project / "golden.c").write_text("void vector_add(){}\n")
+            backend = LocalHlsCosim(
+                golden_c=project / "golden.c", top="vector_add",
+                function_args=_vector_add_args(), num_tests=1, seed=7,
+            )
+            with mock.patch.object(local_hls.subprocess, "run", side_effect=fail_after_rtl):
+                phases = backend.run(project)
+
+            self.assertEqual(phases["csynth"].status, "fail")
+            self.assertIn("simulation not correct", phases["csynth"].summary)
+            self.assertIn(BACKEND_LOG_TAG, phases["csynth"].summary)
+            self.assertFalse(list((project / "rtl").glob("*.v")))
+
+    def test_zero_exit_with_cosim_mismatch_does_not_publish_rtl(self):
+        def mismatch_after_rtl(cmd, capture_output, text, timeout):
+            work = next(Path(arg) for arg in cmd if Path(arg).is_dir())
+            (work / "vector_add.v").write_text("module vector_add(); endmodule\n")
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                stdout="error -> co-simulation main aborted\nNumber of executions : 16\n",
+                stderr="",
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            (project / "golden.c").write_text("void vector_add(){}\n")
+            (project / "rtl").mkdir()
+            (project / "rtl" / "old.v").write_text("// stale\n")
+            backend = LocalHlsCosim(
+                golden_c=project / "golden.c", top="vector_add",
+                function_args=_vector_add_args(), num_tests=1, seed=7,
+            )
+            with mock.patch.object(local_hls.subprocess, "run", side_effect=mismatch_after_rtl):
+                phases = backend.run(project)
+
+            self.assertEqual(phases["csynth"].status, "pass")
+            self.assertEqual(phases["cosim"].status, "fail")
+            self.assertFalse(list((project / "rtl").glob("*.v")))
 
     def test_run_reports_failure_on_nonzero_exit(self):
         import tempfile

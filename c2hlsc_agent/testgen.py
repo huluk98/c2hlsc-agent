@@ -45,7 +45,7 @@ def _storage_type(arg: FunctionArg) -> str:
 
 
 def _value_print(expr: str) -> str:
-    return f"static_cast<long long>({expr})"
+    return f"print_value({expr})"
 
 
 def _init_array(arg: FunctionArg) -> str:
@@ -155,7 +155,8 @@ T random_value(std::mt19937_64& rng) {
   if (std::numeric_limits<T>::is_integer) {
     return static_cast<T>(rng());
   }
-  return static_cast<T>((rng() % 20001) - 10000) / static_cast<T>(100);
+  // rng() is unsigned, so subtract in signed arithmetic to generate negative floats.
+  return static_cast<T>(static_cast<long long>(rng() % 20001) - 10000) / static_cast<T>(100);
 }
 
 template <typename T>
@@ -202,6 +203,9 @@ bool values_equal(T a, T b) {
   if (std::numeric_limits<T>::is_integer) {
     return a == b;
   }
+  if (std::isnan(static_cast<long double>(a)) && std::isnan(static_cast<long double>(b))) return true;
+  if (a == b) return true;
+  if (!std::isfinite(static_cast<long double>(a)) || !std::isfinite(static_cast<long double>(b))) return false;
   long double da = static_cast<long double>(a);
   long double db = static_cast<long double>(b);
   long double diff = da > db ? da - db : db - da;
@@ -214,6 +218,28 @@ int clamp_count(long long value, int limit) {
   if (value < 0) return 0;
   if (value > limit) return limit;
   return static_cast<int>(value);
+}
+
+// Preserve mismatch evidence across integer signedness and floating-point values.
+// Casting every value to long long can turn a real float mismatch into "0 vs 0" and
+// can print large unsigned integers as negative values.
+template <bool Cond, typename Yes, typename No>
+struct select_type { using type = Yes; };
+
+template <typename Yes, typename No>
+struct select_type<false, Yes, No> { using type = No; };
+
+template <typename T>
+struct print_as {
+  using type = typename select_type<
+      std::numeric_limits<T>::is_integer,
+      typename select_type<std::numeric_limits<T>::is_signed, long long, unsigned long long>::type,
+      long double>::type;
+};
+
+template <typename T>
+typename print_as<T>::type print_value(T value) {
+  return static_cast<typename print_as<T>::type>(value);
 }"""
 
 
@@ -296,6 +322,7 @@ extern "C" {{
 {CPP_STIMULUS_HELPERS}
 
 int main() {{
+  std::cerr.precision(17);
   std::mt19937_64 rng({config.seed}ULL);
   // Fail-closed evidence counter. A testbench that compares NOTHING must never report
   // success: an output argument misclassified as `input`, a return type of void with no

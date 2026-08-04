@@ -32,11 +32,11 @@ def vitis_tcl_command(executable: str, script: str) -> list[str]:
 
 
 def find_vitis_executable(preferred: str = "vitis_hls") -> str | None:
-    """Resolve a local HLS launcher, falling forward to Unified IDE when appropriate."""
+    """Resolve a local HLS launcher, including legacy Windows Vivado HLS."""
 
     resolved = shutil.which(preferred)
     if resolved:
         return resolved
     if preferred == "vitis_hls":
-        return shutil.which("vitis-run")
+        return shutil.which("vitis-run") or shutil.which("vivado_hls")
     return None

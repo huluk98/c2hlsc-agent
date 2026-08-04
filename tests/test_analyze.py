@@ -164,6 +164,69 @@ class AnalyzeTests(unittest.TestCase):
         self.assertNotIn("restrict", raws["dst"])
         self.assertNotIn("restrict", result.function.signature)
 
+    def test_multi_dimensional_parameter_is_rejected(self):
+        path = self._write(
+            """
+            void blur(const int in[3][3], int out[3][3]) {
+              for (int r = 0; r < 3; ++r)
+                for (int c = 0; c < 3; ++c) out[r][c] = in[r][c] + 1;
+            }
+            """
+        )
+        result = analyze_source(path, "blur", AgentConfig(top="blur"))
+        codes = [diag.code for diag in result.unsupported_constructs]
+        self.assertEqual(codes.count("multi-dimensional-parameter"), 2)
+        self.assertTrue(result.diagnostics.has_errors)
+
+    def test_qualified_return_type_is_normalized(self):
+        path = self._write(
+            """
+            static void top(const int *a, int *out, int n) {
+              for (int i = 0; i < n; ++i) out[i] = a[i];
+            }
+            """
+        )
+        cfg = AgentConfig(
+            top="top",
+            arguments={"a": ArgumentConfig(length=4), "out": ArgumentConfig(length=4)},
+        )
+        result = analyze_source(path, "top", cfg)
+        self.assertEqual(result.function.return_type, "void")
+        self.assertTrue(result.function.signature.startswith("void top("))
+
+    def test_apostrophe_in_comment_does_not_break_body_extraction(self):
+        path = self._write(
+            """
+            void guard(const int *a, int *out, int n) {
+              // don't let prose hide the closing brace
+              for (int i = 0; i < n; ++i) out[i] = a[i];
+            }
+            """
+        )
+        cfg = AgentConfig(
+            top="guard",
+            arguments={"a": ArgumentConfig(length=4), "out": ArgumentConfig(length=4)},
+        )
+        result = analyze_source(path, "guard", cfg)
+        self.assertIn("out[i] = a[i]", result.function.body)
+        self.assertEqual({arg.name: arg.direction for arg in result.function.args}["out"], "output")
+
+    def test_comment_markers_inside_string_literal_are_not_comments(self):
+        path = self._write(
+            """
+            void tricky(const int *a, int *out, int n) {
+              const char *u = "http://x"; out[0] = a[0] + n;
+              (void)u;
+            }
+            """
+        )
+        cfg = AgentConfig(
+            top="tricky",
+            arguments={"a": ArgumentConfig(length=4), "out": ArgumentConfig(length=4)},
+        )
+        result = analyze_source(path, "tricky", cfg)
+        self.assertEqual({arg.name: arg.direction for arg in result.function.args}["out"], "output")
+
     def test_unsupported_construct_diagnostics(self):
         path = self._write(
             """

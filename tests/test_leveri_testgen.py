@@ -98,6 +98,21 @@ class LeVeriTestgenTests(unittest.TestCase):
         self.assertIn("static_header_alignment", bundle.manifest_json)
         self.assertIn("dynamic_output_consistency", bundle.manifest_json)
         self.assertIn("HLS-LeVeri consistency check passed", bundle.compare_script)
+        self.assertIn("static_cast<long long>(rng() % 20001) - 10000", bundle.golden_tb)
+        self.assertIn("static_cast<long long>(rng() % 20001) - 10000", bundle.hls_tb)
+
+    def test_compare_script_values_match_accepts_nan_and_inf(self):
+        analysis, cfg = self._analysis()
+        namespace: dict = {}
+        script = generate_leveri_testbenches(analysis, cfg).compare_script
+        exec(compile(script, "leveri_compare", "exec"), namespace)
+        values_match = namespace["values_match"]
+        self.assertTrue(values_match("nan", "NAN"))
+        self.assertTrue(values_match("inf", "inf"))
+        self.assertFalse(values_match("inf", "-inf"))
+        self.assertFalse(values_match("inf", "1.0"))
+        self.assertFalse(values_match("nan", "1.0"))
+        self.assertFalse(values_match("0.5", "0.6"))
 
     def test_klee_driver_clones_shared_state_and_checks_all_pointer_poststate(self):
         analysis, cfg = self._analysis()

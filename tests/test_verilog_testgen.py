@@ -81,6 +81,28 @@ endmodule
 """
 
 
+IDLE_FLOAT_RTL = """
+module scale (ap_clk, ap_rst, ap_start, ap_done, ap_idle, ap_ready,
+  x_address0, x_ce0, x_q0, y_address0, y_ce0, y_we0, y_d0, n);
+  input ap_clk; input ap_rst; input ap_start;
+  output ap_done; output ap_idle; output ap_ready;
+  output [1:0] x_address0; output x_ce0; input [31:0] x_q0;
+  output [1:0] y_address0; output y_ce0; output y_we0; output [31:0] y_d0;
+  input [31:0] n;
+  reg done_r = 1'b0;
+  assign ap_done = done_r;
+  assign ap_idle = ~done_r;
+  assign ap_ready = done_r;
+  assign x_address0 = 2'd0; assign x_ce0 = 1'b0;
+  assign y_address0 = 2'd0; assign y_ce0 = 1'b0; assign y_we0 = 1'b0; assign y_d0 = 32'd0;
+  always @(posedge ap_clk) begin
+    if (ap_rst) done_r <= 1'b0;
+    else done_r <= ap_start;
+  end
+endmodule
+"""
+
+
 def _tools(*names):
     return all(shutil.which(name) for name in names)
 
@@ -354,6 +376,85 @@ class VerilogTestgenTests(unittest.TestCase):
         self.assertEqual(bad.returncode, 1, bad.stdout + bad.stderr)
         report = (project / "coverage" / "rtl_tb_report.json").read_text(encoding="utf-8")
         self.assertIn('"status": "fail"', report)
+
+    @unittest.skipUnless(_tools("iverilog", "vvp", "g++", "python3"), "iverilog, vvp, g++, python3 required")
+    def test_rtl_tb_fails_closed_when_a_golden_vector_file_is_missing(self):
+        project = self._write_project(num_tests=8)
+        rtl_dir = project / "c2hlsc_project" / "solution1" / "syn" / "verilog"
+        rtl_dir.mkdir(parents=True, exist_ok=True)
+        (rtl_dir / "vector_add.v").write_text(CORRECT_VECTOR_ADD_RTL, encoding="utf-8")
+        ok = subprocess.run(
+            ["python3", "tb/run_rtl_sim.py"], cwd=project, text=True, capture_output=True
+        )
+        self.assertEqual(ok.returncode, 0, ok.stdout + ok.stderr)
+
+        (project / "rtl_vectors" / "rtl_cmp_out.mem").unlink()
+        vvp = project / "coverage" / "missing_vec.vvp"
+        compiled = subprocess.run(
+            [
+                "iverilog",
+                "-g2012",
+                "-o",
+                str(vvp),
+                "-s",
+                "vector_add_tb",
+                "tb/vector_add_tb.sv",
+                "c2hlsc_project/solution1/syn/verilog/vector_add.v",
+            ],
+            cwd=project,
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(compiled.returncode, 0, compiled.stdout + compiled.stderr)
+        sim = subprocess.run(["vvp", str(vvp)], cwd=project, text=True, capture_output=True)
+        self.assertIn("RTL_TB: FAIL", sim.stdout)
+        self.assertNotIn("RTL_TB: PASS", sim.stdout)
+        self.assertIn("compares=0", sim.stdout)
+
+        again = subprocess.run(
+            ["python3", "tb/run_rtl_sim.py"], cwd=project, text=True, capture_output=True
+        )
+        self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
+        self.assertTrue((project / "rtl_vectors" / "rtl_cmp_out.mem").is_file())
+        report = (project / "coverage" / "rtl_tb_report.json").read_text(encoding="utf-8")
+        self.assertIn('"status": "pass"', report)
+
+    @unittest.skipUnless(_tools("iverilog", "vvp", "g++", "python3"), "iverilog, vvp, g++, python3 required")
+    def test_all_advisory_comparisons_report_advisory_not_pass(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = Path(tmp.name) / "input.c"
+        path.write_text(
+            "void scale(const float *x, float *y, int n) {\n"
+            "  for (int i = 0; i < n; ++i) y[i] = x[i] * 2.0f;\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        cfg = AgentConfig(
+            top="scale",
+            num_tests=8,
+            interface_mode="ap_memory",
+            arguments={
+                "x": ArgumentConfig(direction="input", length=4),
+                "y": ArgumentConfig(direction="output", length=4),
+                "n": ArgumentConfig(range=(1, 4)),
+            },
+        )
+        analysis = analyze_source(path, "scale", cfg)
+        project = Path(tmp.name) / "project"
+        write_project(project, analysis, generate_hls_sources(analysis, cfg), cfg)
+        rtl_dir = project / "c2hlsc_project" / "solution1" / "syn" / "verilog"
+        rtl_dir.mkdir(parents=True, exist_ok=True)
+        (rtl_dir / "scale.v").write_text(IDLE_FLOAT_RTL, encoding="utf-8")
+
+        run = subprocess.run(
+            ["python3", "tb/run_rtl_sim.py"], cwd=project, text=True, capture_output=True
+        )
+        report = (project / "coverage" / "rtl_tb_report.json").read_text(encoding="utf-8")
+        self.assertIn('"status": "advisory"', report)
+        self.assertNotIn('"status": "pass"', report)
+        self.assertIn("RTL_TB: ADVISORY", report)
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
 
 
 if __name__ == "__main__":

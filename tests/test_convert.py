@@ -2,6 +2,7 @@ import tempfile
 import unittest
 import shutil
 import subprocess
+import os
 from pathlib import Path
 import sys
 
@@ -72,6 +73,12 @@ class ConvertTests(unittest.TestCase):
         self.assertIn("cosim_design -tool xsim -rtl verilog", tcl)
         self.assertNotIn("add_files -tb input.c", tcl)
 
+    def test_tcl_defaults_to_vivado_ip_flow_for_legacy_hls_compatibility(self):
+        analysis, cfg = self._analysis()
+        for tcl in (render_run_hls(analysis, cfg), render_run_csim(analysis, cfg)):
+            self.assertIn('open_solution "solution1"', tcl)
+            self.assertNotIn('open_solution "solution1" -flow_target', tcl)
+
     def test_split_tcl_generation_is_phase_specific(self):
         analysis, cfg = self._analysis()
         cfg.cosim_tool = "xsim"
@@ -93,18 +100,48 @@ class ConvertTests(unittest.TestCase):
         self.assertIn(expected, render_makefile(cfg))
         self.assertIn(expected, render_run_all(cfg))
 
+    def test_generated_makefile_allows_windows_python_override(self):
+        _analysis, cfg = self._analysis()
+        makefile = render_makefile(cfg)
+        self.assertIn("PYTHON ?= python3", makefile)
+        self.assertIn('"$(PYTHON)" tb/leveri_compare.py', makefile)
+        self.assertIn('"$(PYTHON)" tb/run_gcov.py', makefile)
+        self.assertIn('"$(PYTHON)" tb/run_klee.py', makefile)
+        self.assertIn('"$(CXX)" $(CXXFLAGS)', makefile)
+
+    @unittest.skipUnless(shutil.which("make"), "make is required")
+    def test_generated_makefile_preserves_python_path_with_spaces(self):
+        _analysis, cfg = self._analysis()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "Makefile").write_text(render_makefile(cfg), encoding="utf-8")
+            env = os.environ.copy()
+            env["PYTHON"] = "/tmp/Python With Spaces/python.exe"
+            dry_run = subprocess.run(
+                ["make", "-n", "gcov-coverage"],
+                cwd=root,
+                env=env,
+                text=True,
+                capture_output=True,
+            )
+        self.assertEqual(dry_run.returncode, 0, dry_run.stdout + dry_run.stderr)
+        self.assertIn(
+            '"/tmp/Python With Spaces/python.exe" tb/run_gcov.py', dry_run.stdout
+        )
+
     def test_generated_testbench_compares_output_arrays(self):
         analysis, cfg = self._analysis()
         testbench = generate_testbench(analysis, cfg)
         self.assertIn("// - out: direction=output length=4 compare all 4 elements; active prefix is clamp(n, 4)", testbench)
         self.assertIn("const int compare_len_out = 4;", testbench)
-        self.assertIn("const int active_len_out = clamp_count(static_cast<long long>(n), 4);", testbench)
+        self.assertIn("const int active_len_out = clamp_count(print_value(n), 4);", testbench)
         self.assertIn("for (int i = 0; i < compare_len_out; ++i)", testbench)
         self.assertIn("if (!values_equal(ref_out[i], hls_out[i]))", testbench)
         self.assertIn('<< " compare_len=" << compare_len_out', testbench)
         self.assertIn('<< " active_len=" << active_len_out', testbench)
-        self.assertIn('<< " n=" << static_cast<long long>(n)', testbench)
+        self.assertIn('<< " n=" << print_value(n)', testbench)
         self.assertIn('"Mismatch test=" << test_idx << " arg=out index="', testbench)
+        self.assertIn("std::cerr.precision(17);", testbench)
 
     def test_generated_testbench_uses_vitis_friendly_stimulus(self):
         analysis, cfg = self._analysis()
@@ -113,6 +150,10 @@ class ConvertTests(unittest.TestCase):
         self.assertIn("output_sentinel<int32_t>(test_idx, i)", testbench)
         self.assertIn("if (std::numeric_limits<T>::is_integer)", testbench)
         self.assertNotIn("if constexpr", testbench)
+        self.assertIn("static_cast<long long>(rng() % 20001) - 10000", testbench)
+        self.assertIn("if (std::isnan(", testbench)
+        self.assertIn("!std::isfinite(", testbench)
+        self.assertIn("struct print_as", testbench)
 
     def test_generated_testbench_bounds_unconfigured_length_from_pointer_capacity(self):
         analysis, cfg = self._analysis()

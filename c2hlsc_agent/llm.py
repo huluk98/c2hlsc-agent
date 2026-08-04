@@ -48,6 +48,28 @@ _HTTP_TIMEOUT = 600  # local models can be slow
 _CLI_TIMEOUT = 900  # claude CLI runs with thinking; give it room
 
 
+class LLMResponseError(RuntimeError):
+    """A backend answered, but the answer cannot be used as a completion.
+
+    Raised instead of returning ``""``: an empty string is indistinguishable from a
+    genuinely empty completion, and every caller of :meth:`LLMClient.complete` already
+    treats an exception as "this attempt failed, keep the deterministic result" while
+    reporting the concrete reason.
+    """
+
+
+class LLMTruncatedError(LLMResponseError):
+    """The backend stopped at its output-token limit, so the completion is incomplete.
+
+    A truncated translation unit must never be mistaken for a finished one: it can pass
+    a caller's ``must_contain`` narrowing while missing its tail.
+    """
+
+
+class LLMEmptyCompletionError(LLMResponseError):
+    """A well-formed response that carried no text at all (e.g. a refusal)."""
+
+
 class LLMClient(Protocol):
     """Minimal text-completion contract used by the generator and repair agents."""
 
@@ -224,22 +246,61 @@ class ClaudeCLIClient:
 
 
 def _text_from_response(response: object) -> str:
+    """Text of an Anthropic Messages response, or raise :class:`LLMResponseError`.
+
+    ``stop_reason == "max_tokens"`` is a truncated answer, not an answer: surfacing it as
+    :class:`LLMTruncatedError` keeps a half-written translation unit out of the pipeline.
+    """
+
+    content = getattr(response, "content", None)
+    if content is None:
+        raise LLMResponseError("Anthropic response carried no content field")
     parts: list[str] = []
-    for block in getattr(response, "content", None) or []:
+    for block in content:
         if getattr(block, "type", None) == "text":
             parts.append(getattr(block, "text", ""))
-    return "\n".join(part for part in parts if part)
+    text = "\n".join(part for part in parts if part)
+    stop_reason = getattr(response, "stop_reason", None)
+    if stop_reason == "max_tokens":
+        raise LLMTruncatedError(
+            f"Anthropic response hit max_tokens after {len(text)} chars; the completion is truncated"
+        )
+    if not text.strip():
+        raise LLMEmptyCompletionError(
+            f"Anthropic response carried no text blocks (stop_reason={stop_reason!r})"
+        )
+    return text
 
 
 def _openai_text(body: dict) -> str:
+    """Text of an OpenAI-compatible response, or raise :class:`LLMResponseError`.
+
+    Mirrors :func:`_text_from_response`: ``finish_reason == "length"`` is a truncated
+    completion, a missing/unusable ``choices`` list is a parse failure, and an answer with
+    no text is an empty completion -- three distinguishable outcomes instead of ``""``.
+    """
+
     choices = body.get("choices") or []
-    if not choices:
-        return ""
-    message = choices[0].get("message") or {}
+    if not choices or not isinstance(choices[0], dict):
+        raise LLMResponseError("OpenAI-compatible response carried no usable 'choices' entry")
+    choice = choices[0]
+    message = choice.get("message") or {}
     content = message.get("content")
     if isinstance(content, list):  # some servers return structured content parts
-        return "".join(part.get("text", "") for part in content if isinstance(part, dict))
-    return content or ""
+        text = "".join(part.get("text", "") for part in content if isinstance(part, dict))
+    else:
+        text = content or ""
+    finish_reason = choice.get("finish_reason")
+    if finish_reason == "length":
+        raise LLMTruncatedError(
+            f"OpenAI-compatible response finished with reason 'length' after {len(text)} chars; "
+            "the completion is truncated"
+        )
+    if not text.strip():
+        raise LLMEmptyCompletionError(
+            f"OpenAI-compatible response carried no text (finish_reason={finish_reason!r})"
+        )
+    return text
 
 
 def _env(*names: str) -> str | None:
@@ -709,7 +770,10 @@ Respond with the single ```json block described in the system prompt."""
 
 # Fence-length aware: an N-backtick fence is closed only by the same N backticks, so a
 # 4-backtick block wrapping inline triple-backtick examples is not truncated mid-body.
-_FENCE = re.compile(r"(`{3,})[ \t]*([A-Za-z0-9_+\-]*)[ \t]*\r?\n(.*?)\r?\n?\1", re.S)
+# The language tag may carry a trailing info string (```cpp linenums, ```cpp title="x"):
+# it is matched and ignored, because refusing to open such a fence made the regex
+# resynchronize on the block's CLOSING fence and capture the following prose as code.
+_FENCE = re.compile(r"(`{3,})[ \t]*([A-Za-z0-9_+\-]*)[^\n`]*\r?\n(.*?)\r?\n?\1", re.S)
 _CODE_LANGS = {"", "c", "cc", "cpp", "c++", "cxx", "h", "hpp", "hxx"}
 
 
@@ -720,12 +784,78 @@ def extract_code_blocks(text: str) -> list[tuple[str, str]]:
 
 
 def _defines_function(code: str, name: str) -> bool:
-    pattern = re.compile(rf"\b{re.escape(name)}\s*\([^;{{}}]*\)\s*\{{", re.S)
-    return bool(pattern.search(code))
+    """True only for a *definition* of ``name`` at a declaration position.
+
+    A bare ``name(...) {`` match also fires on a CALL -- ``if (my_top(a, b)) {`` or
+    ``while (my_top(a)) {}`` -- which let a self-check snippet masquerade as the
+    translation unit. So require the match to start at a line start (or after ``;``/``}``)
+    with a return-type token in front of the name, mirroring
+    ``hlsc_repair_agent._has_function_definition``.
+    """
+
+    pattern = re.compile(
+        rf'(?:^|[;\n}}])\s*(?:static\s+|inline\s+|extern\s+|extern\s+"C"\s+)*'
+        rf"[A-Za-z_][\w\s\*&<>:,]*[\s\*&]{re.escape(name)}\s*\([^;{{}}]*\)\s*\{{",
+        re.S,
+    )
+    return bool(pattern.search(code or ""))
+
+
+# ``int main(`` belongs to the generated testbench, never to the HLS translation unit, so a
+# block that defines it is a self-check/testbench snippet and must not be selected.
+_MAIN_DEFINITION = re.compile(r"(?:^|[;\n}])\s*(?:static\s+|inline\s+)*int[\s\*]+main\s*\(", re.S)
+
+
+def _defines_main(code: str) -> bool:
+    return bool(_MAIN_DEFINITION.search(code or ""))
+
+
+def _strip_literals_and_comments(code: str) -> str:
+    """Drop string/char literals and comments so brace counting sees code braces only."""
+
+    out: list[str] = []
+    i = 0
+    n = len(code)
+    while i < n:
+        char = code[i]
+        if char == "/" and i + 1 < n and code[i + 1] in "/*":
+            if code[i + 1] == "/":
+                end = code.find("\n", i)
+                i = n if end < 0 else end
+            else:
+                end = code.find("*/", i + 2)
+                i = n if end < 0 else end + 2
+            continue
+        if char in "\"'":
+            i += 1
+            while i < n:
+                current = code[i]
+                if current == "\\":
+                    i += 2
+                    continue
+                i += 1
+                if current == char:
+                    break
+                if current == "\n":  # unterminated literal: do not swallow the whole file
+                    break
+            continue
+        out.append(char)
+        i += 1
+    return "".join(out)
 
 
 def _braces_balanced(code: str) -> bool:
-    return bool(code) and "}" in code and code.count("{") == code.count("}")
+    """Balanced braces, counted over code only (literals and comments stripped).
+
+    A raw ``count("{") == count("}")`` both false-accepts a truncated unit whose stray
+    ``}`` in a comment banner balances the tally, and false-rejects a valid unit that
+    prints a brace (``std::cerr << "{"``). The accept/reject policy is unchanged.
+    """
+
+    if not code:
+        return False
+    stripped = _strip_literals_and_comments(code)
+    return "}" in stripped and stripped.count("{") == stripped.count("}")
 
 
 def _is_code_lang(lang: str) -> bool:
@@ -754,15 +884,22 @@ def extract_hls_source(
 ) -> str | None:
     """Extract the synthesizable HLS-C translation unit from a generator response.
 
-    Considers only C/C++-tagged fenced blocks that define ``top_name``. Prefers blocks
-    after the "Vitis HLS annotated code" marker, and among the candidates chooses the last
-    one that is not a verbatim echo of the original source (so a restated "Original code"
-    block is skipped). The chosen unit must pass :func:`is_plausible_translation_unit`;
-    otherwise ``None`` is returned and the caller falls back to the conservative copy.
+    Considers only C/C++-tagged fenced blocks that *define* ``top_name`` (a block that
+    merely calls it, or that defines ``main``, is a self-check snippet and is skipped --
+    otherwise a trailing self-check beats the real unit, since the LAST candidate wins).
+    Prefers blocks after the "Vitis HLS annotated code" marker, and among the candidates
+    chooses the last one that is not a verbatim echo of the original source (so a restated
+    "Original code" block is skipped). The chosen unit must pass
+    :func:`is_plausible_translation_unit`; otherwise ``None`` is returned and the caller
+    falls back to the conservative copy.
     """
 
     def _candidates(blocks: list[tuple[str, str]]) -> list[str]:
-        return [body for lang, body in blocks if _is_code_lang(lang) and _defines_function(body, top_name)]
+        return [
+            body
+            for lang, body in blocks
+            if _is_code_lang(lang) and _defines_function(body, top_name) and not _defines_main(body)
+        ]
 
     candidates: list[str] = []
     marker = re.search(r"vitis hls annotated code", text or "", re.I)
@@ -790,12 +927,32 @@ def extract_hls_source(
     return chosen
 
 
+def _top_from_must_contain(must_contain: str | None) -> str | None:
+    """Recover the top-function name from a ``"<top>("`` marker, or ``None``.
+
+    Every caller passes ``f"{top}("``; recovering the name lets this extractor apply the
+    same structural gate the caller applies afterwards, without a new parameter.
+    """
+
+    marker = (must_contain or "").strip()
+    if not marker.endswith("("):
+        return None
+    name = marker[:-1].strip()
+    return name if name.isidentifier() else None
+
+
 def extract_full_file(text: str, must_contain: str | None = None) -> str | None:
     """Extract a complete file body, preferring C/C++-tagged blocks.
 
     Filters to blocks whose language tag is a C/C++ family tag (or untagged) so a prose
-    or log block cannot be selected, then narrows by ``must_contain`` and returns the
-    longest remaining block. Returns ``None`` when nothing usable matches.
+    or log block cannot be selected, then narrows by ``must_contain``. When
+    ``must_contain`` identifies a top function (``"<top>("``), the pool is further narrowed
+    to blocks that pass :func:`is_plausible_translation_unit` and the LAST such block wins
+    (matching :func:`extract_hls_source`). Preferring the longest block instead handed back
+    an echoed compiler log -- untagged fences are candidates, and the evidence tail in a
+    repair prompt is routinely longer than the file -- which the caller's post-check then
+    rejected, silently ending the repair loop. Falls back to the longest block only when no
+    top name can be recovered. Returns ``None`` when nothing usable matches.
     """
 
     blocks = [(lang, body) for lang, body in extract_code_blocks(text) if body.strip()]
@@ -806,6 +963,12 @@ def extract_full_file(text: str, must_contain: str | None = None) -> str | None:
             pool = filtered
     if not pool:
         return None
+    top = _top_from_must_contain(must_contain)
+    if top is not None:
+        plausible = [body for _lang, body in pool if is_plausible_translation_unit(body, top)]
+        if not plausible:
+            return None  # the caller's post-check would reject every candidate anyway
+        return plausible[-1].rstrip() + "\n"
     body = max((b for _lang, b in pool), key=len)
     return body.rstrip() + "\n"
 

@@ -132,6 +132,8 @@ def validate_vitis_project(project_dir: Path) -> dict[str, object]:
         "top": report.get("top"),
         "part": report.get("part"),
         "clock_ns": report.get("clock_ns"),
+        "seed": report.get("seed"),
+        "num_tests": report.get("num_tests"),
         "vitis_bin": vitis_bin,
         "native_cosim_command": vitis_tcl_command(vitis_bin, "run_cosim.tcl"),
         "phases": phases,

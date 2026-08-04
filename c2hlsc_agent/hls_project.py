@@ -32,7 +32,9 @@ open_project c2hlsc_project
 set_top {fn.name}
 add_files src/hls_top.cpp
 add_files -tb tb/testbench.cpp
-open_solution "solution1" -flow_target vivado
+# Vivado IP is Vitis HLS's default target. Omitting -flow_target keeps this Tcl
+# compatible with legacy Vivado HLS, which predates that option.
+open_solution "solution1"
 set_part {{{config.part}}}
 create_clock -period {config.clock} -name default
 csim_design
@@ -49,7 +51,8 @@ open_project -reset c2hlsc_project
 set_top {fn.name}
 add_files src/hls_top.cpp
 add_files -tb tb/testbench.cpp
-open_solution "solution1" -flow_target vivado
+# Vivado IP is the default and is also understood by legacy Vivado HLS.
+open_solution "solution1"
 set_part {{{config.part}}}
 create_clock -period {config.clock} -name default
 csim_design
@@ -96,6 +99,7 @@ def render_makefile(config: AgentConfig) -> str:
         ppa_flags += f" --top {config.top}"
     vitis_command = shlex.join(vitis_tcl_command(config.vitis_bin, "run_hls.tcl"))
     return f"""CXX ?= g++
+PYTHON ?= python3
 CXXFLAGS ?= -std=c++17 -Wall -Wextra -I src {flags}
 TB_EXE ?= c2hlsc_tb
 LEVERI_GOLDEN_EXE ?= leveri_golden_tb
@@ -108,13 +112,13 @@ RTL_VECTORS_EXE ?= rtl_vectors_tb
 all: test
 
 $(TB_EXE): tb/testbench.cpp src/hls_top.cpp src/hls_top.hpp input.c
-\t$(CXX) $(CXXFLAGS) tb/testbench.cpp src/hls_top.cpp -o $(TB_EXE)
+\t"$(CXX)" $(CXXFLAGS) tb/testbench.cpp src/hls_top.cpp -o $(TB_EXE)
 
 $(LEVERI_GOLDEN_EXE): tb/leveri_golden_tb.cpp input.c
-\t$(CXX) $(CXXFLAGS) tb/leveri_golden_tb.cpp -o $(LEVERI_GOLDEN_EXE)
+\t"$(CXX)" $(CXXFLAGS) tb/leveri_golden_tb.cpp -o $(LEVERI_GOLDEN_EXE)
 
 $(LEVERI_HLS_EXE): tb/leveri_hls_tb.cpp src/hls_top.cpp src/hls_top.hpp
-\t$(CXX) $(CXXFLAGS) tb/leveri_hls_tb.cpp src/hls_top.cpp -o $(LEVERI_HLS_EXE)
+\t"$(CXX)" $(CXXFLAGS) tb/leveri_hls_tb.cpp src/hls_top.cpp -o $(LEVERI_HLS_EXE)
 
 test: $(TB_EXE)
 \t./$(TB_EXE)
@@ -122,40 +126,42 @@ test: $(TB_EXE)
 leveri-test: $(LEVERI_GOLDEN_EXE) $(LEVERI_HLS_EXE)
 \t./$(LEVERI_GOLDEN_EXE)
 \t./$(LEVERI_HLS_EXE)
-\tpython3 tb/leveri_compare.py leveri_golden_trace.csv leveri_hls_trace.csv
+\t"$(PYTHON)" tb/leveri_compare.py leveri_golden_trace.csv leveri_hls_trace.csv
 
 gcov-coverage:
-\tpython3 tb/run_gcov.py
+\t"$(PYTHON)" tb/run_gcov.py
 
 klee-coverage:
-\tpython3 tb/run_klee.py
+\t"$(PYTHON)" tb/run_klee.py
 
 coverage: gcov-coverage klee-coverage
 
 # Standalone RTL (Verilog) testbench flow. Produces golden expected vectors from the
 # original C, renders a self-checking testbench, and (post-synthesis) simulates the RTL.
 $(RTL_VECTORS_EXE): tb/rtl_vectors_tb.cpp input.c
-\t$(CXX) $(CXXFLAGS) tb/rtl_vectors_tb.cpp -o $(RTL_VECTORS_EXE)
+\t"$(CXX)" $(CXXFLAGS) tb/rtl_vectors_tb.cpp -o $(RTL_VECTORS_EXE)
 
 rtl-vectors: $(RTL_VECTORS_EXE)
 \tmkdir -p rtl_vectors
 \t./$(RTL_VECTORS_EXE)
 
 rtl-testbench:
-\tpython3 tb/gen_rtl_tb.py --from-contract
+\t"$(PYTHON)" tb/gen_rtl_tb.py --from-contract
 
 rtl-cosim:
-\tpython3 tb/run_rtl_sim.py
+\t"$(PYTHON)" tb/run_rtl_sim.py
 
 # PPA workflow criteria: yosys + OpenSTA on the project's RTL, measured on the
 # configured process node; prints the slack headroom (iteration budget) and exits
 # nonzero when a declared criterion (e.g. min_slack) is unmet. Needs the
 # c2hlsc_agent package importable plus yosys/OpenSTA; liberties auto-download.
 ppa:
-\tpython3 -m c2hlsc_agent.cli ppa --project . {ppa_flags}
+\t"$(PYTHON)" -m c2hlsc_agent.cli ppa --project . {ppa_flags}
 
+# run_all.sh invokes this native launcher and applies the positive CoSim evidence
+# gate: {vitis_command}
 vitis:
-\t{vitis_command}
+\tbash run_all.sh --vitis-only
 
 clean:
 \trm -f $(TB_EXE) $(LEVERI_GOLDEN_EXE) $(LEVERI_HLS_EXE) $(RTL_VECTORS_EXE)
@@ -173,9 +179,35 @@ def render_run_all(config: AgentConfig | None = None) -> str:
     command = shlex.join(vitis_tcl_command(config.vitis_bin, "run_hls.tcl"))
     return f"""#!/usr/bin/env bash
 set -euo pipefail
-make test
+
+VITIS_LOG="${{VITIS_LOG:-vitis_hls_run.log}}"
+
+gate_cosim_log() {{
+  local log="$1"
+  if grep -qiE 'co-simulation finished: fail|cosim design failed|co-simulation failed|aborting co-simulation|aborting cosim|error: \\[(cosim|sim)|mismatch test=' "$log"; then
+    echo "CoSim gate: FAIL - $log reports a co-simulation failure." >&2
+    return 1
+  fi
+  if ! grep -qi 'co-simulation finished: pass' "$log"; then
+    echo "CoSim gate: FAIL - $log carries no positive C/RTL co-simulation PASS verdict." >&2
+    return 1
+  fi
+  echo "CoSim gate: PASS ($log)."
+}}
+
+vitis_only=0
+if [ "${{1:-}}" = "--vitis-only" ]; then
+  vitis_only=1
+else
+  make test
+fi
+
 if command -v {executable} >/dev/null 2>&1; then
-  {command}
+  {command} 2>&1 | tee "$VITIS_LOG"
+  gate_cosim_log "$VITIS_LOG"
+elif [ "$vitis_only" = "1" ]; then
+  echo "Vitis HLS launcher not found; the requested Vitis ladder did not run." >&2
+  exit 127
 else
   echo "Vitis HLS launcher not found; host equivalence completed, Vitis phases skipped." >&2
 fi
