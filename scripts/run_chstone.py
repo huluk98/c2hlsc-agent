@@ -213,6 +213,19 @@ def _classify_conversion(report: dict, log_text: str) -> tuple[str, str | None]:
     if software in {"", "skipped"}:
         return "analyzed", family or "static_source_rejected"
     lowered = log_text.lower()
+    # After a successful helper-source repair the wall moves to the link step: the golden
+    # reference TU and the HLS-C TU both define the original's file-scope globals. That is a
+    # defect in the single-binary equivalence harness, not in the candidate, so it gets its
+    # own family rather than hiding inside "does not compile".
+    if "multiple definition of" in lowered:
+        return "generated", "golden_candidate_symbol_collision"
+    # CHStone is C compiled by a C++ testbench. Narrowing conversions, K&R declarations and
+    # tentative-definition redeclarations are legal C that g++ rejects -- again a property of
+    # the flow, not of the generated HLS-C.
+    if any(marker in lowered for marker in (
+            "narrowing conversion", "redeclared as different kind",
+            "redefinition of", "variable or field")) and "tb/../" in log_text:
+        return "generated", "original_c_not_valid_cpp"
     if "was not declared in this scope" in lowered or "error:" in lowered:
         return "generated", family or "generated_hlsc_does_not_compile"
     return "generated", family or "host_behavior_mismatch"
@@ -247,9 +260,8 @@ def run_agent(bench: ChstoneBenchmark, out_dir: Path, args: argparse.Namespace) 
         "--out", str(project),
         "--no-run-vitis",
     ]
-    cmd.append("--keep-going" if args.keep_going else "--no-llm")
-    if args.keep_going and not args.use_llm:
-        cmd.append("--no-llm")
+    if args.keep_going:
+        cmd.append("--keep-going")
     if args.use_llm:
         cmd.append("--use-llm")
         if args.llm_backend:
@@ -258,8 +270,15 @@ def run_agent(bench: ChstoneBenchmark, out_dir: Path, args: argparse.Namespace) 
             cmd += ["--llm-model", args.llm_model]
         if args.llm_cli_cmd:
             cmd += ["--llm-cli-cmd", args.llm_cli_cmd]
-        if args.auto_repair:
-            cmd += ["--auto-repair", "--max-iterations", str(args.max_iterations)]
+    else:
+        cmd.append("--no-llm")
+    # --auto-repair is independent of --use-llm: hlsc_repair_agent applies deterministic
+    # mechanical repairs (missing includes, helper-source inclusion, restrict compatibility,
+    # interface-pragma stripping) with no model at all, and only escalates to an LLM patch
+    # when one is configured. Gating it on --use-llm measured single-shot generation and
+    # called it the agent.
+    if args.auto_repair:
+        cmd += ["--auto-repair", "--max-iterations", str(args.max_iterations)]
 
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=args.timeout,

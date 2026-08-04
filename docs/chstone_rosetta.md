@@ -72,9 +72,17 @@ constructs; the default (`--keep-going`) matches CHStone's own Vitis flow, which
 | rung | result |
 | --- | --- |
 | native self-check (calibration) | **12/12 pass** |
-| agent, deterministic converter → host equivalence | **0/12** |
-| agent, LLM generator → host equivalence | **2/4** (`dfadd`, `dfmul` pass; `mips`, `sha` fail) |
+| deterministic converter, **with repair** | **0/12** |
+| LLM generator, **with repair** | **2/4** (`dfadd`, `dfmul` pass; `mips`, `sha` fail) |
 | Vitis CSim / CSynth / CoSim | not attempted (no `vitis_hls`) |
+
+**Run the repair loop.** `--auto-repair --max-iterations N` is independent of `--use-llm`:
+`hlsc_repair_agent` applies deterministic mechanical repairs (missing includes,
+helper-source inclusion, `restrict` compatibility, interface-pragma stripping) with no
+model at all, and escalates to an LLM patch only when one is configured. An earlier version
+of this harness gated `--auto-repair` behind `--use-llm`, so the first deterministic result
+published here measured single-shot generation and called it the agent. Both numbers above
+now include repair.
 
 The LLM generator is the headline: it clears a bar the deterministic converter cannot reach
 at all. On `dfmul` it emitted a self-contained 566-line translation — the SoftFloat call
@@ -92,24 +100,41 @@ tell the generator to namespace unconditionally, or compile the golden as a sepa
 translation unit with renamed symbols. Until one lands, treat `mips`/`sha` as a harness
 limitation, not a model result.
 
-The 0/12 is a single, consistent cause, not twelve different failures. Every benchmark
-reaches `generated` and then fails to compile with family
-`generated_hlsc_does_not_compile`. The converter lifts the **top function body** into
-`src/hls_top.cpp` without the file-scope state that a CHStone `main` depends on — the
-test-vector arrays, `#define`s, helper functions and globals. So the generated HLS-C
-references undeclared symbols:
+### Where the deterministic path actually stops
 
-```
-src/hls_top.cpp:16: error: 'test_compressed' was not declared in this scope
-src/hls_top.cpp:21: error: 'IN_END' was not declared in this scope
-src/hls_top.cpp:28: error: 'printf' was not declared in this scope
-```
+Without repair, all 12 fail identically: the converter lifts the **top function body** into
+`src/hls_top.cpp` without the file-scope state a CHStone `main` closes over — test-vector
+arrays, `#define`s, helper functions, globals — so the generated HLS-C references
+undeclared symbols (`test_compressed`, `IN_END`, `float64`, `N`, `x1`).
 
-That is a real and specific statement about the converter's reach: **it is built for
-self-contained top functions with explicit arguments, not for whole-program tops that
-close over file-scope state.** CHStone's `chstone_main` tops are the latter by
-construction. Running with `--strict-diagnostics` instead reports the same thing one rung
-earlier, as `static_source_rejected` with a `file-io` diagnostic (console I/O in the top).
+With repair on, that is no longer the whole story. `hlsc_repair_agent` applies exactly the
+right mechanical fix — *"include original source with renamed top to supply helper
+definitions"* — and the wall moves. The 0/12 is now **three distinct causes**:
+
+| family | n | benchmarks | whose defect |
+| --- | :-: | --- | --- |
+| `golden_candidate_symbol_collision` | 5 | `aes`, `dfadd`, `dfdiv`, `dfmul`, `dfsin` | the equivalence harness |
+| `original_c_not_valid_cpp` | 4 | `adpcm`, `blowfish`, `jpeg`, `motion` | the C-vs-C++ flow |
+| `generated_hlsc_does_not_compile` | 3 | `gsm`, `mips`, `sha` | the converter |
+
+Only the last three are the converter's reach. The other nine are properties of the flow:
+
+- **Symbol collision.** Once the repair includes the original source to supply helpers, the
+  golden reference TU and the HLS-C TU both define the original's file-scope globals
+  (`float_rounding_mode`, `float_exception_flags`, `sha_info_data`, `main_result`), and the
+  link fails with `multiple definition of`. This is the *same* defect that blocks the LLM
+  path on `mips`/`sha`. The equivalence testbench macro-renames the golden *function* but
+  not its globals.
+- **C compiled as C++.** CHStone is C; the equivalence testbench is C++. Narrowing
+  conversions, K&R parameter declarations and tentative-definition redeclarations are legal
+  C that `g++` rejects outright.
+
+Both are fixable in the repo rather than in the benchmark, and fixing the symbol collision
+alone would unblock 5 deterministic benchmarks and 2 LLM ones. That is the highest-value
+next change this exercise surfaced.
+
+Running with `--strict-diagnostics` instead stops one rung earlier, at
+`static_source_rejected` with a `file-io` diagnostic (console I/O in the top).
 
 A second, quieter limitation worth knowing before reading too much into any CHStone
 "equivalence pass": `chstone_main` takes **no arguments**, so host equivalence reduces to
