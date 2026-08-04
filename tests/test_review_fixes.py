@@ -39,6 +39,10 @@ class ExternalFailureStateTests(unittest.TestCase):
         state = _external_failure_state("csim", "log evidence", run_vitis=False)
         self.assertEqual(state.status_for("software_equivalence"), "pass")
         self.assertEqual(state.status_for("csim"), "fail")
+        self.assertEqual(
+            state.phases["software_equivalence"].metadata["evidence_origin"],
+            "operator_assumption",
+        )
 
 
 class ConfigMergeTests(unittest.TestCase):

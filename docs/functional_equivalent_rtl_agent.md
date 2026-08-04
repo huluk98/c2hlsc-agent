@@ -46,7 +46,9 @@ stimuli; otherwise keep coverage metrics and counterexamples in the report.
        input stimulus, CFG shape, and def-use/DDG structure.
      - Add directed cases first: zero, all ones, min/max, alternating bits, length
        boundaries, alias-risk boundaries, and user-provided semantic corners.
-     - Add coverage refinement later with gcov plus KLEE or a constraint-solver shim.
+     - Run gcov concrete coverage plus the generated bounded relational KLEE driver before
+       synthesis. The driver clones shared symbolic state into golden-C and HLS-C calls,
+       then compares the return and complete configured pointer post-state.
    - Failure ownership: insufficient coverage, input trace mismatch, testbench compile
      errors, incorrect argument metadata.
 
@@ -173,7 +175,10 @@ write report and audit memory
   C++ `restrict` compatibility, helper-source inclusion, interface-pragma stripping) and
   can escalate to an optional LLM patch of `src/hls_top.cpp`. The next step is richer,
   evidence-localized repairs driven by PMLC mismatch analysis.
-- Coverage collection now has generated `gcov` and optional KLEE hooks; the next step is to feed uncovered branches and KLEE counterexamples back into stimulus refinement.
+- Coverage collection now has generated `gcov` and optional bounded relational KLEE hooks.
+  Named relational counterexamples feed failure localization; unsupported contracts and
+  infrastructure/incomplete runs remain blocked evidence. The next step is to feed uncovered
+  gcov branches back into stimulus refinement and minimize KLEE counterexample witnesses.
 - Add PMLC instrumentation for CSim/CoSim mismatches.
 - Add an optimizer queue that snapshots candidates and rolls back rejected QoR changes.
 - Add a structured audit ledger and repair-card store.

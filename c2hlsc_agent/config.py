@@ -37,6 +37,9 @@ class AgentConfig:
     keep_going: bool = False
     run_vitis: bool = False
     use_llm: bool = False
+    # Shift-left verification runs after host equivalence and before any HLS backend:
+    # paired traces are required; gcov/KLEE preserve explicit pass/skipped/blocked evidence.
+    run_shift_left: bool = True
     # Live contract_planner: an LLM pass after analysis that proposes per-argument
     # direction/length/range where the regex inference is uncertain; user config wins
     # per-field and the verifier ladder still gates everything. Requires use_llm.
@@ -301,6 +304,7 @@ def load_config(path: Path | None) -> AgentConfig:
         run_vitis=bool(data.get("run_vitis", False)),
         seed=int(data.get("seed", 1)),
         use_llm=bool(data.get("use_llm", False)),
+        run_shift_left=bool(data.get("run_shift_left", True)),
         plan_contracts=bool(data.get("plan_contracts", False)),
         audit_memory=bool(data.get("audit_memory", False)),
         audit_memory_path=(str(data["audit_memory_path"]) if data.get("audit_memory_path") else None),
@@ -354,6 +358,10 @@ def merge_cli_config(config: AgentConfig, args: Any) -> AgentConfig:
         config.use_llm = True
     elif getattr(args, "no_llm", False):
         config.use_llm = False
+    if getattr(args, "shift_left", False):
+        config.run_shift_left = True
+    elif getattr(args, "no_shift_left", False):
+        config.run_shift_left = False
     if getattr(args, "plan_contracts", False):
         config.plan_contracts = True
     elif getattr(args, "no_plan_contracts", False):

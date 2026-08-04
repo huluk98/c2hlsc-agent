@@ -168,7 +168,8 @@ python3 -m c2hlsc_agent.cli repair \
   --evidence /path/to/vitis_cosim.log
 ```
 
-After a repair, copy the repaired project back to Ubuntu and rerun from CSim. Avoid
+After a repair, copy the repaired project back to Ubuntu and rerun from host
+`software_equivalence`, then continue through the full ladder. Avoid
 `--auto-repair` on the server unless generation, Vitis, and repair are intentionally
 running in one local experiment.
 
@@ -189,7 +190,7 @@ single generation step. The intended agents are:
 1. `contract_planner`: extracts the top-function contract, argument bounds, legal input
    domain, and unsupported C constructs.
 2. `shift_left_testbench_agent`: builds the golden-C oracle testbench, directed/random
-   stimuli, and future coverage/KLEE/gcov augmentation.
+   stimuli, paired golden/HLS traces, gcov evidence, and bounded relational KLEE checks.
 3. `hlsc_generator_agent`: emits synthesizable HLS-C and records every transformation.
 4. `cosim_operator`: runs host equivalence, Vitis CSim, synthesis, and C/RTL CoSim in
    short-circuit order.
@@ -201,6 +202,30 @@ single generation step. The intended agents are:
    only after host equivalence, CSim, synthesis, and CoSim pass again.
 8. `audit_memory_agent`: stores reproducible artifacts and promotes only audited repair
    successes into retrieval memory.
+
+The live default verification order is:
+
+```text
+static contract -> host equivalence -> paired traces -> gcov -> KLEE
+                -> CSim -> CSynth -> C/RTL CoSim -> PPA
+```
+
+This is deliberately shift-left: the paired-trace comparison is a pre-synthesis
+correctness gate, gcov is an evidence phase, and KLEE is a bounded relational gate only
+when it emits an exact-schema, named golden-C↔HLS-C counterexample. The driver gives both
+implementations cloned copies of the same symbolic scalars and buffers, then compares the
+return value and the complete configured post-state of every pointer. Input-only buffers
+are also checked for forbidden mutation. Missing KLEE is `skipped`; unsupported contracts,
+instrumentation failures, timeouts, and toolchain problems are `blocked`, not semantic
+failures. A KLEE PASS means no counterexample was found within the configured bounds and
+model assumptions (distinct pointer arguments and no mutable hidden state); it is not a
+universal equivalence proof. Use `--no-shift-left` only when explicitly trading away those
+additional checks; host equivalence remains mandatory.
+
+Every conversion also writes `verification_knowledge_graph.json`, a deterministic
+dependency-free graph connecting the design contract, arguments, generated artifacts,
+verification phases, evidence references, repair outcomes, and later QoR/PPA reports.
+It stores references and metadata, never source code, logs, prompts, or evidence bodies.
 
 Important correction: Vitis C/RTL CoSim checks generated RTL against the HLS-C design
 under the supplied testbench. It does not, by itself, prove that RTL is equivalent to the
@@ -526,8 +551,9 @@ For every generated project, AUTO RTL now writes:
   `leveri_hls_trace.csv`
 - `tb/leveri_compare.py`: checks static trace alignment and dynamic output consistency
 - `tb/run_gcov.py`: compiles/runs the paired traces with gcov coverage flags
-- `tb/klee_driver.cpp`: symbolic KLEE driver for the golden C top function
-- `tb/run_klee.py`: optional KLEE runner that writes a skip report if KLEE is absent
+- `tb/klee_driver.cpp`: single-invocation bounded relational KLEE driver for golden C and HLS-C
+- `tb/run_klee.py`: compiles/links both implementations, runs KLEE, and writes a structured
+  pass, counterexample, blocked, or skipped verdict
 - `tb/leveri_manifest.json`: records KG-ready metadata for the testbench bundle
 
 Run the paired trace check with:
@@ -546,7 +572,20 @@ make coverage
 
 `gcov` reports are written to `coverage/gcov_report.json`. KLEE reports are written to
 `coverage/klee_report.json`; when KLEE is not installed, the script exits successfully
-with a `skipped` report so the generated project remains portable.
+with a `skipped` report so the generated project remains portable. Relational reports use
+schema `c2hlsc-klee-report-v1` and scope `golden_hlsc_relational`; only a FAIL with
+`failure_kind=relational_counterexample` and a named mismatching observable can gate HLS or
+authorize repair. Manual `repair --stage symbolic_klee` likewise requires this JSON report
+and rejects free-form evidence text. The report binds the verdict to the top and SHA-256
+hashes of `input.c`, the HLS header/source, driver, and manifest, and every named mismatch
+must have a matching KTest witness. The manifest preflights mutable hidden state in both the
+golden source and the generated HLS-C candidate.
+
+During `convert`, these targets now run automatically after the main host-equivalence
+test and before any HLS tool invocation. A PASS, SKIP, or structured BLOCKED verdict
+from a report must come from fresh JSON. Separately, a command failure without JSON is
+retained as unstructured degraded BLOCKED phase evidence, so a stale coverage result
+can never certify a new run.
 
 ## Standalone RTL (Verilog) Testbench
 

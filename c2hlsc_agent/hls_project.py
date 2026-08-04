@@ -180,7 +180,7 @@ def write_project(out_dir: Path, analysis: AnalysisResult, generated: GeneratedS
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "src").mkdir(exist_ok=True)
     (out_dir / "tb").mkdir(exist_ok=True)
-    leveri_bundle = generate_leveri_testbenches(analysis, config)
+    leveri_bundle = generate_leveri_testbenches(analysis, config, generated.source)
     verilog_bundle = generate_verilog_testbenches(analysis, config)
     shutil.copyfile(analysis.function.source_path, out_dir / "input.c")
     files = [

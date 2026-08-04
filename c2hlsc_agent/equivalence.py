@@ -17,6 +17,7 @@ class PhaseResult:
     stderr: str = ""
     log_path: Path | None = None
     summary: str = ""
+    metadata: dict[str, object] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -27,6 +28,7 @@ class PhaseResult:
             "stderr": self.stderr[-4000:],
             "log_path": str(self.log_path) if self.log_path else None,
             "summary": self.summary,
+            "metadata": self.metadata,
         }
 
 

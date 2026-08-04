@@ -11,8 +11,8 @@ Operates on a project that already passes the verification ladder. Loop:
    (seconds, no Vitis), then csim+csynth (local or over --vitis-ssh) to score it from
    its csynth report. Candidates that regress timing past the target clock are excluded.
 4. Promote the best strictly-improving candidate into the project and re-run the FULL
-   ladder (host equivalence -> CSim -> CSynth -> CoSim). Acceptance requires the ladder
-   to pass; otherwise the original source is restored.
+   ladder (host equivalence -> enabled shift-left checks -> CSim -> CSynth -> CoSim).
+   Acceptance requires the ladder to pass; otherwise the original source is restored.
 5. Emit the QoR delta report as JSON, Markdown, and a paper-ready LaTeX table, optionally
    enriched by the local yosys/OpenSTA PPA flow (--ppa-script).
 
@@ -573,10 +573,21 @@ def optimize_project(
     promote_mtime = src_path.stat().st_mtime
     outcome.winner_index = best_index
     if cosim_winner:
-        state = verify_project(project_dir, True, verbose=verbose, remote=remote)
+        state = verify_project(
+            project_dir,
+            True,
+            verbose=verbose,
+            remote=remote,
+            run_shift_left=config.run_shift_left,
+        )
         accepted = final_status(state, True, False) == "pass"
     else:
-        state = verify_project(project_dir, False, verbose=verbose)
+        state = verify_project(
+            project_dir,
+            False,
+            verbose=verbose,
+            run_shift_left=config.run_shift_left,
+        )
         accepted = final_status(state, False, False) == "pass"
     if not accepted:
         src_path.write_text(baseline_source, encoding="utf-8")
@@ -707,3 +718,11 @@ def _write_reports(project_dir: Path, outcome: OptimizeOutcome) -> None:
         # A previous accepted run may have left a qor_table.tex; without this, a stale
         # table would contradict the fresh json/md that say the baseline was kept.
         (project_dir / "qor_table.tex").unlink(missing_ok=True)
+    from .knowledge_graph import FILENAME as KNOWLEDGE_GRAPH_FILENAME
+    from .knowledge_graph import refresh_knowledge_graph
+
+    if (project_dir / KNOWLEDGE_GRAPH_FILENAME).exists():
+        try:
+            refresh_knowledge_graph(project_dir)
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            print(f"warning: could not refresh verification knowledge graph: {exc}", file=sys.stderr)

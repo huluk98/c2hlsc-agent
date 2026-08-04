@@ -18,8 +18,14 @@ ladder decides. LLM calls shell out to the local Claude Code CLI (`claude -p`) t
 
 ## Architecture invariants — do not break these
 
-- The verifier ladder (host equivalence → CSim → CSynth → CoSim) is the **only** equivalence
-  gate. Never let LLM output reach disk without passing through it.
+- The verifier ladder (host equivalence → paired shift-left traces → gcov/KLEE evidence →
+  CSim → CSynth → CoSim) controls acceptance. Host equivalence, paired traces, and CoSim are
+  correctness gates; gcov is supporting evidence. KLEE can gate only on a structured,
+  named golden-C↔HLS-C relational counterexample. A clean bounded KLEE run means no
+  counterexample was found under the declared bounds/non-aliasing/no-hidden-state model,
+  never universal equivalence. Relational reports are revision-bound by top/artifact hashes;
+  do not accept legacy, stale, unscoped, vacuous, or free-form evidence. Never let LLM output
+  bypass the ladder.
 - The original golden `input.c` is **never** handed to the repair agent
   (`hlsc_repair_agent`). Repair sees only `src/hls_top.cpp` plus failure evidence.
 - The sha256 oscillation guards must not be bypassed or weakened. There are two layers:
@@ -59,6 +65,9 @@ field; `is_error` or non-JSON stdout raises.
 - `data/hls_nl/` — 10K-record NL corpus (JSONL) plus batch drivers under `scripts/`.
 - `scripts/` — batch/corpus tooling. These are the only places with concurrency at the
   "many independent records" level (`--workers`).
+- Generated projects contain `verification_knowledge_graph.json`, a deterministic graph of
+  contracts, artifacts, verifier phases, evidence references, repairs, and reports. Keep it
+  content-safe: no source, log, prompt, or evidence bodies.
 
 ## Reference docs
 

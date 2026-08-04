@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -11,9 +13,11 @@ from .candidates import select_best_candidate
 from .config import load_config, merge_cli_config
 from .contract_planner import plan_contracts
 from .convert import ReferenceGenerationError, generate_hls_sources, generate_reference_c
-from .hlsc_repair_agent import clear_repair_audit, repair_project
+from .hlsc_repair_agent import clear_repair_audit, load_repair_audit, repair_project
 from .hls_project import write_project
 from .hls_runner import verify_project
+from .knowledge_graph import FILENAME as KNOWLEDGE_GRAPH_FILENAME
+from .knowledge_graph import refresh_knowledge_graph, write_knowledge_graph
 from .llm import build_llm_client, missing_llm_reason
 from .local_hls import LocalHlsCosim, available as local_hls_available, resolve_cosim_backend
 from .remote import RemoteVitis
@@ -120,6 +124,17 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="disable the contract_planner pass even if the config enables it",
     )
+    shift_left = convert.add_mutually_exclusive_group()
+    shift_left.add_argument(
+        "--shift-left",
+        action="store_true",
+        help="run paired traces, gcov, and KLEE before HLS synthesis (default)",
+    )
+    shift_left.add_argument(
+        "--no-shift-left",
+        action="store_true",
+        help="skip the additional paired-trace and coverage checks; host equivalence still runs",
+    )
     memory = convert.add_mutually_exclusive_group()
     memory.add_argument(
         "--audit-memory",
@@ -167,7 +182,12 @@ def build_parser() -> argparse.ArgumentParser:
     convert.add_argument("--verbose", action="store_true", help="print command output")
     repair = sub.add_parser("repair", help="apply a repair from externally supplied Vitis/verification evidence")
     repair.add_argument("--project", required=True, help="existing generated project directory")
-    repair.add_argument("--stage", required=True, choices=["software_equivalence", "csim", "csynth", "cosim"], help="earliest failing stage from the external run")
+    repair.add_argument(
+        "--stage",
+        required=True,
+        choices=["software_equivalence", "shift_left_trace", "coverage_gcov", "symbolic_klee", "csim", "csynth", "cosim"],
+        help="earliest failing stage from the external run",
+    )
     repair.add_argument("--evidence", action="append", default=[], help="path to a log/report file from the failing stage; may be repeated")
     repair.add_argument("--evidence-text", default="", help="inline failing-stage evidence text")
     repair.add_argument("--input", help="original input C file; defaults to PROJECT/input.c")
@@ -193,7 +213,7 @@ def build_parser() -> argparse.ArgumentParser:
     optimize.add_argument(
         "--no-cosim-winner",
         action="store_true",
-        help="accept the winner after host equivalence only (skip the full Vitis re-ladder); NOT recommended",
+        help="accept the winner after host equivalence plus enabled shift-left checks (skip the full Vitis re-ladder); NOT recommended",
     )
     optimize.add_argument(
         "--ppa-script",
@@ -428,7 +448,14 @@ def run_convert(args: argparse.Namespace) -> int:
     seen_signatures = {_project_signature(out_dir)}
     for iteration in range(iterations):
         completed_iterations = iteration + 1
-        state = verify_project(out_dir, config.run_vitis, verbose=args.verbose, remote=remote, local=local)
+        state = verify_project(
+            out_dir,
+            config.run_vitis,
+            verbose=args.verbose,
+            remote=remote,
+            local=local,
+            run_shift_left=config.run_shift_left,
+        )
         status = final_status(state, config.run_vitis, analysis.diagnostics.has_errors)
         if status == "pass":
             break
@@ -606,11 +633,208 @@ def _read_evidence(paths: list[str], inline: str) -> str:
     return "\n\n".join(part for part in parts if part)
 
 
-def _external_failure_state(stage: str, evidence: str, run_vitis: bool):
+def _read_relational_klee_evidence(
+    paths: list[str],
+    inline: str,
+    project_dir: Path | None = None,
+    expected_top: str | None = None,
+) -> tuple[str, dict[str, object]]:
+    """Require structured, scoped evidence before a manual KLEE repair.
+
+    Free-form KLEE text cannot distinguish a golden/HLS-C counterexample from a
+    harness, contract, timeout, or toolchain failure.  The generated report is the
+    authority, and only its small verdict allowlist is propagated into orchestration.
+    """
+
+    if inline.strip():
+        raise SystemExit(
+            "--evidence-text is not accepted for --stage symbolic_klee; pass the "
+            "generated coverage/klee_report.json with --evidence"
+        )
+    if not paths:
+        raise SystemExit(
+            "--stage symbolic_klee requires the generated coverage/klee_report.json "
+            "via --evidence"
+        )
+
+    metadata: dict[str, object] | None = None
+    required_artifacts = (
+        "input.c",
+        "src/hls_top.hpp",
+        "src/hls_top.cpp",
+        "tb/klee_driver.cpp",
+        "tb/leveri_manifest.json",
+    )
+    name_pattern = re.compile(
+        r"^C2HLSC_RELATIONAL_MISMATCH:(?:return|[A-Za-z_][A-Za-z0-9_]*)$"
+    )
+    for item in paths:
+        path = Path(item).expanduser().resolve()
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        names = payload.get("counterexample_names")
+        counterexamples = payload.get("counterexamples")
+        ktest_files = payload.get("ktest_files")
+        witnessed_names: set[str] = set()
+        witnessed_ktests: set[str] = set()
+        if isinstance(counterexamples, list) and isinstance(ktest_files, list):
+            safe_ktests = {
+                name
+                for name in ktest_files
+                if isinstance(name, str)
+                and re.fullmatch(r"coverage/klee-out/test[0-9]+\.ktest", name)
+            }
+            for counterexample in counterexamples:
+                if not isinstance(counterexample, dict):
+                    continue
+                observable = counterexample.get("observable")
+                error_file = counterexample.get("error_file")
+                if not (
+                    isinstance(observable, str)
+                    and name_pattern.fullmatch(observable)
+                    and isinstance(error_file, str)
+                    and re.fullmatch(
+                        r"coverage/klee-out/test[0-9]+\.c2hlsc_relational\.err",
+                        error_file,
+                    )
+                ):
+                    continue
+                expected_ktest = error_file[: -len(".c2hlsc_relational.err")] + ".ktest"
+                if expected_ktest in safe_ktests:
+                    witnessed_names.add(observable)
+                    witnessed_ktests.add(expected_ktest)
+        artifact_hashes = payload.get("artifact_sha256")
+        assumptions = payload.get("assumptions")
+        model_matches = (
+            payload.get("invocations") == 1
+            and type(payload.get("observable_count")) is int
+            and payload["observable_count"] > 0
+            and isinstance(assumptions, dict)
+            and assumptions.get("pointer_alias_model") == "distinct_pointer_arguments"
+            and assumptions.get("hidden_state_model") == "no_mutable_hidden_state"
+            and assumptions.get("comparison") == "return_and_complete_pointer_post_state"
+        )
+        provenance_matches = (
+            isinstance(artifact_hashes, dict)
+            and isinstance(payload.get("top"), str)
+            and bool(payload["top"])
+            and set(artifact_hashes) == set(required_artifacts)
+            and all(
+                isinstance(artifact_hashes[relative], str)
+                and re.fullmatch(r"[0-9a-fA-F]{64}", artifact_hashes[relative])
+                for relative in required_artifacts
+            )
+        )
+        if project_dir is not None:
+            provenance_matches = provenance_matches and (
+                payload.get("top") == expected_top
+                and all(
+                    (project_dir / relative).is_file()
+                    and hashlib.sha256((project_dir / relative).read_bytes()).hexdigest()
+                    == artifact_hashes[relative].lower()
+                    for relative in required_artifacts
+                )
+            )
+        if (
+            isinstance(payload, dict)
+            and payload.get("schema") == "c2hlsc-klee-report-v1"
+            and payload.get("scope") == "golden_hlsc_relational"
+            and str(payload.get("status", "")).lower() == "fail"
+            and payload.get("outcome") == "counterexample"
+            and payload.get("failure_kind") == "relational_counterexample"
+            and isinstance(names, list)
+            and names
+            and all(
+                isinstance(name, str) and name_pattern.fullmatch(name)
+                for name in names
+            )
+            and set(names) == witnessed_names
+            and model_matches
+            and provenance_matches
+        ):
+            safe_names = sorted(set(names))
+            metadata = {
+                "schema": payload["schema"],
+                "scope": payload["scope"],
+                "outcome": payload["outcome"],
+                "failure_kind": payload["failure_kind"],
+                "counterexample_names": safe_names,
+                "counterexample_count": len(safe_names),
+                "counterexample_ktest_files": sorted(witnessed_ktests),
+                "evidence_origin": "validated_external_report",
+            }
+            for key in (
+                "completed_paths",
+                "generated_tests",
+                "timed_out",
+                "invocations",
+                "observable_count",
+            ):
+                value = payload.get(key)
+                if isinstance(value, (int, bool)):
+                    metadata[key] = value
+            if isinstance(payload.get("top"), str):
+                metadata["top"] = payload["top"]
+            if isinstance(artifact_hashes, dict):
+                metadata["artifact_sha256"] = {
+                    relative: artifact_hashes[relative].lower()
+                    for relative in required_artifacts
+                    if isinstance(artifact_hashes.get(relative), str)
+                    and re.fullmatch(r"[0-9a-fA-F]{64}", artifact_hashes[relative])
+                }
+            bounded_lengths = payload.get("bounded_lengths")
+            if isinstance(bounded_lengths, dict):
+                metadata["bounded_lengths"] = {
+                    name: value
+                    for name, value in bounded_lengths.items()
+                    if isinstance(name, str) and type(value) is int and value > 0
+                }
+            scalar_ranges = payload.get("scalar_ranges")
+            if isinstance(scalar_ranges, dict):
+                metadata["scalar_ranges"] = {
+                    name: list(value)
+                    for name, value in scalar_ranges.items()
+                    if isinstance(name, str)
+                    and isinstance(value, list)
+                    and len(value) == 2
+                    and all(type(bound) is int for bound in value)
+                }
+            assumptions = payload.get("assumptions")
+            if isinstance(assumptions, dict):
+                metadata["assumptions"] = {
+                    key: assumptions[key]
+                    for key in (
+                        "pointer_alias_model",
+                        "hidden_state_model",
+                        "comparison",
+                    )
+                    if isinstance(assumptions.get(key), str)
+                }
+            break
+
+    if metadata is None:
+        raise SystemExit(
+            "symbolic_klee repair requires a c2hlsc-klee-report-v1 FAIL report "
+            "scoped to golden_hlsc_relational with a named relational counterexample"
+        )
+    compact = json.dumps({"validated_relational_klee": metadata}, sort_keys=True)
+    return compact, metadata
+
+
+def _external_failure_state(
+    stage: str,
+    evidence: str,
+    run_vitis: bool,
+    metadata: dict[str, object] | None = None,
+):
     from .equivalence import PhaseResult, VerificationState
 
     state = VerificationState()
-    phases = ["software_equivalence"]
+    phases = ["software_equivalence", "shift_left_trace", "coverage_gcov", "symbolic_klee"]
     if run_vitis:
         phases.extend(["csim", "csynth", "cosim"])
     if stage not in phases:
@@ -618,9 +842,27 @@ def _external_failure_state(stage: str, evidence: str, run_vitis: bool):
         phases.append(stage)
     for phase in phases:
         if phase == stage:
-            state.add_phase(PhaseResult(phase, "fail", stdout=evidence, summary="external evidence supplied"))
+            state.add_phase(
+                PhaseResult(
+                    phase,
+                    "fail",
+                    stdout=evidence,
+                    summary="external evidence supplied",
+                    metadata=dict(metadata or {}),
+                )
+            )
             break
-        state.add_phase(PhaseResult(phase, "pass", summary="assumed pass before external failing stage"))
+        state.add_phase(
+            PhaseResult(
+                phase,
+                "pass",
+                summary="operator assumed pass before external failing stage",
+                metadata={
+                    "evidence_origin": "operator_assumption",
+                    "assumed_for_external_stage": stage,
+                },
+            )
+        )
     for phase in phases[phases.index(stage) + 1 :]:
         state.add_phase(PhaseResult(phase, "blocked", summary=f"{stage} failed"))
     return state
@@ -637,8 +879,17 @@ def run_repair(args: argparse.Namespace) -> int:
         config.top = _load_project_top(project_dir)
     if not config.top:
         raise SystemExit("--top is required because conversion_report.json does not record a top function")
-    config.run_vitis = args.stage != "software_equivalence"
-    evidence = _read_evidence(args.evidence, args.evidence_text)
+    config.run_vitis = args.stage in {"csim", "csynth", "cosim"}
+    evidence_metadata: dict[str, object] = {}
+    if args.stage == "symbolic_klee":
+        evidence, evidence_metadata = _read_relational_klee_evidence(
+            args.evidence,
+            args.evidence_text,
+            project_dir=project_dir,
+            expected_top=config.top,
+        )
+    else:
+        evidence = _read_evidence(args.evidence, args.evidence_text)
     if not evidence:
         raise SystemExit("--evidence or --evidence-text is required")
 
@@ -650,7 +901,9 @@ def run_repair(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
     analysis = analyze_source(config.input_files[0], config.top, config)
-    state = _external_failure_state(args.stage, evidence, config.run_vitis)
+    state = _external_failure_state(
+        args.stage, evidence, config.run_vitis, metadata=evidence_metadata
+    )
     repair = repair_project(project_dir, analysis, config, state, args.iteration, llm=llm)
     manual_report = project_dir / "manual_repair_report.json"
     manual_report.write_text(
@@ -659,6 +912,7 @@ def run_repair(args: argparse.Namespace) -> int:
                 "mode": "external_evidence_manual_repair",
                 "project": str(project_dir),
                 "stage": args.stage,
+                "relational_klee": evidence_metadata,
                 "repair": repair.to_dict(),
                 "next_step": "rerun verification or CoSim from the beginning on the Vitis machine",
             },
@@ -666,6 +920,14 @@ def run_repair(args: argparse.Namespace) -> int:
         ),
         encoding="utf-8",
     )
+    write_knowledge_graph(
+        project_dir,
+        analysis,
+        config,
+        state=state,
+        repair_history=load_repair_audit(project_dir),
+    )
+    refresh_knowledge_graph(project_dir)
     print(repair.summary)
     print(f"Manual repair report: {manual_report}")
     return 0 if repair.changed else 1
@@ -708,6 +970,11 @@ def _optimize_local_hls_baseline(project_dir: Path, config, analysis, verbose: b
         + "\n",
         encoding="utf-8",
     )
+    if (project_dir / KNOWLEDGE_GRAPH_FILENAME).exists():
+        try:
+            refresh_knowledge_graph(project_dir, phase_updates={"ppa": phase.status})
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            print(f"warning: could not refresh verification knowledge graph: {exc}", file=sys.stderr)
     # A "fail" here means a declared PPA criterion is unmet and this backend cannot
     # optimize toward it — surface that as a non-zero exit.
     return 1 if phase.status == "fail" else 0
@@ -812,6 +1079,11 @@ def run_ppa(args: argparse.Namespace) -> int:
         project_dir, config, verbose=args.verbose, clock_port=args.clock_port,
         gate_sim=not args.no_gate_sim, sta_bin=args.sta_bin,
     )
+    if (project_dir / KNOWLEDGE_GRAPH_FILENAME).exists():
+        try:
+            refresh_knowledge_graph(project_dir, phase_updates={"ppa": phase.status})
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            print(f"warning: could not refresh verification knowledge graph: {exc}", file=sys.stderr)
     print(f"PPA[{config.node}]: {phase.status} — {phase.summary}")
     print(f"Report: {project_dir / 'ppa_report.json'}")
     return 0 if phase.status in ("pass", "skipped") else 1
