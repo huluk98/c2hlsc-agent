@@ -962,12 +962,22 @@ def evaluate_rtl(
     compile_timeout: int = DEFAULT_COMPILE_TIMEOUT,
     sim_timeout: int = DEFAULT_SIM_TIMEOUT,
     apply_shims: bool = True,
+    enforce_illegal_task_gate: bool = True,
 ) -> SimResult:
     """Compile and simulate ``rtl_text`` against ``design``'s testbench in ``workdir``.
 
     Thread-safe as long as each concurrent call gets its own ``workdir``: no module state
     is mutated and every tool runs with ``cwd=workdir``. Never raises -- a broken toolchain
     comes back as ``syntax_pass=False`` with the reason in ``compile_log``.
+
+    ``enforce_illegal_task_gate=False`` skips the admissibility check of
+    :func:`find_illegal_system_tasks` and lets a candidate that can write to the simulator's
+    stdout run anyway. **The verdict it returns is not a sound score**: the pass oracle is a
+    substring test over a stream the design under test shares with the testbench, so such a
+    candidate can print its own ``Pass``. It exists for one purpose -- measuring how much the
+    gate costs a set of candidates that were produced without being told about it, so the
+    gate's effect on a comparison can be stated rather than assumed. Nothing that feeds a
+    headline number may use it.
     """
 
     workdir = Path(workdir)
@@ -981,6 +991,7 @@ def evaluate_rtl(
             compile_timeout=compile_timeout,
             sim_timeout=sim_timeout,
             apply_shims=apply_shims,
+            enforce_illegal_task_gate=enforce_illegal_task_gate,
         )
     except Exception as exc:  # pragma: no cover - a harness crash must not kill a sweep
         return SimResult(
@@ -1006,6 +1017,7 @@ def _evaluate_rtl(
     compile_timeout: int,
     sim_timeout: int,
     apply_shims: bool,
+    enforce_illegal_task_gate: bool = True,
 ) -> SimResult:
     shim_applied = _prepare_workdir(design, rtl_text, workdir, apply_shims)
 
@@ -1013,7 +1025,7 @@ def _evaluate_rtl(
     # (or to end the run early) can produce its own verdict, and no downstream oracle could
     # tell that apart from a real pass. The candidate is still written to the sandbox so the
     # refusal is auditable next to every other attempt.
-    violations = find_illegal_system_tasks(rtl_text)
+    violations = find_illegal_system_tasks(rtl_text) if enforce_illegal_task_gate else ()
     if violations:
         compile_log = illegal_task_report(violations)
         return SimResult(

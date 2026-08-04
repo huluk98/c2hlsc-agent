@@ -1,7 +1,15 @@
 #!/usr/bin/env python3
 """Run the RTLLM v2.0 benchmark end to end: natural-language spec -> RTL -> iverilog verdict.
 
-Three modes:
+Four modes:
+
+``--external-rtl DIR``
+    Score *pre-generated* RTL from some other model through this exact pipeline -- same
+    testbenches, same shims, same dual oracle, same failure taxonomy -- so a comparison
+    against the agent is like-for-like rather than a quote from someone else's paper. No LLM
+    is constructed. ``DIR`` either holds one file per design, or per-trial subdirectories
+    (``t1``, ``t2``, ...), in which case each trial is one SAMPLE of the same model and
+    ``pass@k`` works exactly as it does under ``--samples N``.
 
 ``--reference``
     Evaluate the benchmark's *own* ``verified_*.v`` against its own testbench. No LLM client is
@@ -92,6 +100,12 @@ LLM_ERROR_FAMILY = "llm_error"
 #: A design whose whole run raised inside the driver (bad benchmark dir, agent bug, ...).
 DRIVER_ERROR_FAMILY = "driver_error"
 UNKNOWN_FAMILY = "unknown"
+#: ``--external-rtl``: the trial shipped no file for this design. Scored as a failed sample
+#: rather than dropped, and counted separately in the report so the denominator is auditable.
+MISSING_CANDIDATE_FAMILY = "missing_candidate"
+#: Stamped into the synthetic ``compile_log`` of a missing candidate so a stored row explains
+#: itself without the driver.
+MISSING_CANDIDATE_MARKER = "run_rtllm_v2: no candidate RTL file for this design in this trial"
 
 
 # --------------------------------------------------------------------------- #
@@ -202,6 +216,10 @@ RESUME_CRITICAL_KEYS = (
     "plan",
     "sim_timeout",
     "compile_timeout",
+    # mode alone does not separate two --external-rtl sweeps: both are mode="external", and
+    # merging gpt-3.5's rows with gpt-4's would report one model's designs as the other's.
+    "external_rtl",
+    "external_label",
 )
 
 
@@ -211,6 +229,7 @@ def run_config_fingerprint(
     *,
     backend: "str | None" = None,
     model: "str | None" = None,
+    extra: "dict[str, Any] | None" = None,
 ) -> "dict[str, Any]":
     """The scoring-relevant configuration stamped into every results row."""
 
@@ -218,6 +237,7 @@ def run_config_fingerprint(
     fingerprint.update(config.to_dict())
     fingerprint["backend"] = backend
     fingerprint["model"] = model
+    fingerprint.update(extra or {})
     return fingerprint
 
 
@@ -373,6 +393,226 @@ def run_reference_design(
         func_success=int(sim.func_pass),
     )
     return result.to_dict()
+
+
+# --------------------------------------------------------------------------- #
+# external RTL (--external-rtl): score another model's pre-generated files
+# --------------------------------------------------------------------------- #
+
+
+def discover_external_trials(root: Path) -> "list[Path]":
+    """The trial directories under ``root``, sorted; ``[root]`` when it holds the files itself.
+
+    A "trial" is any immediate subdirectory containing at least one ``.v`` file. RTLLM ships
+    its archived model output as ``_chatgpt4/t1 ... t5``, five independent generations of the
+    same design set, which is exactly the shape ``--samples 5`` produces for the agent -- so
+    each trial becomes one sample and pass@k is the same estimator over the same n.
+
+    Sorted by name so sample indices are stable across runs (and so ``t10`` cannot swap
+    places with ``t2`` between two invocations and silently re-label the artifacts).
+    """
+
+    root = Path(root)
+    if not root.is_dir():
+        raise SystemExit(f"--external-rtl directory not found: {root}")
+    trials = sorted(
+        (entry for entry in root.iterdir() if entry.is_dir() and any(entry.glob("*.v"))),
+        key=lambda path: path.name,
+    )
+    if trials:
+        return trials
+    if any(root.glob("*.v")):
+        return [root]
+    raise SystemExit(
+        f"--external-rtl {root} holds no .v files, and none of its subdirectories do either. "
+        "Point it at a directory of <design>.v files, or at one holding per-trial "
+        "subdirectories (t1, t2, ...) of them."
+    )
+
+
+def resolve_external_candidate(
+    trial: Path, design_name: str
+) -> "tuple[Path | None, str]":
+    """Find ``design_name``'s candidate file in ``trial``: ``(path, how_it_was_resolved)``.
+
+    Exact ``<design>.v`` first -- that is the documented layout and the only resolution that
+    needs no explanation. Two fallbacks follow, and **both are reported** in report.json's
+    ``resolved_by_fallback`` rather than applied silently, because each one is a judgement
+    call about whose file this is:
+
+    ``case``
+        the same stem in a different case, on a case-sensitive filesystem.
+    ``module``
+        no filename match, but exactly one ``.v`` file in the trial *declares* ``module
+        <design_name>``. RTLLM's own archive needs this: every ``_chatgpt35`` trial ships
+        the ``calendar`` design as ``calender.v`` (upstream typo) with ``module calendar``
+        inside. Scoring that as a miss would charge the model five failures for a filename.
+
+    Ambiguity is never resolved: two files declaring the module leave the design missing.
+    """
+
+    exact = trial / f"{design_name}.v"
+    if exact.is_file():
+        return exact, "exact"
+
+    candidates = sorted(path for path in trial.glob("*.v") if path.is_file())
+    lowered = design_name.lower()
+    by_case = [path for path in candidates if path.stem.lower() == lowered]
+    if len(by_case) == 1:
+        return by_case[0], "case"
+
+    by_module = []
+    for path in candidates:
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if any(m.group("name") == design_name for m in rtllm_bench._ANY_MODULE_RE.finditer(text)):
+            by_module.append(path)
+    if len(by_module) == 1:
+        return by_module[0], "module"
+    return None, "missing"
+
+
+def external_basis(
+    trials: "Sequence[Path]", designs: "Sequence[rtllm_bench.RtllmDesign]"
+) -> "list[rtllm_bench.RtllmDesign]":
+    """The designs this external set actually attempted: present in at least one trial.
+
+    A model that shipped 29 of the benchmark's 50 designs did not fail the other 21, it was
+    never asked about them, and scoring 0/50 would be a statement about the archive rather
+    than about the model. The basis size is printed in report.json and report.md so the
+    denominator can never be read as "the whole benchmark" by accident.
+    """
+
+    return [
+        design
+        for design in designs
+        if any(resolve_external_candidate(trial, design.name)[0] for trial in trials)
+    ]
+
+
+def _missing_candidate_sim(design_name: str, trial: Path) -> rtllm_bench.SimResult:
+    return rtllm_bench.SimResult(
+        design=design_name,
+        syntax_pass=False,
+        func_pass=False,
+        func_pass_strict=False,
+        timed_out=False,
+        compile_log=(
+            f"{MISSING_CANDIDATE_MARKER}\n"
+            f"Looked for {trial / (design_name + '.v')} (and for a .v file declaring "
+            f"'module {design_name}'); found neither. Recorded as a failed sample of this "
+            "model, not dropped: dropping it would shrink the denominator and raise the rate."
+        ),
+        sim_log="",
+        duration_s=0.0,
+        failure_family=MISSING_CANDIDATE_FAMILY,
+    )
+
+
+def run_external_design(
+    design: rtllm_bench.RtllmDesign,
+    trials: "Sequence[Path]",
+    config: rtllm_agent.RtllmAgentConfig,
+    workdir: Path,
+    *,
+    gate_impact: bool = True,
+) -> "dict[str, Any]":
+    """Score one design's pre-generated RTL, one sample per trial.
+
+    Each sample has exactly one round: these files were produced without a verifier in the
+    loop, so there is nothing to repair and ``pass@1 round 0`` equals ``pass@1 with repair``
+    by construction. That is the honest comparison point against the agent's round-0 number.
+
+    When the illegal-system-task gate refuses a candidate and ``gate_impact`` is set, the
+    same file is re-run with the gate disabled *purely to record what the gate cost*. That
+    second verdict never touches ``syntax_pass``/``func_pass`` -- it is stored under
+    ``gate_impact`` and reported as a delta, because a candidate that can print is a
+    candidate that can print its own ``Pass``.
+    """
+
+    samples: "list[rtllm_agent.SampleResult]" = []
+    missing: "list[str]" = []
+    fallbacks: "list[dict[str, Any]]" = []
+    impacts: "list[dict[str, Any]]" = []
+
+    for index, trial in enumerate(trials):
+        path, resolved_by = resolve_external_candidate(trial, design.name)
+        if path is None:
+            missing.append(trial.name)
+            sim = _missing_candidate_sim(design.name, trial)
+            rtl = ""
+        else:
+            if resolved_by != "exact":
+                fallbacks.append(
+                    {
+                        "design": design.name,
+                        "trial": trial.name,
+                        "path": str(path),
+                        "resolved_by": resolved_by,
+                    }
+                )
+            rtl = path.read_text(encoding="utf-8", errors="replace")
+            sim = rtllm_bench.evaluate_rtl(
+                design,
+                rtl,
+                Path(workdir) / f"sample{index}",
+                compile_timeout=config.compile_timeout,
+                sim_timeout=config.sim_timeout,
+                apply_shims=config.apply_shims,
+            )
+            if gate_impact and sim.failure_family == "illegal_system_task":
+                ungated = rtllm_bench.evaluate_rtl(
+                    design,
+                    rtl,
+                    Path(workdir) / f"sample{index}_ungated",
+                    compile_timeout=config.compile_timeout,
+                    sim_timeout=config.sim_timeout,
+                    apply_shims=config.apply_shims,
+                    enforce_illegal_task_gate=False,
+                )
+                impacts.append(
+                    {
+                        "design": design.name,
+                        "trial": trial.name,
+                        "sample": index,
+                        "path": str(path),
+                        "gated_verdict": "rejected_illegal_system_task",
+                        "ungated_syntax_pass": bool(ungated.syntax_pass),
+                        "ungated_func_pass": bool(ungated.func_pass),
+                        "ungated_func_pass_strict": bool(ungated.func_pass_strict),
+                        "ungated_failure_family": ungated.failure_family,
+                    }
+                )
+
+        attempt = rtllm_agent.AttemptRecord(round=0, role="external_rtl", sim=sim, rtl=rtl)
+        samples.append(
+            rtllm_agent.SampleResult(
+                design=design.name,
+                sample=index,
+                syntax_pass=sim.syntax_pass,
+                func_pass=sim.func_pass,
+                func_pass_strict=sim.func_pass_strict,
+                rounds=[attempt],
+                contract=None,
+                final_rtl=rtl,
+                evidence_policy="none",
+            )
+        )
+
+    result = rtllm_agent.DesignResult(
+        design=design.name,
+        category=design.category,
+        samples=samples,
+        syntax_success=sum(1 for s in samples if s.syntax_pass),
+        func_success=sum(1 for s in samples if s.func_pass),
+    )
+    row = result.to_dict()
+    row["missing_candidate_trials"] = missing
+    row["resolved_by_fallback"] = fallbacks
+    row["gate_impact"] = impacts
+    return row
 
 
 def execute(
@@ -670,6 +910,7 @@ def build_report(
     wall_clock_s: float = 0.0,
     interrupted: bool = False,
     resumed: int = 0,
+    external: "dict[str, Any] | None" = None,
 ) -> "dict[str, Any]":
     """Aggregate finished ``DesignResult`` rows into the report.json payload.
 
@@ -717,7 +958,8 @@ def build_report(
     excluded_from_sound = sorted(
         {row["design"] for row in table} - {row["design"] for row in sound}
     )
-    return {
+    payload_external = external_section(rows, external) if external is not None else None
+    report = {
         "mode": mode,
         "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "benchmark": benchmark,
@@ -776,6 +1018,78 @@ def build_report(
         },
         "designs": table,
     }
+    if payload_external is not None:
+        report["external"] = payload_external
+    return report
+
+
+def external_section(
+    rows: "Sequence[dict[str, Any]]", meta: "dict[str, Any]"
+) -> "dict[str, Any]":
+    """The ``external`` block of report.json: whose RTL this was and what was skipped.
+
+    Aggregated from the rows rather than from the sweep's in-memory state, so a ``--resume``
+    that finishes a half-done comparison reports the same numbers as an uninterrupted one.
+    """
+
+    missing: "dict[str, list[str]]" = {}
+    fallbacks: "list[dict[str, Any]]" = []
+    impacts: "list[dict[str, Any]]" = []
+    for row in rows:
+        trials = row.get("missing_candidate_trials")
+        if isinstance(trials, list) and trials:
+            missing[str(row.get("design"))] = [str(name) for name in trials]
+        for entry in row.get("resolved_by_fallback") or []:
+            if isinstance(entry, dict):
+                fallbacks.append(entry)
+        for entry in row.get("gate_impact") or []:
+            if isinstance(entry, dict):
+                impacts.append(entry)
+
+    rescued = [entry for entry in impacts if entry.get("ungated_func_pass")]
+    return {
+        "label": meta.get("label"),
+        "rtl_dir": meta.get("rtl_dir"),
+        "trials": list(meta.get("trials") or []),
+        "trial_count": len(meta.get("trials") or []),
+        "basis_designs": meta.get("basis_designs"),
+        "benchmark_designs": meta.get("benchmark_designs"),
+        "basis_note": (
+            "Only designs with a candidate file in at least one trial are in this model's "
+            "basis. Designs the archive never attempted are out of the denominator entirely; "
+            "a design attempted in SOME trials counts as a failed sample in the trials that "
+            "are missing it (see missing_candidates)."
+        ),
+        "missing_candidates": dict(sorted(missing.items())),
+        "missing_candidate_samples": sum(len(v) for v in missing.values()),
+        "missing_candidate_designs": len(missing),
+        "resolved_by_fallback": sorted(
+            fallbacks, key=lambda e: (str(e.get("design")), str(e.get("trial")))
+        ),
+        "gate_impact": {
+            "enabled": bool(meta.get("gate_impact_enabled")),
+            "rejected_samples": len(impacts),
+            "rejected_designs": len({str(entry.get("design")) for entry in impacts}),
+            "would_pass_without_gate": len(rescued),
+            "would_pass_without_gate_designs": sorted(
+                {str(entry.get("design")) for entry in rescued}
+            ),
+            "samples": sorted(
+                impacts, key=lambda e: (str(e.get("design")), str(e.get("trial")))
+            ),
+            "note": (
+                "The illegal-system-task gate (rtllm_bench.find_illegal_system_tasks) is "
+                "applied to external RTL exactly as it is to the agent's. It is part of the "
+                "oracle, not a house rule: the benchmark scores by grepping the simulator's "
+                "stdout for 'Pass', and the design under test shares that stream with the "
+                "testbench, so a candidate containing $display can print its own verdict. "
+                "These files were nonetheless produced without being told about the gate, so "
+                "'would_pass_without_gate' states what it cost -- the largest number of "
+                "designs this comparison could possibly be understating. That number is "
+                "NOT a score: an ungated pass cannot be distinguished from a self-reported one."
+            ),
+        },
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -800,11 +1114,18 @@ def render_markdown(report: "dict[str, Any]") -> str:
     lines.append("# RTLLM v2.0 report")
     lines.append("")
     mode = report["mode"]
-    engine = (
-        "reference (the benchmark's own verified RTL; no model involved)"
-        if mode == "reference"
-        else f"agent (backend={report.get('backend')}, model={report.get('model')})"
-    )
+    external = report.get("external") or {}
+    if mode == "reference":
+        engine = "reference (the benchmark's own verified RTL; no model involved)"
+    elif mode == "empty":
+        engine = "empty stub (a port-only module with no logic; no model involved)"
+    elif mode == "external":
+        engine = (
+            f"external RTL from `{external.get('label')}`, pre-generated and scored through "
+            "this harness (no model was called by this run)"
+        )
+    else:
+        engine = f"agent (backend={report.get('backend')}, model={report.get('model')})"
     lines.append(f"- mode: **{mode}** -- {engine}")
     lines.append(f"- benchmark: `{report.get('benchmark')}`")
     lines.append(f"- generated: {report.get('timestamp')}")
@@ -820,7 +1141,30 @@ def render_markdown(report: "dict[str, Any]") -> str:
     # No report.md is quotable without the configuration that produced it: `samples` and
     # `max_repair_rounds` alone are the difference between a single-shot number and a
     # best-of-15 one.
-    config = report.get("agent_config") or {}
+    config = dict(report.get("agent_config") or {})
+    if mode == "external":
+        # The scoring knobs that are meaningless for a file that was never regenerated: no
+        # planner ran, no repair round existed, no evidence was shown to anything.
+        for key in ("plan", "max_repair_rounds", "evidence_policy", "llm_retries"):
+            config.pop(key, None)
+        gate = external.get("gate_impact") or {}
+        config.update(
+            {
+                "external_label": external.get("label"),
+                "external_rtl_dir": external.get("rtl_dir"),
+                "external_trials": ", ".join(external.get("trials") or []) or "(none)",
+                "external_trial_count": external.get("trial_count"),
+                "external_basis_designs": (
+                    f"{external.get('basis_designs')} of "
+                    f"{external.get('benchmark_designs')} benchmark designs"
+                ),
+                "external_missing_candidate_samples": external.get("missing_candidate_samples"),
+                "external_missing_candidate_designs": external.get("missing_candidate_designs"),
+                "illegal_task_gate": "enforced (same as the agent run)",
+                "illegal_task_gate_rejected_samples": gate.get("rejected_samples"),
+                "illegal_task_gate_would_pass_disabled": gate.get("would_pass_without_gate"),
+            }
+        )
     if config:
         lines.append("## Configuration")
         lines.append("")
@@ -885,6 +1229,14 @@ def render_markdown(report: "dict[str, Any]") -> str:
         "is the agent's score, not the base model's. Only `pass@1, round 0` is comparable to a "
         "published single-shot RTLLM pass@1."
     )
+    if mode == "external":
+        lines.append("")
+        lines.append(
+            "This run scored **pre-generated files**: every sample has exactly one round, so "
+            "`pass@1, with repair` and `pass@1, round 0` are the same number by construction. "
+            "The agent number to compare against is its **round 0** column, not its with-repair "
+            "one -- these candidates had no verifier in the loop."
+        )
     lines.append("")
 
     lines.append("## Designs")
@@ -917,6 +1269,56 @@ def render_markdown(report: "dict[str, Any]") -> str:
 
     lines.append("## Caveats")
     lines.append("")
+    if external:
+        gate = external.get("gate_impact") or {}
+        lines.append(
+            f"**Basis.** `{external.get('label')}` shipped RTL for "
+            f"{external.get('basis_designs')} of the {external.get('benchmark_designs')} "
+            "benchmark designs discovered here. Only those are in the denominator; the rest "
+            "were never attempted and are not counted as failures. Any rate from this report "
+            "is a rate over that basis, not over the whole benchmark."
+        )
+        lines.append("")
+        missing = external.get("missing_candidates") or {}
+        if missing:
+            lines.append(
+                f"**Missing candidates.** {external.get('missing_candidate_samples')} "
+                f"design-sample(s) across {external.get('missing_candidate_designs')} design(s) "
+                "have no file in some trial. Each is scored as a FAILED sample of that trial "
+                "(family `missing_candidate`), not dropped -- dropping would shrink the "
+                "denominator and raise the rate:"
+            )
+            lines.append("")
+            for name, trials in sorted(missing.items()):
+                lines.append(f"- `{name}`: absent from {', '.join(trials)}")
+            lines.append("")
+        else:
+            lines.append("- Every design in the basis has a candidate file in every trial.")
+            lines.append("")
+        fallbacks = external.get("resolved_by_fallback") or []
+        if fallbacks:
+            lines.append(
+                "**Filename fallbacks.** These candidates were not found at `<design>.v` and "
+                "were resolved another way. Listed rather than applied silently, because each "
+                "is a judgement about whose file this is:"
+            )
+            lines.append("")
+            for entry in fallbacks:
+                lines.append(
+                    f"- `{entry.get('design')}` / {entry.get('trial')}: "
+                    f"`{Path(str(entry.get('path'))).name}` (matched by {entry.get('resolved_by')})"
+                )
+            lines.append("")
+        lines.append(
+            "**Illegal-system-task gate.** Applied identically to the agent's RTL and to this "
+            f"RTL. It rejected {gate.get('rejected_samples')} design-sample(s) here; with the "
+            f"gate disabled {gate.get('would_pass_without_gate')} of them would have reported a "
+            "pass. That delta is the most this comparison could be understating "
+            f"`{external.get('label')}`. It is not itself a score: the oracle greps the "
+            "simulator's stdout, the design shares that stream with the testbench, so an "
+            "ungated pass cannot be told apart from a self-printed one."
+        )
+        lines.append("")
     affected = oracle["affected_selected_designs"]
     if affected:
         lines.append(
@@ -1047,6 +1449,32 @@ def build_parser() -> argparse.ArgumentParser:
             "(no LLM is constructed)"
         ),
     )
+    parser.add_argument(
+        "--external-rtl",
+        type=Path,
+        default=None,
+        metavar="DIR",
+        help=(
+            "Score pre-generated RTL from another model through this same pipeline instead of "
+            "calling one: DIR/<design>.v, or DIR/<trial>/<design>.v where each trial is one "
+            "sample (no LLM is constructed). Mutually exclusive with --reference/--empty-baseline"
+        ),
+    )
+    parser.add_argument(
+        "--label",
+        default=None,
+        metavar="NAME",
+        help="Name of the model that produced --external-rtl, recorded in the report (default: DIR basename)",
+    )
+    parser.add_argument(
+        "--no-gate-impact",
+        action="store_true",
+        help=(
+            "Skip the second, gate-disabled run of every candidate the illegal-system-task gate "
+            "refuses. That measurement is on by default for --external-rtl so the gate's cost is "
+            "stated rather than assumed; it never changes a reported verdict"
+        ),
+    )
     parser.add_argument("--resume", action="store_true", help=f"Skip designs already recorded in <out-dir>/{RESULTS_FILE} and append to it")
     parser.add_argument("--sim-timeout", type=int, default=rtllm_bench.DEFAULT_SIM_TIMEOUT, help="Per-simulation timeout in seconds")
     parser.add_argument("--compile-timeout", type=int, default=rtllm_bench.DEFAULT_COMPILE_TIMEOUT, help="Per-compile timeout in seconds")
@@ -1161,12 +1589,61 @@ def main(argv: "list[str] | None" = None) -> int:
             "--reference and --empty-baseline are two different measurements (the oracle's "
             "ceiling and its floor). Run them into separate --out-dirs."
         )
+    if args.external_rtl is not None and (args.reference or args.empty_baseline):
+        raise SystemExit(
+            "--external-rtl scores another model's pre-generated RTL; --reference and "
+            "--empty-baseline score the benchmark's own golden RTL and an empty module. They "
+            "are three different measurements. Run them into separate --out-dirs."
+        )
+    if args.label is not None and args.external_rtl is None:
+        raise SystemExit("--label names the model behind --external-rtl and needs it.")
 
     root = resolve_benchmark(args)
     designs = select_designs(root, args)
-    harness_mode = args.reference or args.empty_baseline
-    mode = "reference" if args.reference else ("empty" if args.empty_baseline else "llm")
+    external_mode = args.external_rtl is not None
+    harness_mode = args.reference or args.empty_baseline or external_mode
+    mode = (
+        "external"
+        if external_mode
+        else ("reference" if args.reference else ("empty" if args.empty_baseline else "llm"))
+    )
     config = make_agent_config(args)
+
+    trials: "list[Path]" = []
+    external_meta: "dict[str, Any] | None" = None
+    if external_mode:
+        rtl_dir = Path(args.external_rtl).expanduser()
+        label = args.label or rtl_dir.name
+        trials = discover_external_trials(rtl_dir)
+        benchmark_designs = len(designs)
+        designs = external_basis(trials, designs)
+        if not designs:
+            raise SystemExit(
+                f"--external-rtl {rtl_dir} has no candidate file for any of the "
+                f"{benchmark_designs} selected benchmark design(s). Nothing to score."
+            )
+        if args.samples != 1 and args.samples != len(trials):
+            print(
+                f"warning: --samples {args.samples} ignored for --external-rtl: the sample "
+                f"count is the number of trial directories ({len(trials)}).",
+                file=sys.stderr,
+                flush=True,
+            )
+        # The report's Configuration block must describe what was actually scored.
+        config.samples = len(trials)
+        external_meta = {
+            "label": label,
+            "rtl_dir": str(rtl_dir),
+            "trials": [trial.name for trial in trials],
+            "basis_designs": len(designs),
+            "benchmark_designs": benchmark_designs,
+            "gate_impact_enabled": not args.no_gate_impact,
+        }
+        print(
+            f"external RTL: label={label} trials={len(trials)} "
+            f"({', '.join(t.name for t in trials)}) basis={len(designs)}/{benchmark_designs} designs",
+            flush=True,
+        )
 
     client = None
     backend = model = None
@@ -1198,7 +1675,20 @@ def main(argv: "list[str] | None" = None) -> int:
     work_root = out_dir / "work"
 
     selected_names = [design.name for design in designs]
-    run_config = run_config_fingerprint(config, root, backend=backend, model=model)
+    run_config = run_config_fingerprint(
+        config,
+        root,
+        backend=backend,
+        model=model,
+        extra=(
+            {
+                "external_rtl": external_meta["rtl_dir"],
+                "external_label": external_meta["label"],
+            }
+            if external_meta
+            else {}
+        ),
+    )
     rows: "list[dict[str, Any]]" = []
     pending = designs
     if args.resume:
@@ -1231,7 +1721,15 @@ def main(argv: "list[str] | None" = None) -> int:
         began = time.time()
         workdir = work_root / design.name
         try:
-            if harness_mode:
+            if external_mode:
+                row = run_external_design(
+                    design,
+                    trials,
+                    config,
+                    workdir,
+                    gate_impact=not args.no_gate_impact,
+                )
+            elif harness_mode:
                 row = run_reference_design(
                     design, config, workdir, empty_baseline=args.empty_baseline
                 )
@@ -1245,7 +1743,9 @@ def main(argv: "list[str] | None" = None) -> int:
             row = {
                 "design": design.name,
                 "category": design.category,
-                "n_samples": 1 if harness_mode else max(1, args.samples),
+                "n_samples": (
+                    len(trials) if external_mode else (1 if harness_mode else max(1, args.samples))
+                ),
                 "syntax_success": 0,
                 "func_success": 0,
                 "samples": [],
@@ -1294,8 +1794,13 @@ def main(argv: "list[str] | None" = None) -> int:
         benchmark=str(root),
         out_dir=str(out_dir),
         # A reference/empty run has exactly one deterministic sample per design; a pass@5
-        # over n=1 would be undefined for every row, so k is pinned to 1 there.
-        k=1 if harness_mode else max(1, args.samples),
+        # over n=1 would be undefined for every row, so k is pinned to 1 there. An external
+        # run has one sample per trial, which is exactly what k means.
+        k=(
+            len(trials)
+            if external_mode
+            else (1 if harness_mode else max(1, args.samples))
+        ),
         backend=backend,
         model=model,
         agent_config=config.to_dict() if hasattr(config, "to_dict") else {},
@@ -1303,6 +1808,7 @@ def main(argv: "list[str] | None" = None) -> int:
         wall_clock_s=time.time() - started,
         interrupted=interrupted,
         resumed=resumed,
+        external=external_meta,
     )
     _atomic_write(out_dir / REPORT_JSON, json.dumps(report, indent=2, sort_keys=True))
     _atomic_write(out_dir / REPORT_MD, render_markdown(report))
@@ -1325,6 +1831,20 @@ def main(argv: "list[str] | None" = None) -> int:
         print(
             "empty-baseline: a design listed here passes with NO LOGIC, so its score is "
             "meaningless -- " + (", ".join(vacuous) if vacuous else "(none)"),
+            flush=True,
+        )
+    if mode == "external":
+        section = report.get("external") or {}
+        gate = section.get("gate_impact") or {}
+        missing = section.get("missing_candidates") or {}
+        print(
+            f"external[{section.get('label')}]: basis {section.get('basis_designs')}/"
+            f"{section.get('benchmark_designs')} designs over {section.get('trial_count')} trials; "
+            f"missing candidates {section.get('missing_candidate_samples')} sample(s) across "
+            f"{section.get('missing_candidate_designs')} design(s)"
+            + (" -- " + ", ".join(f"{n}({','.join(t)})" for n, t in sorted(missing.items())) if missing else "")
+            + f"; illegal-task gate rejected {gate.get('rejected_samples')} sample(s), "
+            f"{gate.get('would_pass_without_gate')} of which would pass with the gate disabled",
             flush=True,
         )
     backend_failed = report.get("llm_error_designs") or []
