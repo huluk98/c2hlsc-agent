@@ -1,0 +1,72 @@
+name: Native AMD HLS Verification (Windows)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, live-agents]
+    paths:
+      - ".github/workflows/vivado-windows-verify.yml"
+      - "c2hlsc_agent/**"
+      - "examples/vector_add/**"
+      - "scripts/run_vitis_windows.ps1"
+      - "pyproject.toml"
+
+permissions:
+  contents: read
+
+jobs:
+  vector-add-vivado-vitis-windows:
+    # Native AMD tools require a licensed self-hosted Windows runner. Set
+    # C2HLSC_VIVADO_WINDOWS_CI=true only after registering these exact labels.
+    if: ${{ github.event_name == 'workflow_dispatch' || vars.C2HLSC_VIVADO_WINDOWS_CI == 'true' }}
+    runs-on: [self-hosted, windows, x64, vivado-hls]
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: powershell
+    env:
+      VIVADO_SETTINGS: ${{ vars.VIVADO_WINDOWS_SETTINGS }}
+      VIVADO_HLS_BIN: ${{ vars.VIVADO_WINDOWS_HLS_BIN }}
+      VIVADO_ROOT: ${{ vars.VIVADO_WINDOWS_ROOT }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare isolated Python environment
+        run: |
+          $ErrorActionPreference = "Stop"
+          $hostPython = Get-Command -Name "python.exe" -CommandType Application -ErrorAction Stop
+          & $hostPython.Path -m venv .venv-vitis-windows
+          if ($LASTEXITCODE -ne 0) { throw "Python virtual environment creation failed" }
+          $venvPython = Join-Path $PWD ".venv-vitis-windows\Scripts\python.exe"
+          & $venvPython -m pip install -e .
+          if ($LASTEXITCODE -ne 0) { throw "Package installation failed" }
+          "VENV_PYTHON=$venvPython" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Run vector_add through native AMD HLS
+        run: |
+          $ErrorActionPreference = "Stop"
+          & .\scripts\run_vitis_windows.ps1 `
+            -Config "examples\vector_add\config.yaml" `
+            -Out "build\vitis-windows-vector-add" `
+            -Python $env:VENV_PYTHON
+          if ($LASTEXITCODE -ne 0) { throw "Windows Vitis verification helper failed" }
+
+      - name: Upload AMD HLS reports, RTL, and evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vivado-vitis-windows-vector-add-${{ github.sha }}
+          if-no-files-found: warn
+          retention-days: 14
+          path: |
+            build/vitis-windows-vector-add/conversion_report.*
+            build/vitis-windows-vector-add/verification_knowledge_graph.json
+            build/vitis-windows-vector-add/vitis_evidence.json
+            build/vitis-windows-vector-add/toolchain_provenance.json
+            build/vitis-windows-vector-add/*.log
+            build/vitis-windows-vector-add/coverage/*.json
+            build/vitis-windows-vector-add/c2hlsc_project/*/syn/report/**
+            build/vitis-windows-vector-add/c2hlsc_project/*/syn/verilog/**
+            build/vitis-windows-vector-add/c2hlsc_project/*/syn/vhdl/**
+            build/vitis-windows-vector-add/c2hlsc_project/*/sim/report/**

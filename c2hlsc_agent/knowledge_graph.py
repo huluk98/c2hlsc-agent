@@ -78,6 +78,7 @@ _REPORT_ARTIFACTS = (
 
 _EVIDENCE_ARTIFACTS = (
     "vitis_evidence.json",
+    "toolchain_provenance.json",
     "coverage/gcov_report.json",
     "coverage/klee_report.json",
     "coverage/rtl_tb_report.json",
@@ -90,6 +91,7 @@ _EVIDENCE_ARTIFACTS = (
 
 _EVIDENCE_PHASES = {
     "vitis_evidence.json": "cosim",
+    "toolchain_provenance.json": "cosim",
     "coverage/gcov_report.json": "coverage_gcov",
     "coverage/klee_report.json": "symbolic_klee",
     "coverage/rtl_tb_report.json": "rtl_cosim",

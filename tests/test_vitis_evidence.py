@@ -57,6 +57,30 @@ class VitisCommandTests(unittest.TestCase):
                 "/opt/AMD/Vitis/bin/vitis-run",
             )
 
+    def test_default_launcher_falls_back_to_legacy_vivado_hls(self):
+        with mock.patch(
+            "c2hlsc_agent.vitis_command.shutil.which",
+            side_effect=lambda name: "C:/Xilinx/Vivado/2020.2/bin/vivado_hls.bat"
+            if name == "vivado_hls"
+            else None,
+        ):
+            self.assertEqual(
+                find_vitis_executable(),
+                "C:/Xilinx/Vivado/2020.2/bin/vivado_hls.bat",
+            )
+
+    def test_legacy_vivado_hls_uses_f_script_contract(self):
+        self.assertEqual(
+            vitis_tcl_command(
+                "C:/Xilinx/Vivado/2020.2/bin/vivado_hls.bat", "run_csim.tcl"
+            ),
+            [
+                "C:/Xilinx/Vivado/2020.2/bin/vivado_hls.bat",
+                "-f",
+                "run_csim.tcl",
+            ],
+        )
+
 
 class VitisEvidenceTests(unittest.TestCase):
     def _project(self, root: Path) -> Path:
@@ -90,6 +114,8 @@ class VitisEvidenceTests(unittest.TestCase):
                     "top": "top",
                     "part": "xczu7ev-ffvc1156-2-e",
                     "clock_ns": 10.0,
+                    "seed": 7,
+                    "num_tests": 64,
                     "cosim_backend": "vitis",
                     "vitis_bin": "/opt/AMD/Vitis/bin/vitis-run",
                     **phases,
@@ -104,6 +130,8 @@ class VitisEvidenceTests(unittest.TestCase):
             evidence = validate_vitis_project(self._project(Path(tmp)))
         self.assertEqual(evidence["status"], "pass")
         self.assertEqual(evidence["backend"], "vitis")
+        self.assertEqual(evidence["seed"], 7)
+        self.assertEqual(evidence["num_tests"], 64)
         self.assertEqual(len(evidence["rtl"]), 1)
         self.assertEqual(
             evidence["native_cosim_command"],

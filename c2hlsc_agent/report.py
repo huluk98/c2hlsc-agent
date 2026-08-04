@@ -192,6 +192,8 @@ def write_reports(
         "top": fn.name,
         "part": config.part,
         "clock_ns": config.clock,
+        "seed": config.seed,
+        "num_tests": config.num_tests,
         "cosim_backend": config.cosim_backend,
         "vitis_bin": config.vitis_bin if config.cosim_backend in ("vitis", "vitis-ssh") else None,
         "generator_prompt_id": generated.generator_prompt_id,

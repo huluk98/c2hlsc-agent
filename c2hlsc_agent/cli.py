@@ -70,7 +70,7 @@ def _add_remote_vitis_arguments(parser: argparse.ArgumentParser) -> None:
         "--vitis-bin",
         help=(
             "local/remote HLS launcher name or absolute path: vitis-run (Unified IDE) "
-            "or vitis_hls (legacy)"
+            "or vitis_hls/vivado_hls (legacy)"
         ),
     )
 
