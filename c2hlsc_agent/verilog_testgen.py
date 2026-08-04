@@ -139,6 +139,19 @@ def _looks_like_length_name(scalar_name: str, array_name: str) -> bool:
     )
 
 
+def _inferred_scalar_bounds(
+    scalar: FunctionArg, arrays: list[FunctionArg], array_spec: dict[str, dict]
+) -> tuple[int, int] | None:
+    if scalar.scalar_range:
+        return scalar.scalar_range
+    depths = [
+        array_spec[arg.name]["depth"]
+        for arg in arrays
+        if _looks_like_length_name(scalar.name, arg.name)
+    ]
+    return (0, min(depths)) if depths else None
+
+
 def _active_length_arg(array_arg: FunctionArg, scalars: list[FunctionArg]) -> FunctionArg | None:
     for scalar in scalars:
         if not scalar.scalar_range:
@@ -417,8 +430,9 @@ def _vectors_tb(analysis: AnalysisResult, config: AgentConfig, spec: dict[str, o
 
     for arg in scalars:
         info = scalar_spec[arg.name]
-        if arg.scalar_range:
-            lo, hi = arg.scalar_range
+        bounds = _inferred_scalar_bounds(arg, arrays, array_spec)
+        if bounds is not None:
+            lo, hi = bounds
             declarations.append(f"    {arg.c_type} {arg.name} = bounded_scalar<{arg.c_type}>(test_idx, rng, {lo}LL, {hi}LL);")
         else:
             declarations.append(f"    {arg.c_type} {arg.name} = random_value<{arg.c_type}>(rng);")

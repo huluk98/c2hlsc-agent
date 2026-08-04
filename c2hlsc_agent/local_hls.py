@@ -128,7 +128,9 @@ def _looks_like_length(name: str) -> bool:
 
 def _testbench_xml(function_args: list[FunctionArg], num_tests: int, seed: int) -> str:
     rng = random.Random(seed)
-    max_len = max((_array_length(a) for a in function_args if a.is_pointer_like), default=1)
+    array_lengths = [_array_length(a) for a in function_args if a.is_pointer_like]
+    max_len = max(array_lengths, default=1)
+    min_len = min(array_lengths, default=1)
     lines = ['<?xml version="1.0"?>', "<function>"]
     for test_index in range(num_tests):
         attrs = []
@@ -152,6 +154,11 @@ def _testbench_xml(function_args: list[FunctionArg], num_tests: int, seed: int) 
                         value = min(hi, max_len) if test_index == 0 else rng.randint(max(lo, 1), hi)
                     else:
                         value = rng.randint(lo, hi)
+                elif _looks_like_length(arg.name) and array_lengths:
+                    # No configured range, but the scalar bounds the arrays'
+                    # active region: cap it at the smallest buffer so the
+                    # kernel never reads/writes past what the XML allocates.
+                    value = min_len if test_index == 0 else rng.randint(1, min_len)
                 else:
                     lo, hi = _value_range(arg)
                     value = rng.randint(lo, hi)

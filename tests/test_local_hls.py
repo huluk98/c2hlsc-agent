@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -39,6 +40,18 @@ class TestbenchXmlTests(unittest.TestCase):
     def test_emits_one_testbench_per_test(self):
         xml = _testbench_xml(_vector_add_args(), num_tests=4, seed=1)
         self.assertEqual(xml.count("<testbench "), 4)
+
+    def test_unconfigured_length_scalar_is_capped_by_array_length(self):
+        args = _vector_add_args()
+        args[3] = FunctionArg(raw="int n", name="n", c_type="int", direction="input")
+        xml = _testbench_xml(args, num_tests=6, seed=3)
+        values = [int(match) for match in re.findall(r'n="(-?\d+)"', xml)]
+        self.assertEqual(len(values), 6)
+        # Full length first, then within the smallest buffer -- never the raw
+        # type range that would send the kernel past the allocated arrays.
+        self.assertEqual(values[0], 8)
+        for value in values:
+            self.assertTrue(1 <= value <= 8, values)
 
 
 class ParseCosimTests(unittest.TestCase):

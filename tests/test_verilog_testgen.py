@@ -164,6 +164,27 @@ class VerilogTestgenTests(unittest.TestCase):
         self.assertIn("xvlog", bundle.run_script)
         self.assertIn("vector_add", bundle.manifest_json)
 
+    def test_unconfigured_length_scalar_bounded_in_vectors_tb(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = Path(tmp.name) / "input.c"
+        path.write_text(
+            """
+            void vector_add(const int *a, const int *b, int *out, int n) {
+              for (int i = 0; i < n; ++i) out[i] = a[i] + b[i];
+            }
+            """,
+            encoding="utf-8",
+        )
+        cfg = AgentConfig(top="vector_add", num_tests=4, interface_mode="ap_memory")
+        analysis = analyze_source(path, "vector_add", cfg)
+        generated = generate_hls_sources(analysis, cfg)
+        project = Path(tmp.name) / "project"
+        write_project(project, analysis, generated, cfg)
+        text = (project / "tb" / "rtl_vectors_tb.cpp").read_text(encoding="utf-8")
+        self.assertIn("int n = bounded_scalar<int>(test_idx, rng, 0LL, 16LL);", text)
+        self.assertNotIn("int n = random_value<int>(rng);", text)
+
     def test_written_project_has_rtl_bundle(self):
         project = self._write_project()
         for rel in ("tb/rtl_vectors_tb.cpp", "tb/gen_rtl_tb.py", "tb/run_rtl_sim.py", "tb/rtl_tb_manifest.json"):

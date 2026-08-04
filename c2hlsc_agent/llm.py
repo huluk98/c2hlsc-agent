@@ -155,8 +155,8 @@ class ClaudeCLIClient:
 
         # Lean, fully-isolated one-shot invocation: no MCP servers, no on-disk session,
         # no user/project/local settings (this is an automated completion call, not an
-        # interactive session -- it must not pick up hooks/skills meant for Luke's own
-        # interactive use of this repo), and no tool use (single text-in/text-out call).
+        # interactive session -- it must not pick up hooks/skills meant for the
+        # maintainer's interactive use of this repo), and no tool use (single text-in/text-out call).
         self._base = shlex.split(cli_cmd) + [
             "-p",
             "--model", model,
