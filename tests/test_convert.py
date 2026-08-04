@@ -10,7 +10,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from c2hlsc_agent.analyze import analyze_source
 from c2hlsc_agent.config import AgentConfig, ArgumentConfig
 from c2hlsc_agent.convert import generate_hls_sources
-from c2hlsc_agent.hls_project import render_run_csim, render_run_cosim, render_run_csynth, render_run_hls, write_project
+from c2hlsc_agent.hls_project import (
+    render_makefile,
+    render_run_all,
+    render_run_csim,
+    render_run_cosim,
+    render_run_csynth,
+    render_run_hls,
+    write_project,
+)
 from c2hlsc_agent.testgen import generate_testbench
 
 
@@ -77,6 +85,13 @@ class ConvertTests(unittest.TestCase):
         self.assertNotIn("csim_design", csynth)
         self.assertIn("cosim_design -tool xsim -rtl verilog", cosim)
         self.assertNotIn("csynth_design", cosim)
+
+    def test_generated_helpers_use_unified_vitis_native_command(self):
+        _analysis, cfg = self._analysis()
+        cfg.vitis_bin = "/opt/AMD/Vitis/bin/vitis-run"
+        expected = "/opt/AMD/Vitis/bin/vitis-run --mode hls --tcl run_hls.tcl"
+        self.assertIn(expected, render_makefile(cfg))
+        self.assertIn(expected, render_run_all(cfg))
 
     def test_generated_testbench_compares_output_arrays(self):
         analysis, cfg = self._analysis()

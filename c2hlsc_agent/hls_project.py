@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 import shutil
 import stat
 from dataclasses import dataclass
@@ -12,6 +13,7 @@ from .convert import GeneratedSource
 from .leveri_testgen import generate_leveri_testbenches
 from .testgen import generate_testbench
 from .verilog_testgen import generate_verilog_testbenches
+from .vitis_command import vitis_tcl_command
 
 
 @dataclass
@@ -92,6 +94,7 @@ def render_makefile(config: AgentConfig) -> str:
         ppa_flags += f" --max-latency {config.max_latency_cycles}"
     if config.top:
         ppa_flags += f" --top {config.top}"
+    vitis_command = shlex.join(vitis_tcl_command(config.vitis_bin, "run_hls.tcl"))
     return f"""CXX ?= g++
 CXXFLAGS ?= -std=c++17 -Wall -Wextra -I src {flags}
 TB_EXE ?= c2hlsc_tb
@@ -152,7 +155,7 @@ ppa:
 \tpython3 -m c2hlsc_agent.cli ppa --project . {ppa_flags}
 
 vitis:
-\tvitis_hls -f run_hls.tcl
+\t{vitis_command}
 
 clean:
 \trm -f $(TB_EXE) $(LEVERI_GOLDEN_EXE) $(LEVERI_HLS_EXE) $(RTL_VECTORS_EXE)
@@ -164,14 +167,17 @@ clean:
 """
 
 
-def render_run_all() -> str:
-    return """#!/usr/bin/env bash
+def render_run_all(config: AgentConfig | None = None) -> str:
+    config = config or AgentConfig()
+    executable = shlex.quote(config.vitis_bin)
+    command = shlex.join(vitis_tcl_command(config.vitis_bin, "run_hls.tcl"))
+    return f"""#!/usr/bin/env bash
 set -euo pipefail
 make test
-if command -v vitis_hls >/dev/null 2>&1; then
-  vitis_hls -f run_hls.tcl
+if command -v {executable} >/dev/null 2>&1; then
+  {command}
 else
-  echo "vitis_hls not found; host equivalence completed, Vitis phases skipped." >&2
+  echo "Vitis HLS launcher not found; host equivalence completed, Vitis phases skipped." >&2
 fi
 """
 
@@ -226,7 +232,7 @@ def write_project(out_dir: Path, analysis: AnalysisResult, generated: GeneratedS
     (out_dir / "run_cosim.tcl").write_text(render_run_cosim(config), encoding="utf-8")
     (out_dir / "Makefile").write_text(render_makefile(config), encoding="utf-8")
     run_all = out_dir / "run_all.sh"
-    run_all.write_text(render_run_all(), encoding="utf-8")
+    run_all.write_text(render_run_all(config), encoding="utf-8")
     run_all.chmod(run_all.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     leveri_compare = out_dir / "tb" / "leveri_compare.py"
     leveri_compare.chmod(leveri_compare.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)

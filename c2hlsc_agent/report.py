@@ -107,6 +107,8 @@ def write_reports(
 - Top function: `{fn.name}`
 - Source: `{fn.source_path}`
 - Vitis part: `{config.part}`
+- RTL verification backend: `{config.cosim_backend}`
+- Vitis launcher: `{config.vitis_bin if config.cosim_backend in ('vitis', 'vitis-ssh') else 'not used'}`
 - Clock period: `{config.clock}`
 - Random seed: `{config.seed}`
 - Test count: `{config.num_tests}`
@@ -180,6 +182,10 @@ def write_reports(
     machine = {
         "status": status,
         "top": fn.name,
+        "part": config.part,
+        "clock_ns": config.clock,
+        "cosim_backend": config.cosim_backend,
+        "vitis_bin": config.vitis_bin if config.cosim_backend in ("vitis", "vitis-ssh") else None,
         "generator_prompt_id": generated.generator_prompt_id,
         "testbench_policy_id": LEVERI_TESTBENCH_POLICY_ID,
         "software_equivalence": state.status_for("software_equivalence"),

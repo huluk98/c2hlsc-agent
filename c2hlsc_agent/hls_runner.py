@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import json
 import re
-import shutil
 import subprocess
 from pathlib import Path
 
 from .equivalence import PhaseResult, VerificationState, parse_mismatches, run_command
 from .remote import RemoteVitis
+from .vitis_command import find_vitis_executable, vitis_tcl_command
 
 
 SHIFT_LEFT_PHASES = ("shift_left_trace", "coverage_gcov", "symbolic_klee")
@@ -409,12 +409,22 @@ def _gate_equivalence_on_evidence(result: PhaseResult) -> PhaseResult:
     )
 
 
-def _run_vitis_phase(project_dir: Path, phase: str, remote: RemoteVitis | None) -> PhaseResult:
+def _run_vitis_phase(
+    project_dir: Path,
+    phase: str,
+    remote: RemoteVitis | None,
+    vitis_bin: str,
+) -> PhaseResult:
     timeout = PHASE_TIMEOUTS[phase]
     try:
         if remote is not None:
             return remote.run_phase(project_dir, phase, timeout)
-        return run_command(["vitis_hls", "-f", f"run_{phase}.tcl"], project_dir, phase, timeout=timeout)
+        return run_command(
+            vitis_tcl_command(vitis_bin, f"run_{phase}.tcl"),
+            project_dir,
+            phase,
+            timeout=timeout,
+        )
     except subprocess.TimeoutExpired as exc:
         return _timeout_result(project_dir, phase, exc, f"Vitis {phase}")
 
@@ -424,6 +434,7 @@ def run_vitis(
     run_requested: bool,
     remote: RemoteVitis | None = None,
     upto: str = "cosim",
+    vitis_bin: str = "vitis_hls",
 ) -> dict[str, PhaseResult]:
     """Run the Vitis ladder, optionally stopping early.
 
@@ -457,16 +468,23 @@ def run_vitis(
                 "csynth": PhaseResult("csynth", "blocked", summary=message),
                 "cosim": PhaseResult("cosim", "blocked", summary=message),
             }
-    elif shutil.which("vitis_hls") is None:
-        message = "vitis_hls not found on PATH (use --vitis-ssh to run Vitis on a remote Linux host)"
+    else:
+        resolved_vitis = find_vitis_executable(vitis_bin)
+    if remote is None and resolved_vitis is None:
+        message = (
+            f"Vitis HLS launcher {vitis_bin!r} not found "
+            "(pass --vitis-bin, source the AMD settings script, or use --vitis-ssh)"
+        )
         return {
             "csim": PhaseResult("csim", "fail", summary=message),
             "csynth": PhaseResult("csynth", "blocked", summary=message),
             "cosim": PhaseResult("cosim", "blocked", summary=message),
         }
+    if remote is None:
+        vitis_bin = resolved_vitis
 
     try:
-        phases["csim"] = _run_vitis_phase(project_dir, "csim", remote)
+        phases["csim"] = _run_vitis_phase(project_dir, "csim", remote, vitis_bin)
         if phases["csim"].status != "pass":
             message = "csim failed"
             phases["csynth"] = PhaseResult("csynth", "blocked", summary=message)
@@ -475,14 +493,14 @@ def run_vitis(
         if upto == "csim":
             return phases
 
-        phases["csynth"] = _run_vitis_phase(project_dir, "csynth", remote)
+        phases["csynth"] = _run_vitis_phase(project_dir, "csynth", remote, vitis_bin)
         if phases["csynth"].status != "pass":
             phases["cosim"] = PhaseResult("cosim", "blocked", summary="csynth failed")
             return phases
         if upto == "csynth":
             return phases
 
-        phases["cosim"] = _run_vitis_phase(project_dir, "cosim", remote)
+        phases["cosim"] = _run_vitis_phase(project_dir, "cosim", remote, vitis_bin)
         phases["cosim"] = _gate_cosim_on_log(phases["cosim"])
         return phases
     finally:
@@ -498,6 +516,11 @@ _COSIM_FAILURE_MARKERS = (
     "cosim design failed",
     "co-simulation failed",
     "aborting cosim",
+)
+
+VITIS_COSIM_SUCCESS_MARKERS = (
+    "c/rtl co-simulation finished: pass",
+    "co-simulation finished: pass",
 )
 
 
@@ -524,6 +547,19 @@ def _gate_cosim_on_log(result: PhaseResult) -> PhaseResult:
             result.log_path,
             summary="Vitis exited 0 but the CoSim log reports a co-simulation failure",
         )
+    if not any(marker in haystack for marker in VITIS_COSIM_SUCCESS_MARKERS):
+        return PhaseResult(
+            result.name,
+            "fail",
+            result.returncode,
+            result.stdout,
+            result.stderr,
+            result.log_path,
+            summary=(
+                "Vitis CoSim exited 0 but emitted no positive C/RTL co-simulation "
+                "PASS marker — cannot confirm that an RTL comparison ran"
+            ),
+        )
     return result
 
 
@@ -534,6 +570,7 @@ def verify_project(
     remote: RemoteVitis | None = None,
     local: "object | None" = None,
     run_shift_left: bool = True,
+    vitis_bin: str = "vitis_hls",
 ) -> VerificationState:
     state = VerificationState()
     software = run_software_equivalence(project_dir, verbose=verbose)
@@ -562,6 +599,11 @@ def verify_project(
         for result in local.run(project_dir).values():
             state.add_phase(result)
         return state
-    for result in run_vitis(project_dir, run_vitis_requested, remote=remote).values():
+    for result in run_vitis(
+        project_dir,
+        run_vitis_requested,
+        remote=remote,
+        vitis_bin=vitis_bin,
+    ).values():
         state.add_phase(result)
     return state

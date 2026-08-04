@@ -61,12 +61,12 @@ class ResolveBackendTests(unittest.TestCase):
     def test_auto_prefers_remote_then_vitis_then_local_then_none(self):
         cfg = AgentConfig(cosim_backend="auto")
         self.assertEqual(resolve_cosim_backend(cfg, remote=object()), "vitis-ssh")
-        with mock.patch.object(local_hls.shutil, "which", return_value="/usr/bin/vitis_hls"):
+        with mock.patch.object(local_hls, "find_vitis_executable", return_value="/usr/bin/vitis_hls"):
             self.assertEqual(resolve_cosim_backend(cfg, remote=None), "vitis")
-        with mock.patch.object(local_hls.shutil, "which", return_value=None), \
+        with mock.patch.object(local_hls, "find_vitis_executable", return_value=None), \
              mock.patch.object(local_hls, "available", return_value=(True, "")):
             self.assertEqual(resolve_cosim_backend(cfg, remote=None), "local-hls")
-        with mock.patch.object(local_hls.shutil, "which", return_value=None), \
+        with mock.patch.object(local_hls, "find_vitis_executable", return_value=None), \
              mock.patch.object(local_hls, "available", return_value=(False, "no docker")):
             self.assertEqual(resolve_cosim_backend(cfg, remote=None), "none")
 

@@ -209,7 +209,11 @@ def classify_log_family(phase: str, text: str) -> str:
         # golden C, so this is a backend/toolchain limitation, not a repairable
         # HLS-C defect. Route to a blocked family so no HLS-C mutation happens.
         return "local_hls_backend"
-    if "vitis_hls not found" in lowered or "remote vitis unavailable" in lowered:
+    if (
+        "vitis_hls not found" in lowered
+        or "remote vitis unavailable" in lowered
+        or ("vitis" in lowered and "not found" in lowered)
+    ):
         return "toolchain_unavailable"
     if re.search(r"\b(timeout|timed out|deadlock|stdout-silence)\b", lowered):
         return "timeout_or_deadlock"

@@ -30,6 +30,7 @@ from pathlib import Path
 from .analyze import AnalysisResult, FunctionArg
 from .config import AgentConfig
 from .equivalence import PhaseResult
+from .vitis_command import find_vitis_executable
 
 DEFAULT_SQUASHFS = Path.home() / "tools" / "eda" / "bambu" / "squashfs-root"
 DEFAULT_BAMBU_TESTS = 16  # emulated x86 sim is slow; keep the default vector count modest
@@ -62,7 +63,7 @@ def resolve_cosim_backend(config: AgentConfig, remote: object | None) -> str:
         return choice
     if remote is not None:
         return "vitis-ssh"
-    if shutil.which(getattr(config, "vitis_bin", "vitis_hls") or "vitis_hls"):
+    if find_vitis_executable(getattr(config, "vitis_bin", "vitis_hls") or "vitis_hls"):
         return "vitis"
     ok, _ = available()
     return "local-hls" if ok else "none"

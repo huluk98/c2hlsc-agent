@@ -222,6 +222,7 @@ class KnowledgeGraphTests(unittest.TestCase):
     def test_refresh_adds_late_reports_without_analysis_or_source_reads(self):
         write_knowledge_graph(self.project, self.analysis, self.config)
         (self.project / "conversion_report.json").write_text('{"status":"pass"}\n', encoding="utf-8")
+        (self.project / "vitis_evidence.json").write_text('{"status":"pass"}\n', encoding="utf-8")
         coverage = self.project / "coverage"
         coverage.mkdir()
         (coverage / "klee_report.json").write_text('{"status":"skipped"}\n', encoding="utf-8")
@@ -231,10 +232,15 @@ class KnowledgeGraphTests(unittest.TestCase):
         graph = self._read()
         nodes = {node["id"]: node for node in graph["nodes"]}
         self.assertEqual(nodes["artifact:conversion_report.json"]["kind"], "report_artifact")
+        self.assertEqual(nodes["artifact:vitis_evidence.json"]["kind"], "evidence_artifact")
         self.assertEqual(nodes["artifact:coverage/klee_report.json"]["kind"], "evidence_artifact")
         links = {(edge["source"], edge["type"], edge["target"]) for edge in graph["edges"]}
         self.assertIn(
             ("phase:symbolic_klee", "PRODUCED_EVIDENCE", "artifact:coverage/klee_report.json"),
+            links,
+        )
+        self.assertIn(
+            ("phase:cosim", "PRODUCED_EVIDENCE", "artifact:vitis_evidence.json"),
             links,
         )
 

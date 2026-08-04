@@ -28,6 +28,12 @@ class CosimLogGateTests(unittest.TestCase):
         )
         self.assertEqual(_gate_cosim_on_log(result).status, "pass")
 
+    def test_exit_zero_without_positive_marker_is_downgraded(self):
+        result = PhaseResult("cosim", "pass", returncode=0, stdout="Vitis HLS completed")
+        gated = _gate_cosim_on_log(result)
+        self.assertEqual(gated.status, "fail")
+        self.assertIn("no positive", gated.summary)
+
     def test_non_pass_is_untouched(self):
         result = PhaseResult("cosim", "fail", returncode=1, stdout="boom")
         self.assertEqual(_gate_cosim_on_log(result).status, "fail")

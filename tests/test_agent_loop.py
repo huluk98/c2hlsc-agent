@@ -38,6 +38,17 @@ class AgentLoopTests(unittest.TestCase):
         self.assertEqual(decision.owner_agent, "cosim_operator")
         self.assertEqual(decision.status, "blocked")
 
+    def test_routes_missing_unified_vitis_launcher_to_operator(self):
+        state = VerificationState()
+        state.add_phase(PhaseResult("software_equivalence", "pass"))
+        state.add_phase(
+            PhaseResult("csim", "fail", summary="Vitis HLS launcher 'vitis-run' not found")
+        )
+        decision = classify_failure(state, run_vitis_requested=True)
+        self.assertEqual(decision.family, "toolchain_unavailable")
+        self.assertEqual(decision.owner_agent, "cosim_operator")
+        self.assertEqual(decision.status, "blocked")
+
     def test_all_pass_hands_to_optimizer(self):
         state = VerificationState()
         for phase in ("software_equivalence", "csim", "csynth", "cosim"):

@@ -390,7 +390,7 @@ attempt order, so the selected winner is identical either way.
 ### Remote Vitis over SSH (`--vitis-ssh`)
 
 Keep everything on the Mac — analysis, generation, testbenches, host equivalence,
-classification, and every LLM call — and ship **only** the `vitis_hls` phases to a Linux
+classification, and every LLM call — and ship **only** the native Vitis HLS phases to a Linux
 box:
 
 ```bash
@@ -402,11 +402,12 @@ python -m c2hlsc_agent.cli convert \
 
 Per verification pass the project directory is rsynced to
 `<--vitis-remote-dir, default ~/c2hlsc_runs>/<project-name>` on the host, each phase runs
-as `ssh <host> 'cd <dir> && timeout <t> vitis_hls -f run_<phase>.tcl'` with the log
+as either `vitis-run --mode hls --tcl run_<phase>.tcl` (Unified IDE) or
+`vitis_hls -f run_<phase>.tcl` (legacy) with the log
 captured locally exactly like a local run (so classification and repair evidence work
 unchanged), and the synthesized RTL (`syn/`), cosim reports, and Vitis logs are rsynced
-back afterwards. `vitis_hls` is located on the remote via `--vitis-setup
-'source /tools/Xilinx/Vitis/2024.2/settings64.sh'`, `--vitis-bin /path/to/vitis_hls`, or
+back afterwards. The launcher is located on the remote via `--vitis-setup
+'source /tools/Xilinx/Vitis/2024.2/settings64.sh'`, `--vitis-bin /path/to/vitis-run`, or
 an automatic probe of the common Xilinx install locations. The host can also come from
 `C2HLSC_VITIS_SSH` or the config file (`vitis_ssh_host`, `vitis_remote_dir`,
 `vitis_setup`, `vitis_bin`). Requirements: ssh key auth + rsync on both sides; no Python,
@@ -823,14 +824,36 @@ VITIS_HLS_ROOT="/path/to/Vitis_HLS/2024.2" \
   --out build/vector_add
 ```
 
-If the settings script does not put `vitis_hls` on `PATH`, pass the binary directly:
+The runner accepts both AMD command-line generations: current Unified IDE
+`vitis-run --mode hls --tcl ...` and legacy `vitis_hls -f ...`. If the settings script
+does not put either launcher on `PATH`, pass the binary directly:
 
 ```bash
-VITIS_HLS_BIN="/path/to/Vitis_HLS/2024.2/bin/vitis_hls" \
+VITIS_HLS_BIN="/path/to/Vitis/2025.2/bin/vitis-run" \
   bash scripts/run_vitis_linux.sh \
   --config examples/vector_add/config.yaml \
   --out build/vector_add
 ```
+
+After a native run, require fresh Vitis evidence before treating the result as functional
+RTL/QoR evidence:
+
+```bash
+python -m c2hlsc_agent.vitis_evidence build/vector_add
+```
+
+This checks the same phase ledger used by the Bambu path, plus Vitis-specific proof: a
+fresh `csynth.xml`, emitted Verilog/SystemVerilog, and an explicit C/RTL CoSim PASS marker.
+It writes `vitis_evidence.json` with report and RTL hashes and the parsed synthesis metrics.
+
+### GitHub native Vitis verification
+
+`.github/workflows/vitis-verify.yml` runs the full shift-left → CSim → CSynth → CoSim
+ladder on a licensed self-hosted Linux/x64 runner and uploads the evidence bundle. Register
+the runner with labels `self-hosted`, `linux`, `x64`, and `vitis-hls`; set repository
+variable `C2HLSC_VITIS_CI=true` to enable push runs. Optional variables `VITIS_SETTINGS`
+and `VITIS_HLS_BIN` select the installation. Without that explicitly configured runner,
+the Vitis job is skipped rather than claiming a hosted unit-test run is RTL sign-off.
 
 There is also a Python wrapper that can read the binary path from a local text
 file. Put your path in `vitis_hls_bin_path.txt`, then run the wrapper:

@@ -547,6 +547,14 @@ class RemoteVitisTests(unittest.TestCase):
         self.assertIn("source /tools/x/settings64.sh && ", script)
         self.assertIn("timeout -k 30s 600s vitis_hls -f run_cosim.tcl", script)
 
+    def test_phase_script_supports_unified_vitis_launcher(self):
+        remote = RemoteVitis(host="u@h", vitis_bin="/opt/AMD/Vitis/bin/vitis-run")
+        script = remote.phase_script(Path("/x/build/proj"), "cosim", 600)
+        self.assertIn(
+            "timeout -k 30s 600s /opt/AMD/Vitis/bin/vitis-run --mode hls --tcl run_cosim.tcl",
+            script,
+        )
+
     def test_phase_script_probes_settings_when_no_setup(self):
         remote = RemoteVitis(host="u@h")
         script = remote.phase_script(Path("/x/build/proj"), "csim", 600)
@@ -570,7 +578,7 @@ class RemoteVitisTests(unittest.TestCase):
         remote.run_phase.side_effect = [
             PhaseResult("csim", "pass"),
             PhaseResult("csynth", "pass"),
-            PhaseResult("cosim", "pass"),
+            PhaseResult("cosim", "pass", stdout="C/RTL co-simulation finished: PASS"),
         ]
         remote.pull.return_value = PhaseResult("vitis_pull", "pass")
         with tempfile.TemporaryDirectory() as tmp:

@@ -205,8 +205,8 @@ class RunVitisUptoTests(unittest.TestCase):
     def test_upto_csynth_skips_cosim(self):
         with tempfile.TemporaryDirectory() as tmp:
             with mock.patch("c2hlsc_agent.hls_runner._run_vitis_phase",
-                            side_effect=lambda d, p, r: PhaseResult(p, "pass")), \
-                 mock.patch("c2hlsc_agent.hls_runner.shutil.which", return_value="/bin/vitis_hls"):
+                            side_effect=lambda d, p, r, b: PhaseResult(p, "pass")), \
+                 mock.patch("c2hlsc_agent.hls_runner.find_vitis_executable", return_value="/bin/vitis_hls"):
                 phases = run_vitis(Path(tmp), True, upto="csynth")
         self.assertEqual(phases["csynth"].status, "pass")
         self.assertEqual(phases["cosim"].status, "skipped")
@@ -249,7 +249,13 @@ class OptimizerLoopTests(unittest.TestCase):
     def _fake_run_vitis(latencies: list[int]):
         """Each csynth-scoring call writes the next latency into the candidate's report."""
 
-        def fake(project_dir: Path, run_requested: bool, remote=None, upto="cosim"):
+        def fake(
+            project_dir: Path,
+            run_requested: bool,
+            remote=None,
+            upto="cosim",
+            vitis_bin="vitis_hls",
+        ):
             latency = latencies.pop(0) if latencies else 999
             xml = project_dir / CSYNTH_XML_RELPATH
             xml.parent.mkdir(parents=True, exist_ok=True)
@@ -418,7 +424,13 @@ class OptimizerReviewFixTests(OptimizerLoopTests):
             os.utime(xml, (old, old))
             calls = {"n": 0}
 
-            def fake_run_vitis(project_dir, run_requested, remote=None, upto="cosim"):
+            def fake_run_vitis(
+                project_dir,
+                run_requested,
+                remote=None,
+                upto="cosim",
+                vitis_bin="vitis_hls",
+            ):
                 calls["n"] += 1
                 p = project_dir / CSYNTH_XML_RELPATH
                 p.parent.mkdir(parents=True, exist_ok=True)

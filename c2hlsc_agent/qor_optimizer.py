@@ -193,10 +193,20 @@ def _stage_candidate(project_dir: Path, index: int, source: str) -> Path:
     return cand_dir
 
 
-def _synth_metrics(project_dir: Path, remote: RemoteVitis | None) -> tuple[QoRMetrics | None, str]:
+def _synth_metrics(
+    project_dir: Path,
+    remote: RemoteVitis | None,
+    vitis_bin: str = "vitis_hls",
+) -> tuple[QoRMetrics | None, str]:
     """csim+csynth the project and parse its csynth report. Returns (metrics, fail_note)."""
 
-    phases = run_vitis(project_dir, True, remote=remote, upto="csynth")
+    phases = run_vitis(
+        project_dir,
+        True,
+        remote=remote,
+        upto="csynth",
+        vitis_bin=vitis_bin,
+    )
     if phases["csim"].status != "pass":
         return None, f"csim_fail: {phases['csim'].summary or 'csim failed'}"
     if phases["csynth"].status != "pass":
@@ -378,7 +388,7 @@ def optimize_project(
     if baseline is None:
         if verbose:
             print("No fresh csynth report in the project; running csim+csynth for the baseline.")
-        baseline, note = _synth_metrics(project_dir, remote)
+        baseline, note = _synth_metrics(project_dir, remote, config.vitis_bin)
         if baseline is None:
             raise RuntimeError(f"cannot establish baseline QoR: {note}")
     if needs_ppa:
@@ -431,7 +441,7 @@ def optimize_project(
             result.note = (equiv.summary or "host equivalence failed").strip()[:300]
             history.append({"index": index, "kind": kind, "status": "equiv_fail", "note": result.note})
             return result
-        metrics, fail_note = _synth_metrics(cand_dir, remote)
+        metrics, fail_note = _synth_metrics(cand_dir, remote, config.vitis_bin)
         strategy = _pragma_summary(baseline_source, source)
         if metrics is None:
             result.status = fail_note.split(":", 1)[0] if ":" in fail_note else "csynth_fail"
@@ -540,7 +550,11 @@ def optimize_project(
         scored_any = any(c.status in ("scored", "timing_regressed") for c in outcome.candidates)
         infra_notes = [
             c.note for c in outcome.candidates
-            if "vitis_hls not found" in (c.note or "") or "remote vitis unavailable" in (c.note or "")
+            if (
+                "vitis_hls not found" in (c.note or "").lower()
+                or "remote vitis unavailable" in (c.note or "").lower()
+                or ("vitis" in (c.note or "").lower() and "not found" in (c.note or "").lower())
+            )
         ]
         if not scored_any and infra_notes:
             # Don't report a toolchain outage as an optimization result.
@@ -579,6 +593,7 @@ def optimize_project(
             verbose=verbose,
             remote=remote,
             run_shift_left=config.run_shift_left,
+            vitis_bin=config.vitis_bin,
         )
         accepted = final_status(state, True, False) == "pass"
     else:
@@ -587,6 +602,7 @@ def optimize_project(
             False,
             verbose=verbose,
             run_shift_left=config.run_shift_left,
+            vitis_bin=config.vitis_bin,
         )
         accepted = final_status(state, False, False) == "pass"
     if not accepted:

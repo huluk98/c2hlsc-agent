@@ -22,6 +22,7 @@ from .llm import build_llm_client, missing_llm_reason
 from .local_hls import LocalHlsCosim, available as local_hls_available, resolve_cosim_backend
 from .remote import RemoteVitis
 from .report import final_status, write_reports
+from .vitis_command import find_vitis_executable
 
 
 def _add_llm_arguments(parser: argparse.ArgumentParser) -> None:
@@ -65,7 +66,13 @@ def _add_remote_vitis_arguments(parser: argparse.ArgumentParser) -> None:
         help="remote shell prefix that puts vitis_hls on PATH, e.g. "
         "'source /tools/Xilinx/Vitis/2024.2/settings64.sh'; common locations are probed when unset",
     )
-    parser.add_argument("--vitis-bin", help="remote vitis_hls executable name or absolute path")
+    parser.add_argument(
+        "--vitis-bin",
+        help=(
+            "local/remote HLS launcher name or absolute path: vitis-run (Unified IDE) "
+            "or vitis_hls (legacy)"
+        ),
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -328,6 +335,15 @@ def run_convert(args: argparse.Namespace) -> int:
     remote = RemoteVitis.from_config(config)
     if remote is not None and args.verbose:
         print(f"Vitis phases will run on {remote.host}:{remote.remote_dir}; everything else runs locally.")
+    # Resolve the backend before materializing the project so generated Makefile and
+    # run_all.sh helpers use the exact same native launcher as the verifier.
+    explicit_backend = (config.cosim_backend or "auto").lower() != "auto"
+    backend = resolve_cosim_backend(config, remote)
+    config.cosim_backend = backend
+    if backend == "vitis":
+        resolved_vitis = find_vitis_executable(config.vitis_bin)
+        if resolved_vitis is not None:
+            config.vitis_bin = resolved_vitis
 
     if nl_only:
         try:
@@ -417,8 +433,6 @@ def run_convert(args: argparse.Namespace) -> int:
 
     # Choose who runs the csynth/cosim ladder. local-hls replaces Vitis entirely
     # (local Bambu); vitis/vitis-ssh keep the Xilinx path; none skips it.
-    explicit_backend = (config.cosim_backend or "auto").lower() != "auto"
-    backend = resolve_cosim_backend(config, remote)
     local = None
     if backend == "local-hls":
         remote = None
@@ -455,6 +469,7 @@ def run_convert(args: argparse.Namespace) -> int:
             remote=remote,
             local=local,
             run_shift_left=config.run_shift_left,
+            vitis_bin=config.vitis_bin,
         )
         status = final_status(state, config.run_vitis, analysis.diagnostics.has_errors)
         if status == "pass":

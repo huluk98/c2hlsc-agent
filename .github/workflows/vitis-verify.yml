@@ -1,0 +1,64 @@
+name: Native Vitis Verification
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, live-agents]
+    paths:
+      - ".github/workflows/vitis-verify.yml"
+      - "c2hlsc_agent/**"
+      - "examples/vector_add/**"
+      - "scripts/run_vitis_linux.sh"
+
+permissions:
+  contents: read
+
+jobs:
+  vector-add-vitis:
+    # Vitis is licensed software and is not installed on GitHub-hosted runners.
+    # Set repository variable C2HLSC_VITIS_CI=true after registering a runner with
+    # these labels. Manual dispatch always requests the real runner.
+    if: ${{ github.event_name == 'workflow_dispatch' || vars.C2HLSC_VITIS_CI == 'true' }}
+    runs-on: [self-hosted, linux, x64, vitis-hls]
+    timeout-minutes: 60
+    env:
+      C2HLSC_USE_ACTIVE_ENV: "1"
+      VITIS_SETTINGS: ${{ vars.VITIS_SETTINGS }}
+      VITIS_HLS_BIN: ${{ vars.VITIS_HLS_BIN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare isolated Python environment
+        run: |
+          python3 -m venv .venv-vitis
+          .venv-vitis/bin/python -m pip install -e .
+          echo "$PWD/.venv-vitis/bin" >> "$GITHUB_PATH"
+
+      - name: Run the full native Vitis ladder
+        run: |
+          scripts/run_vitis_linux.sh \
+            --config examples/vector_add/config.yaml \
+            --out build/vitis-native-vector-add \
+            --no-llm \
+            --shift-left
+
+      - name: Validate fresh synthesis, RTL, and CoSim evidence
+        run: |
+          python -m c2hlsc_agent.vitis_evidence build/vitis-native-vector-add
+
+      - name: Upload Vitis evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vitis-native-vector-add-${{ github.sha }}
+          if-no-files-found: warn
+          retention-days: 14
+          path: |
+            build/vitis-native-vector-add/conversion_report.*
+            build/vitis-native-vector-add/verification_knowledge_graph.json
+            build/vitis-native-vector-add/vitis_evidence.json
+            build/vitis-native-vector-add/*.log
+            build/vitis-native-vector-add/coverage/*.json
+            build/vitis-native-vector-add/c2hlsc_project/*/syn/report/csynth.xml
+            build/vitis-native-vector-add/c2hlsc_project/*/syn/verilog/*
+            build/vitis-native-vector-add/c2hlsc_project/*/sim/report/*
