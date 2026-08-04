@@ -28,9 +28,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
-import shlex
-import subprocess
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -55,7 +52,7 @@ from run_hls_nl_vitis_batch import (  # noqa: E402
     resolve_vitis_hls,
     run_design,
 )
-from c2hlsc_agent.llm import extract_code_blocks  # noqa: E402
+from c2hlsc_agent.llm import extract_code_blocks, is_plausible_translation_unit  # noqa: E402
 
 Completer = Callable[[str, str], str]  # (system, user) -> raw model text
 
@@ -70,17 +67,13 @@ def make_completer(args: argparse.Namespace) -> Completer:
 
     # Claude Code path (subscription auth, no API key). `claude -p` reads the prompt and
     # prints the answer. Set --claude-cmd "ssh you@mac claude" to drive Claude Code on a
-    # remote Mac from the Vitis server.
-    base = shlex.split(args.claude_cmd) + ["-p", "--model", args.claude_model]
+    # remote Mac from the Vitis server. Reuse ClaudeCLIClient so this script inherits the
+    # same lean-flag/JSON-envelope hardening as the rest of the pipeline instead of
+    # drifting from it with its own bespoke subprocess invocation.
+    from c2hlsc_agent.llm import ClaudeCLIClient
 
-    def complete(system: str, user: str) -> str:
-        prompt = f"{system}\n\n{user}"
-        proc = subprocess.run(base, input=prompt, text=True, capture_output=True, timeout=args.repair_timeout)
-        if proc.returncode != 0:
-            raise RuntimeError(f"claude CLI failed (rc={proc.returncode}): {proc.stderr[-800:]}")
-        return proc.stdout
-
-    return complete
+    client = ClaudeCLIClient(model=args.claude_model, cli_cmd=args.claude_cmd, timeout=args.repair_timeout)
+    return client.complete
 
 
 REPAIR_SYSTEM = (
@@ -96,14 +89,11 @@ REPAIR_SYSTEM = (
 
 def pick_code(resp: str, top_name: str) -> str | None:
     blocks = extract_code_blocks(resp)
-    candidates = [c for (lang, c) in blocks if lang.lower() in ("cpp", "c++", "c", "")] or [c for (_, c) in blocks]
-    defines = re.compile(rf"\b{re.escape(top_name)}\s*\(")
-    for c in candidates:
-        if defines.search(c):
-            return c.strip() + "\n"
-    if candidates:
-        return candidates[0].strip() + "\n"
-    if defines.search(resp):
+    candidates = [c for lang, c in blocks if lang.lower() in ("cpp", "c++", "c", "")]
+    for candidate in candidates:
+        if is_plausible_translation_unit(candidate, top_name):
+            return candidate.strip() + "\n"
+    if not blocks and is_plausible_translation_unit(resp, top_name):
         return resp.strip() + "\n"
     return None
 

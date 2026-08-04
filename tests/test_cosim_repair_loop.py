@@ -16,6 +16,23 @@ sys.modules[spec.name] = loop
 spec.loader.exec_module(loop)
 
 
+class PickCodeTests(unittest.TestCase):
+    def test_accepts_fenced_definition_of_requested_top(self):
+        response = "```cpp\nvoid target(int value) { (void)value; }\n```"
+        self.assertEqual(loop.pick_code(response, "target"), "void target(int value) { (void)value; }\n")
+
+    def test_accepts_unfenced_definition_of_requested_top(self):
+        response = "void target(int value) { (void)value; }"
+        self.assertEqual(loop.pick_code(response, "target"), response + "\n")
+
+    def test_rejects_declaration_only(self):
+        self.assertIsNone(loop.pick_code("```cpp\nvoid target(int value);\n```", "target"))
+
+    def test_rejects_wrong_top_fenced_fallback(self):
+        response = "```cpp\nvoid different(int value) { (void)value; }\n```"
+        self.assertIsNone(loop.pick_code(response, "target"))
+
+
 class LoadDoneIdsTests(unittest.TestCase):
     def test_reads_ids_and_tolerates_bad_rows(self):
         with tempfile.TemporaryDirectory() as tmp:

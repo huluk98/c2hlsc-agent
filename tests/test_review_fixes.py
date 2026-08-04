@@ -28,6 +28,12 @@ class CosimLogGateTests(unittest.TestCase):
         )
         self.assertEqual(_gate_cosim_on_log(result).status, "pass")
 
+    def test_exit_zero_without_positive_marker_is_downgraded(self):
+        result = PhaseResult("cosim", "pass", returncode=0, stdout="Vitis HLS completed")
+        gated = _gate_cosim_on_log(result)
+        self.assertEqual(gated.status, "fail")
+        self.assertIn("no positive", gated.summary)
+
     def test_non_pass_is_untouched(self):
         result = PhaseResult("cosim", "fail", returncode=1, stdout="boom")
         self.assertEqual(_gate_cosim_on_log(result).status, "fail")
@@ -39,6 +45,10 @@ class ExternalFailureStateTests(unittest.TestCase):
         state = _external_failure_state("csim", "log evidence", run_vitis=False)
         self.assertEqual(state.status_for("software_equivalence"), "pass")
         self.assertEqual(state.status_for("csim"), "fail")
+        self.assertEqual(
+            state.phases["software_equivalence"].metadata["evidence_origin"],
+            "operator_assumption",
+        )
 
 
 class ConfigMergeTests(unittest.TestCase):

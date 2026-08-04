@@ -12,6 +12,7 @@ Mac), so the expensive Vitis ladder only ever sees the best candidate. Selection
 from __future__ import annotations
 
 import shutil
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -90,30 +91,61 @@ def select_best_candidate(
 
     scratch_dir = out_dir / CANDIDATE_DIRNAME
     scratch_dir.mkdir(parents=True, exist_ok=True)
-    scores: list[CandidateScore] = []
-    best: tuple[int, GeneratedSource, int] | None = None
-    # Smaller key = better. A candidate that ran and first failed at a later test index
-    # (-first_failure_index) beats one that failed earlier; any candidate that ran and
-    # mismatched beats one that did not build/run the harness at all (inf).
-    best_key = float("inf")
-    for index, candidate in enumerate(candidates):
-        score = _score_candidate(scratch_dir, analysis, candidate, config, index)
-        scores.append(score)
-        if score.passed and score.mismatch_count == 0:
+
+    def decide(ordered_scores):
+        scores: list[CandidateScore] = []
+        best: tuple[int, GeneratedSource, int] | None = None
+        # Smaller key = better. A candidate that ran and first failed at a later test
+        # index (-first_failure_index) beats one that failed earlier; any candidate that
+        # ran and mismatched beats one that did not build/run the harness at all (inf).
+        best_key = float("inf")
+        for score in ordered_scores:
+            index = score.index
+            candidate = candidates[index]
+            scores.append(score)
+            if score.passed and score.mismatch_count == 0:
+                candidate.transformations.append(
+                    f"Selected candidate {index + 1}/{len(candidates)}: passed local host equivalence."
+                )
+                return candidate, scores
+            key = float(-score.first_failure_index) if score.first_failure_index is not None else float("inf")
+            if key < best_key:
+                best = (index, candidate, score.first_failure_index or 0)
+                best_key = key
+
+        if best is not None:
+            index, candidate, reached = best
             candidate.transformations.append(
-                f"Selected candidate {index + 1}/{len(candidates)}: passed local host equivalence."
+                f"Selected candidate {index + 1}/{len(candidates)} that stayed correct furthest "
+                f"(first host-equivalence mismatch at test {reached}); the repair loop will drive it to equivalence."
             )
             return candidate, scores
-        key = float(-score.first_failure_index) if score.first_failure_index is not None else float("inf")
-        if key < best_key:
-            best = (index, candidate, score.first_failure_index or 0)
-            best_key = key
+        return None, scores
 
-    if best is not None:
-        index, candidate, reached = best
-        candidate.transformations.append(
-            f"Selected candidate {index + 1}/{len(candidates)} that stayed correct furthest "
-            f"(first host-equivalence mismatch at test {reached}); the repair loop will drive it to equivalence."
+    workers = min(len(candidates), max(1, int(getattr(config, "llm_candidate_workers", 4))))
+    if workers == 1:
+        return decide(
+            _score_candidate(scratch_dir, analysis, candidate, config, index)
+            for index, candidate in enumerate(candidates)
         )
-        return candidate, scores
-    return None, scores
+
+    # Candidate zero is the common fast path. Keep its historical early return and avoid
+    # launching redundant compiler jobs when it already passes. If it fails, the remaining
+    # projects and logs live in disjoint cand_<index> directories and can run concurrently.
+    first_score = _score_candidate(scratch_dir, analysis, candidates[0], config, 0)
+    if first_score.passed and first_score.mismatch_count == 0:
+        return decide((first_score,))
+
+    with ThreadPoolExecutor(max_workers=min(workers, len(candidates) - 1)) as pool:
+        futures = [
+            pool.submit(_score_candidate, scratch_dir, analysis, candidate, config, index)
+            for index, candidate in enumerate(candidates[1:], start=1)
+        ]
+
+        def ordered_scores():
+            yield first_score
+            yield from (future.result() for future in futures)
+
+        # Consume Future results in submission order so winner selection and the public
+        # score-list prefix exactly match the serial path even when jobs finish out of order.
+        return decide(ordered_scores())

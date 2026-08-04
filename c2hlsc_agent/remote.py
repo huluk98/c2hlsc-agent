@@ -22,12 +22,13 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .equivalence import PhaseResult, run_command
+from .vitis_command import vitis_tcl_command
 
 # Common settings64 locations, probed on the remote host when no explicit setup is given.
 _SETTINGS_CANDIDATES = tuple(
     f"{root}/Xilinx/{tool}/{version}/{script}"
     for root in ("/tools", "/opt")
-    for version in ("2024.2", "2024.1", "2023.2", "2022.1")
+    for version in ("2026.1", "2025.2", "2025.1", "2024.2", "2024.1", "2023.2", "2022.1")
     for tool, script in (("Vitis", "settings64.sh"), ("Vitis_HLS", ".settings64-Vitis_HLS.sh"))
 )
 
@@ -94,11 +95,12 @@ class RemoteVitis:
 
     def phase_script(self, project_dir: Path, phase: str, timeout: int) -> str:
         rdir = self.remote_project_dir(project_dir)
+        command = shlex.join(vitis_tcl_command(self.vitis_bin, f"run_{phase}.tcl"))
         # -k 30s: if vitis_hls ignores SIGTERM at the deadline, SIGKILL it 30s later so
         # the ssh session actually closes instead of hanging on the local grace timeout.
         return (
             f"cd {shlex.quote(rdir)} && {self._env_snippet()}"
-            f"timeout -k 30s {int(timeout)}s {shlex.quote(self.vitis_bin)} -f run_{phase}.tcl"
+            f"timeout -k 30s {int(timeout)}s {command}"
         )
 
     def phase_command(self, project_dir: Path, phase: str, timeout: int) -> list[str]:

@@ -46,7 +46,9 @@ stimuli; otherwise keep coverage metrics and counterexamples in the report.
        input stimulus, CFG shape, and def-use/DDG structure.
      - Add directed cases first: zero, all ones, min/max, alternating bits, length
        boundaries, alias-risk boundaries, and user-provided semantic corners.
-     - Add coverage refinement later with gcov plus KLEE or a constraint-solver shim.
+     - Run gcov concrete coverage plus the generated bounded relational KLEE driver before
+       synthesis. The driver clones shared symbolic state into golden-C and HLS-C calls,
+       then compares the return and complete configured pointer post-state.
    - Failure ownership: insufficient coverage, input trace mismatch, testbench compile
      errors, incorrect argument metadata.
 
@@ -101,14 +103,27 @@ stimuli; otherwise keep coverage metrics and counterexamples in the report.
      - Rerun the full verifier from the beginning after every patch.
 
 7. RTL optimizer agent
-   - Inputs: four-stage passing HLS-C, Vitis synthesis reports, optimization policy.
+   - Inputs: four-stage passing HLS-C, Vitis synthesis reports, optimization policy,
+     the configured PPA criteria (process node + slack floor).
    - Outputs: optimized HLS-C candidates, QoR delta, accepted/rejected decisions.
    - Gate:
      - This agent is disabled until functional equivalence is signed off.
+   - PPA workflow criteria (hardwired via the config `ppa:` block):
+     - Every slack/area/power number is measured on the declared process node
+       (`ppa.node`: nangate45 45 nm citable baseline — the default; sky130hd 130 nm
+       manufacturable; asap7 7 nm predictive), via the local yosys + OpenSTA step.
+     - `ppa.min_slack` (node time units) is the slack floor. Measured slack above the
+       floor is the **iteration budget**: spend it on functionality or frequency
+       (more work per cycle, deeper unroll, higher clock) — never accept a candidate
+       that lands below the floor.
+     - The `ppa` verification phase fails the run when a declared criterion is unmet
+       or unverifiable, and its `ppa_report.json` records slack headroom per run so
+       iterations can be compared.
    - Procedures:
      - Try one optimization family at a time: pipeline, unroll, array partition,
        dataflow, interface choice, bitwidth narrowing.
-     - Accept only if host equivalence, CSim, CSynth, and CoSim all pass again.
+     - Accept only if host equivalence, CSim, CSynth, and CoSim all pass again, and
+       the PPA criteria still hold on the configured node.
      - Record QoR deltas and rollback rejected changes.
 
 8. Audit memory agent
@@ -160,7 +175,10 @@ write report and audit memory
   C++ `restrict` compatibility, helper-source inclusion, interface-pragma stripping) and
   can escalate to an optional LLM patch of `src/hls_top.cpp`. The next step is richer,
   evidence-localized repairs driven by PMLC mismatch analysis.
-- Coverage collection now has generated `gcov` and optional KLEE hooks; the next step is to feed uncovered branches and KLEE counterexamples back into stimulus refinement.
+- Coverage collection now has generated `gcov` and optional bounded relational KLEE hooks.
+  Named relational counterexamples feed failure localization; unsupported contracts and
+  infrastructure/incomplete runs remain blocked evidence. The next step is to feed uncovered
+  gcov branches back into stimulus refinement and minimize KLEE counterexample witnesses.
 - Add PMLC instrumentation for CSim/CoSim mismatches.
 - Add an optimizer queue that snapshots candidates and rolls back rejected QoR changes.
 - Add a structured audit ledger and repair-card store.

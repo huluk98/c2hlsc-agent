@@ -135,6 +135,21 @@ class QoRParsingTests(unittest.TestCase):
         self.assertAlmostEqual(m.sta_worst_slack_max_ns, 5.85)
         self.assertAlmostEqual(m.sta_total_power_w, 1.23e-09)
 
+    def test_hierarchical_area_uses_top_module_not_submodule(self):
+        # Hierarchical netlists (e.g. Bambu RTL) emit per-submodule area lines BEFORE
+        # the whole-design "top module" total; the parser must report the top total,
+        # not the first functional-unit submodule it happens to see.
+        report = (
+            "Chip area for module '\\ui_plus_expr_FU': 86.450000\n"
+            "Chip area for module '\\_vector_add': 0.000000\n"
+            "Chip area for top module '\\vector_add': 12428.584000\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "yosys_area.rpt"
+            path.write_text(report, encoding="utf-8")
+            m = parse_yosys_area(path)
+        self.assertAlmostEqual(m.yosys_area_um2, 12428.584)
+
     def test_delta_and_objectives(self):
         base = QoRMetrics(latency_worst=200, lut=1000, ff=500, dsp=2, bram=1,
                           target_clock_ns=10.0, estimated_clock_ns=8.0)
@@ -190,8 +205,8 @@ class RunVitisUptoTests(unittest.TestCase):
     def test_upto_csynth_skips_cosim(self):
         with tempfile.TemporaryDirectory() as tmp:
             with mock.patch("c2hlsc_agent.hls_runner._run_vitis_phase",
-                            side_effect=lambda d, p, r: PhaseResult(p, "pass")), \
-                 mock.patch("c2hlsc_agent.hls_runner.shutil.which", return_value="/bin/vitis_hls"):
+                            side_effect=lambda d, p, r, b: PhaseResult(p, "pass")), \
+                 mock.patch("c2hlsc_agent.hls_runner.find_vitis_executable", return_value="/bin/vitis_hls"):
                 phases = run_vitis(Path(tmp), True, upto="csynth")
         self.assertEqual(phases["csynth"].status, "pass")
         self.assertEqual(phases["cosim"].status, "skipped")
@@ -234,7 +249,13 @@ class OptimizerLoopTests(unittest.TestCase):
     def _fake_run_vitis(latencies: list[int]):
         """Each csynth-scoring call writes the next latency into the candidate's report."""
 
-        def fake(project_dir: Path, run_requested: bool, remote=None, upto="cosim"):
+        def fake(
+            project_dir: Path,
+            run_requested: bool,
+            remote=None,
+            upto="cosim",
+            vitis_bin="vitis_hls",
+        ):
             latency = latencies.pop(0) if latencies else 999
             xml = project_dir / CSYNTH_XML_RELPATH
             xml.parent.mkdir(parents=True, exist_ok=True)
@@ -403,7 +424,13 @@ class OptimizerReviewFixTests(OptimizerLoopTests):
             os.utime(xml, (old, old))
             calls = {"n": 0}
 
-            def fake_run_vitis(project_dir, run_requested, remote=None, upto="cosim"):
+            def fake_run_vitis(
+                project_dir,
+                run_requested,
+                remote=None,
+                upto="cosim",
+                vitis_bin="vitis_hls",
+            ):
                 calls["n"] += 1
                 p = project_dir / CSYNTH_XML_RELPATH
                 p.parent.mkdir(parents=True, exist_ok=True)
@@ -550,16 +577,28 @@ class LocalPPATests(unittest.TestCase):
     def test_scripts_reference_flow(self):
         from c2hlsc_agent.local_ppa import _sta_script, _yosys_script
 
-        ys = _yosys_script([Path("/x/rtl/top.v")], "cnn_conv3x3", Path("/lib/n45.lib"), 10.0, Path("syn/net.v"))
-        self.assertIn("read_verilog /x/rtl/top.v", ys)
-        self.assertIn("dfflibmap -liberty /lib/n45.lib", ys)
-        self.assertIn("abc -liberty /lib/n45.lib -D 10000", ys)
+        lib = Path("/lib dir/n45.lib")  # space in the path must survive quoting
+        ys = _yosys_script([Path("/x/rtl dir/top.v")], "cnn_conv3x3", lib, [lib], 10.0, Path("syn/net.v"))
+        self.assertIn('read_verilog "/x/rtl dir/top.v"', ys)
+        self.assertIn('dfflibmap -liberty "/lib dir/n45.lib"', ys)
+        self.assertIn('abc -liberty "/lib dir/n45.lib" -D 10000', ys)
         self.assertIn("stat -liberty", ys)
-        tcl = _sta_script(Path("/lib/n45.lib"), Path("syn/net.v"), "cnn_conv3x3", 10.0, "ap_clk")
+        tcl = _sta_script([lib], Path("syn/net.v"), "cnn_conv3x3", 10.0, "ap_clk")
+        self.assertIn('read_liberty "/lib dir/n45.lib"', tcl)
         self.assertIn("create_clock -name ap_clk -period 10.0", tcl)
         self.assertIn("report_worst_slack -max", tcl)
         self.assertIn("report_power", tcl)
         self.assertIn("-group_path_count 3", tcl)  # non-deprecated OpenSTA flag
+
+    def test_sta_script_scales_to_node_units(self):
+        from c2hlsc_agent.local_ppa import _sta_script
+        from c2hlsc_agent.nodes import resolve_node
+
+        asap7 = resolve_node("asap7")
+        tcl = _sta_script([Path("/l/seq.lib")], Path("syn/net.v"), "top", 10.0, "ap_clk", node=asap7)
+        self.assertIn("create_clock -name ap_clk -period 10000.0", tcl)  # 10 ns -> ps
+        self.assertIn("set_output_delay 2000.0", tcl)
+        self.assertIn("set_load 10.0", tcl)
 
     def test_generate_cell_models_from_liberty(self):
         from c2hlsc_agent.local_ppa import generate_cell_models
@@ -577,7 +616,7 @@ class LocalPPATests(unittest.TestCase):
             out = Path(tmp) / "cells_sim.v"
             n = generate_cell_models(lib, net, out)
             text = out.read_text(encoding="utf-8")
-        self.assertEqual(n, 1)
+        self.assertEqual(n, (1, []))
         self.assertIn("module INV_X1(ZN, A);", text)
         self.assertIn("assign ZN = ~A;", text)
 
@@ -622,7 +661,7 @@ def _fake_local_ppa_factory(slacks: list[float]):
     from c2hlsc_agent.local_ppa import LocalPPAOutcome
 
     def fake(project_dir, top, clock_ns, liberty=None, sta_bin=None, clock_port="ap_clk",
-             gate_sim=True, metrics=None, verbose=False):
+             gate_sim=True, metrics=None, verbose=False, node="nangate45"):
         m = metrics or QoRMetrics()
         m.sta_worst_slack_max_ns = slacks.pop(0) if slacks else 9.9
         m.yosys_area_um2 = 900.0
@@ -726,3 +765,202 @@ class OptimizeCliTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PPACriteriaTests(unittest.TestCase):
+    """The `ppa:` config block is the hardwired workflow criteria: node + slack floor."""
+
+    def _load(self, text: str):
+        from c2hlsc_agent.config import load_config
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.yaml"
+            path.write_text(text, encoding="utf-8")
+            return load_config(path)
+
+    def test_ppa_block_hardwires_node_and_slack(self):
+        cfg = self._load("top: t\nppa:\n  node: asap7\n  min_slack: 50\n")
+        self.assertEqual(cfg.node, "asap7")
+        self.assertEqual(cfg.min_slack, 50.0)
+        self.assertTrue(cfg.run_local_ppa)  # presence of the block enables the step
+
+    def test_ppa_block_rejects_unknown_node_and_keys(self):
+        with self.assertRaises(ValueError):
+            self._load("top: t\nppa:\n  node: tsmc5\n")
+        with self.assertRaises(ValueError):
+            self._load("top: t\nppa:\n  nodes: nangate45\n")
+
+    def test_no_ppa_block_keeps_step_off(self):
+        cfg = self._load("top: t\n")
+        self.assertEqual(cfg.node, "nangate45")
+        self.assertFalse(cfg.run_local_ppa)
+        self.assertIsNone(cfg.min_slack)
+
+    def test_targets_from_config_and_headroom(self):
+        from c2hlsc_agent.qor import slack_headroom, targets_from_config
+
+        cfg = self._load("top: t\nppa:\n  min_slack: 1.5\n  max_area_um2: 2000\n")
+        targets = targets_from_config(cfg)
+        self.assertEqual(targets.min_slack_ns, 1.5)
+        self.assertEqual(targets.max_area_um2, 2000.0)
+        m = QoRMetrics(sta_worst_slack_max_ns=5.85)
+        self.assertAlmostEqual(slack_headroom(m, targets), 4.35)
+        self.assertAlmostEqual(slack_headroom(m, None), 5.85)  # floor defaults to 0
+        self.assertIsNone(slack_headroom(QoRMetrics(), targets))  # unmeasured -> None
+
+    def test_node_registry_units(self):
+        from c2hlsc_agent.nodes import NODES, resolve_node
+
+        self.assertEqual(set(NODES), {"nangate45", "sky130hd", "asap7"})
+        asap7 = resolve_node("asap7")
+        self.assertEqual(asap7.clock_period(10.0), 10000.0)  # ns -> ps
+        self.assertEqual(resolve_node("sky130hd").clock_period(10.0), 10.0)
+        self.assertTrue(resolve_node("sky130hd").manufacturable)
+        with self.assertRaises(ValueError):
+            resolve_node("tsmc5")
+
+    def test_quoted_liberty_pins_parse(self):
+        """SkyWater-style quoting: cell ("x") / pin ("A") / direction : "input"."""
+        from c2hlsc_agent.local_ppa import _liberty_cell_blocks, _parse_pins
+
+        with tempfile.TemporaryDirectory() as tmp:
+            lib = Path(tmp) / "q.lib"
+            lib.write_text(
+                'library (q) {\n'
+                '  cell ("inv_q") {\n'
+                '    pg_pin ("VPWR") { direction : "input"; }\n'
+                '    pin ("A") { direction : "input"; }\n'
+                '    pin ("Y") { direction : "output"; function : "(!A)"; }\n'
+                '  }\n'
+                '}\n',
+                encoding="utf-8",
+            )
+            blocks = _liberty_cell_blocks(lib)
+        self.assertIn("inv_q", blocks)
+        pins = _parse_pins(blocks["inv_q"])
+        self.assertEqual([(n, d) for n, d, _ in pins], [("A", "input"), ("Y", "output")])
+
+
+class PPAReviewRegressionTests(unittest.TestCase):
+    """Regressions for the adversarial-review findings on the node+slack criteria change."""
+
+    def test_final_status_gates_on_present_ppa_phase(self):
+        from c2hlsc_agent.equivalence import PhaseResult, VerificationState
+        from c2hlsc_agent.report import final_status
+
+        s = VerificationState()
+        s.add_phase(PhaseResult("software_equivalence", "pass"))
+        self.assertEqual(final_status(s, False, False), "pass")  # no ppa phase -> pass
+        s.add_phase(PhaseResult("ppa", "skipped"))
+        self.assertEqual(final_status(s, False, False), "pass")  # skipped ppa never gates
+        s.add_phase(PhaseResult("ppa", "fail"))
+        self.assertEqual(final_status(s, False, False), "fail")  # failed ppa gates
+
+    def test_evaluate_targets_seeded_latency_passes(self):
+        from c2hlsc_agent.qor import PPATargets, QoRMetrics, evaluate_targets
+
+        # A latency criterion evaluates when latency_worst is seeded (the csynth-seed fix);
+        # unseeded it is "no measurement yet" and fails.
+        seeded = QoRMetrics(latency_worst=50, sta_worst_slack_max_ns=5.0, yosys_area_um2=900)
+        met, gaps, _ = evaluate_targets(seeded, PPATargets(max_latency_cycles=100))
+        self.assertTrue(met, gaps)
+        unseeded = QoRMetrics(sta_worst_slack_max_ns=5.0, yosys_area_um2=900)
+        met2, gaps2, _ = evaluate_targets(unseeded, PPATargets(max_latency_cycles=100))
+        self.assertFalse(met2)
+        self.assertIn("no measurement yet", gaps2[0])
+
+    def test_evaluate_targets_slack_unit_label(self):
+        from c2hlsc_agent.qor import PPATargets, QoRMetrics, evaluate_targets
+
+        m = QoRMetrics(sta_worst_slack_max_ns=96.0)
+        _, gaps, _ = evaluate_targets(m, PPATargets(min_slack_ns=200), time_unit="ps")
+        self.assertIn("(ps)", gaps[0])
+
+    def test_config_contradiction_and_criterion_forces_step(self):
+        from c2hlsc_agent.config import load_config
+
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "c.yaml"
+            p.write_text("top: t\nppa:\n  run_local_ppa: false\n  min_slack: 1.0\n")
+            with self.assertRaises(ValueError):
+                load_config(p)  # criterion + off-switch is a contradiction, not a silent drop
+            p.write_text("top: t\nppa:\n  run_local_ppa: false\n  max_area_um2: 2000\n")
+            with self.assertRaises(ValueError):
+                load_config(p)
+            # a declared criterion alone forces the step on
+            p.write_text("top: t\nppa:\n  max_power_w: 0.001\n")
+            self.assertTrue(load_config(p).run_local_ppa)
+
+    def test_yaml_no_off_are_false(self):
+        from c2hlsc_agent.config import _parse_scalar
+
+        self.assertIs(_parse_scalar("no"), False)
+        self.assertIs(_parse_scalar("off"), False)
+        self.assertIs(_parse_scalar("yes"), True)
+        self.assertIs(_parse_scalar("on"), True)
+
+    def test_explicit_liberty_missing_path_is_error(self):
+        from c2hlsc_agent.local_ppa import resolve_explicit_liberty
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path, err = resolve_explicit_liberty(Path(tmp), "/no/such.lib")
+            self.assertIsNone(path)
+            self.assertIn("does not exist", err)
+            # nothing requested -> node flow, no error
+            path2, err2 = resolve_explicit_liberty(Path(tmp), None)
+            self.assertIsNone(path2)
+            self.assertIsNone(err2)
+
+    def test_async_ff_and_latch_are_unmodeled(self):
+        from c2hlsc_agent.local_ppa import generate_cell_models
+
+        with tempfile.TemporaryDirectory() as tmp:
+            lib = Path(tmp) / "x.lib"
+            lib.write_text(
+                "library(x){\n"
+                '  cell(DFFR){ ff(IQ,IQN){ next_state:"D"; clocked_on:"CK"; clear:"!RN"; }\n'
+                "    pin(D){direction:input;} pin(CK){direction:input;} pin(RN){direction:input;}\n"
+                '    pin(Q){direction:output; function:"IQ";} }\n'
+                "  cell(LAT){ latch(IQ,IQN){ enable:\"E\"; data_in:\"D\"; }\n"
+                '    pin(D){direction:input;} pin(E){direction:input;} pin(Q){direction:output; function:"IQ";} }\n'
+                '  cell(INV){ pin(A){direction:input;} pin(ZN){direction:output; function:"!A";} }\n'
+                "}\n"
+            )
+            net = Path(tmp) / "net.v"
+            net.write_text(
+                "module top();\n  DFFR u0(.D(a),.CK(b),.RN(c),.Q(d));\n"
+                "  LAT u1(.D(a),.E(b),.Q(e));\n  INV u2(.A(a),.ZN(f));\nendmodule\n"
+            )
+            modeled, unmodeled = generate_cell_models([lib], net, Path(tmp) / "out.v")
+        self.assertEqual(modeled, 1)  # only INV
+        self.assertEqual(sorted(unmodeled), ["DFFR", "LAT"])  # async FF + latch skipped
+
+    def test_paren_postfix_negation_is_unmodeled(self):
+        from c2hlsc_agent.local_ppa import _liberty_expr_to_verilog
+
+        with self.assertRaises(ValueError):
+            _liberty_expr_to_verilog("(A+B)'")  # must raise -> cell skipped, not mis-emitted
+        self.assertEqual(_liberty_expr_to_verilog("!A"), "~A")  # simple cases still work
+
+    def test_fetch_file_catches_incomplete_read(self):
+        import http.client
+
+        from c2hlsc_agent import nodes
+
+        self.assertIn(http.client.HTTPException, nodes._DOWNLOAD_ERRORS)
+        # IncompleteRead is an HTTPException, NOT an OSError — the load-bearing case
+        self.assertTrue(issubclass(http.client.IncompleteRead, http.client.HTTPException))
+        self.assertFalse(issubclass(http.client.IncompleteRead, OSError))
+
+
+class YosysPlainStatParseTest(unittest.TestCase):
+    def test_plain_stat_bare_cell_total_parses(self):
+        # Multi-liberty nodes (asap7) use plain `stat` -> bare "N cells" row, no area col.
+        from c2hlsc_agent.qor import parse_yosys_area
+
+        with tempfile.TemporaryDirectory() as tmp:
+            rpt = Path(tmp) / "y.rpt"
+            rpt.write_text("=== top ===\n      690 wire bits\n      655 cells\n        1   AND2x2_ASAP7_75t_R\n", encoding="utf-8")
+            m = parse_yosys_area(rpt)
+        self.assertEqual(m.yosys_cells, 655)
+        self.assertIsNone(m.yosys_area_um2)  # plain stat has no area

@@ -1,3 +1,4 @@
+import hashlib
 import json
 import contextlib
 import io
@@ -10,7 +11,12 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from c2hlsc_agent.cli import build_parser, run_convert, run_repair
+from c2hlsc_agent.cli import (
+    _read_relational_klee_evidence,
+    build_parser,
+    run_convert,
+    run_repair,
+)
 from c2hlsc_agent.equivalence import PhaseResult, VerificationState
 
 
@@ -22,6 +28,145 @@ def _state(*phases: PhaseResult) -> VerificationState:
 
 
 class CliRepairLoopTests(unittest.TestCase):
+    def test_manual_symbolic_repair_rejects_inline_or_legacy_evidence(self):
+        with self.assertRaisesRegex(SystemExit, "evidence-text is not accepted"):
+            _read_relational_klee_evidence([], "KLEE assertion failure")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            report = Path(tmp) / "klee_report.json"
+            report.write_text(
+                json.dumps(
+                    {
+                        "status": "fail",
+                        "reason": "KLEE crashed",
+                        "counterexample_names": [
+                            "C2HLSC_RELATIONAL_MISMATCH:return"
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(SystemExit, "requires a c2hlsc-klee-report-v1"):
+                _read_relational_klee_evidence([str(report)], "")
+
+    def test_manual_symbolic_repair_accepts_only_scoped_relational_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report = Path(tmp) / "klee_report.json"
+            report.write_text(
+                json.dumps(
+                    {
+                        "schema": "c2hlsc-klee-report-v1",
+                        "scope": "golden_hlsc_relational",
+                        "status": "fail",
+                        "outcome": "counterexample",
+                        "failure_kind": "relational_counterexample",
+                        "completed_paths": 2,
+                        "generated_tests": 1,
+                        "timed_out": False,
+                        "invocations": 1,
+                        "observable_count": 1,
+                        "top": "kernel",
+                        "assumptions": {
+                            "pointer_alias_model": "distinct_pointer_arguments",
+                            "hidden_state_model": "no_mutable_hidden_state",
+                            "comparison": "return_and_complete_pointer_post_state",
+                        },
+                        "artifact_sha256": {
+                            relative: "0" * 64
+                            for relative in (
+                                "input.c",
+                                "src/hls_top.hpp",
+                                "src/hls_top.cpp",
+                                "tb/klee_driver.cpp",
+                                "tb/leveri_manifest.json",
+                            )
+                        },
+                        "counterexample_names": [
+                            "C2HLSC_RELATIONAL_MISMATCH:return"
+                        ],
+                        "counterexamples": [
+                            {
+                                "observable": "C2HLSC_RELATIONAL_MISMATCH:return",
+                                "error_file": "coverage/klee-out/test000001.c2hlsc_relational.err",
+                            }
+                        ],
+                        "ktest_files": ["coverage/klee-out/test000001.ktest"],
+                        "commands": ["must not enter metadata"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            evidence, metadata = _read_relational_klee_evidence([str(report)], "")
+
+            self.assertIn("validated_relational_klee", evidence)
+            self.assertNotIn("must not enter metadata", evidence)
+            self.assertNotIn(str(report.resolve()), evidence)
+            self.assertEqual(metadata["scope"], "golden_hlsc_relational")
+            self.assertEqual(metadata["counterexample_count"], 1)
+            self.assertNotIn("commands", metadata)
+
+    def test_manual_symbolic_repair_binds_report_to_project_revision(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project = root / "project"
+            artifacts = (
+                "input.c",
+                "src/hls_top.hpp",
+                "src/hls_top.cpp",
+                "tb/klee_driver.cpp",
+                "tb/leveri_manifest.json",
+            )
+            for relative in artifacts:
+                path = project / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(f"content:{relative}\n", encoding="utf-8")
+            hashes = {
+                relative: hashlib.sha256((project / relative).read_bytes()).hexdigest()
+                for relative in artifacts
+            }
+            report = root / "klee_report.json"
+            report.write_text(
+                json.dumps(
+                    {
+                        "schema": "c2hlsc-klee-report-v1",
+                        "scope": "golden_hlsc_relational",
+                        "status": "fail",
+                        "outcome": "counterexample",
+                        "failure_kind": "relational_counterexample",
+                        "invocations": 1,
+                        "observable_count": 1,
+                        "assumptions": {
+                            "pointer_alias_model": "distinct_pointer_arguments",
+                            "hidden_state_model": "no_mutable_hidden_state",
+                            "comparison": "return_and_complete_pointer_post_state",
+                        },
+                        "top": "kernel",
+                        "artifact_sha256": hashes,
+                        "counterexample_names": ["C2HLSC_RELATIONAL_MISMATCH:return"],
+                        "counterexamples": [
+                            {
+                                "observable": "C2HLSC_RELATIONAL_MISMATCH:return",
+                                "error_file": "coverage/klee-out/test000001.c2hlsc_relational.err",
+                            }
+                        ],
+                        "ktest_files": ["coverage/klee-out/test000001.ktest"],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            _, metadata = _read_relational_klee_evidence(
+                [str(report)], "", project_dir=project, expected_top="kernel"
+            )
+            self.assertEqual(metadata["top"], "kernel")
+
+            (project / "src/hls_top.cpp").write_text("changed\n", encoding="utf-8")
+            with self.assertRaisesRegex(SystemExit, "requires a c2hlsc-klee-report-v1"):
+                _read_relational_klee_evidence(
+                    [str(report)], "", project_dir=project, expected_top="kernel"
+                )
+
     def test_max_iterations_reruns_from_beginning_after_applied_repair(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -158,14 +158,28 @@ def parse_yosys_area(path: Path, metrics: QoRMetrics | None = None) -> QoRMetric
 
     metrics = metrics or QoRMetrics()
     text = path.read_text(encoding="utf-8", errors="replace")
-    area = re.search(r"Chip area for (?:top )?module '[^']*':\s*([0-9.]+)", text)
+    # yosys `stat` emits one "Chip area for module 'X'" line per module and a single
+    # "Chip area for top module 'T'" line carrying the whole-design total. On a flat
+    # netlist there is only the top line; on a hierarchical one (e.g. Bambu RTL, whose
+    # top is a thin wrapper over a `_<top>` datapath) the submodule lines come FIRST, so
+    # a plain first-match grabs a functional-unit's area, not the design's. Prefer the
+    # "top module" total; fall back to the first per-module line only if it is absent.
+    area = re.search(r"Chip area for top module '[^']*':\s*([0-9.]+(?:[eE][+-]?\d+)?)", text)
+    if area is None:
+        area = re.search(r"Chip area for module '[^']*':\s*([0-9.]+(?:[eE][+-]?\d+)?)", text)
     if area:
         metrics.yosys_area_um2 = float(area.group(1))
-    # Classic format ("Number of cells: N") and the modern column-table total row
-    # ("     759  958.398 cells"), as emitted by yosys 0.6x `stat`.
+    # Three yosys `stat` shapes:
+    #  - classic "Number of cells: N"
+    #  - with -liberty, a total row carrying area: "759  958.398 cells" (or sci-notation
+    #    "606 4.65E+03 cells" once the area passes 4 digits)
+    #  - without -liberty (multi-liberty nodes like asap7 use plain `stat`), a bare
+    #    total row with no area column: "655 cells"
     cells = re.search(r"Number of cells:\s*(\d+)", text)
     if cells is None:
-        cells = re.search(r"^\s*(\d+)\s+[0-9.]+\s+cells\s*$", text, re.M)
+        cells = re.search(r"^\s*(\d+)\s+[0-9.]+(?:[eE][+-]?\d+)?\s+cells\s*$", text, re.M)
+    if cells is None:
+        cells = re.search(r"^\s*(\d+)\s+cells\s*$", text, re.M)
     if cells:
         metrics.yosys_cells = int(cells.group(1))
     return metrics
@@ -269,12 +283,37 @@ class PPATargets:
         }
 
 
-def evaluate_targets(metrics: QoRMetrics, targets: PPATargets) -> tuple[bool, list[str], float]:
+def targets_from_config(config: object) -> PPATargets:
+    """Build :class:`PPATargets` from the config's ``ppa:`` criteria block, so the
+    workflow gates on the same numbers whether driven by CLI flags or config."""
+
+    return PPATargets(
+        max_latency_cycles=getattr(config, "max_latency_cycles", None),
+        min_slack_ns=getattr(config, "min_slack", None),
+        max_area_um2=getattr(config, "max_area_um2", None),
+        max_power_w=getattr(config, "max_power_w", None),
+    )
+
+
+def slack_headroom(metrics: QoRMetrics, targets: PPATargets | None) -> float | None:
+    """The iteration budget: measured worst setup slack minus the ``min_slack`` floor
+    (or minus zero when no floor is set). Positive headroom is timing budget that can
+    be spent on functionality or frequency; ``None`` when slack was not measured."""
+
+    if metrics.sta_worst_slack_max_ns is None:
+        return None
+    floor = targets.min_slack_ns if targets is not None and targets.min_slack_ns is not None else 0.0
+    return metrics.sta_worst_slack_max_ns - floor
+
+
+def evaluate_targets(metrics: QoRMetrics, targets: PPATargets, time_unit: str = "ns") -> tuple[bool, list[str], float]:
     """Check ``metrics`` against ``targets``.
 
     Returns ``(all_met, gap_descriptions, gap_score)`` where ``gap_score`` sums the
     normalized shortfalls (0.0 when every specified target is met; a target whose metric
     is missing counts as fully unmet, 1.0). Lower gap_score = closer to the targets.
+    ``time_unit`` (ns/ps) labels the slack gap message on the active process node —
+    ``min_slack_ns`` is a field name, not the physical unit, which is ps on asap7.
     """
 
     gaps: list[str] = []
@@ -299,7 +338,7 @@ def evaluate_targets(metrics: QoRMetrics, targets: PPATargets) -> tuple[bool, li
         latency = metrics.latency_worst if metrics.latency_worst is not None else metrics.interval_max
         check("latency (worst cycles)", latency, float(targets.max_latency_cycles), "<=")
     if targets.min_slack_ns is not None:
-        check("worst setup slack (ns)", metrics.sta_worst_slack_max_ns, targets.min_slack_ns, ">=")
+        check(f"worst setup slack ({time_unit})", metrics.sta_worst_slack_max_ns, targets.min_slack_ns, ">=")
     if targets.max_area_um2 is not None:
         check("std-cell area (um^2)", metrics.yosys_area_um2, targets.max_area_um2, "<=")
     if targets.max_power_w is not None:

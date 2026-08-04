@@ -48,6 +48,52 @@ class FailureAnalysis:
         }
 
 
+def _is_valid_relational_klee_metadata(metadata: object) -> bool:
+    if not isinstance(metadata, dict):
+        return False
+    names = metadata.get("counterexample_names")
+    assumptions = metadata.get("assumptions")
+    hashes = metadata.get("artifact_sha256")
+    return (
+        metadata.get("schema") == "c2hlsc-klee-report-v1"
+        and metadata.get("scope") == "golden_hlsc_relational"
+        and metadata.get("outcome") == "counterexample"
+        and metadata.get("failure_kind") == "relational_counterexample"
+        and metadata.get("invocations") == 1
+        and type(metadata.get("observable_count")) is int
+        and metadata["observable_count"] > 0
+        and isinstance(metadata.get("top"), str)
+        and bool(metadata["top"])
+        and isinstance(names, list)
+        and bool(names)
+        and all(
+            isinstance(name, str)
+            and re.fullmatch(
+                r"C2HLSC_RELATIONAL_MISMATCH:(?:return|[A-Za-z_][A-Za-z0-9_]*)",
+                name,
+            )
+            for name in names
+        )
+        and isinstance(assumptions, dict)
+        and assumptions.get("pointer_alias_model") == "distinct_pointer_arguments"
+        and assumptions.get("hidden_state_model") == "no_mutable_hidden_state"
+        and assumptions.get("comparison") == "return_and_complete_pointer_post_state"
+        and isinstance(hashes, dict)
+        and set(hashes)
+        == {
+            "input.c",
+            "src/hls_top.hpp",
+            "src/hls_top.cpp",
+            "tb/klee_driver.cpp",
+            "tb/leveri_manifest.json",
+        }
+        and all(
+            isinstance(digest, str) and re.fullmatch(r"[0-9a-fA-F]{64}", digest)
+            for digest in hashes.values()
+        )
+    )
+
+
 def multi_agent_procedures() -> tuple[AgentProcedure, ...]:
     return (
         AgentProcedure(
@@ -134,6 +180,18 @@ def multi_agent_procedures() -> tuple[AgentProcedure, ...]:
             outputs=("audit ledger", "repair-success cards", "retrieval blind-spot notes"),
             stop_condition="No reference HLS, hidden labels, or manual fixes enter prompt-facing memory.",
         ),
+        AgentProcedure(
+            name="cross_reference_operator",
+            role="Dual-generation differential oracle",
+            owns="Generate two independent implementations from the same NL spec (no shared "
+            "context, different framings), compare them under shared stimulus in isolated "
+            "namespaces, and classify each record.",
+            inputs=("HLS_NL record (NL spec + top name)", "stimulus seed", "vector count"),
+            outputs=("cross_referenced_corpus.jsonl", "needs_review.jsonl", "results.jsonl"),
+            stop_condition="Only records whose two arms parse, compile, and agree on every "
+            "driven vector enter the cross-verified corpus; the dataset reference is never "
+            "shown to either arm.",
+        ),
     )
 
 
@@ -146,7 +204,16 @@ def _phase_text(state: VerificationState, phase: str) -> str:
 
 def classify_log_family(phase: str, text: str) -> str:
     lowered = text.lower()
-    if "vitis_hls not found" in lowered or "remote vitis unavailable" in lowered:
+    if "local-hls backend" in lowered:
+        # A local-hls (Bambu) csynth/cosim failure: the backend synthesizes the
+        # golden C, so this is a backend/toolchain limitation, not a repairable
+        # HLS-C defect. Route to a blocked family so no HLS-C mutation happens.
+        return "local_hls_backend"
+    if (
+        "vitis_hls not found" in lowered
+        or "remote vitis unavailable" in lowered
+        or ("vitis" in lowered and "not found" in lowered)
+    ):
         return "toolchain_unavailable"
     if re.search(r"\b(timeout|timed out|deadlock|stdout-silence)\b", lowered):
         return "timeout_or_deadlock"
@@ -214,6 +281,54 @@ def classify_failure(
             repair_scope="verification scheduling",
         )
 
+    shift_left_trace = state.status_for("shift_left_trace")
+    if shift_left_trace == "fail":
+        return FailureAnalysis(
+            family="shift_left_trace_failure",
+            owner_agent="shift_left_testbench_agent",
+            next_action="Inspect the first paired golden/HLS trace divergence or harness build failure before synthesis.",
+            evidence_needed=("shift_left_trace.log", "golden/HLS trace rows", "argument metadata", "trace schema"),
+            repair_scope="generated HLS-C, paired-trace harness, or contract metadata",
+        )
+    coverage_gcov = state.status_for("coverage_gcov")
+    if coverage_gcov == "fail":
+        return FailureAnalysis(
+            family="concrete_coverage_failure",
+            owner_agent="shift_left_testbench_agent",
+            next_action="Repair the gcov build/instrumentation harness; do not mutate HLS-C from coverage infrastructure evidence alone.",
+            evidence_needed=("coverage_gcov.log", "coverage/gcov_report.json", "compiler and gcov versions"),
+            repair_scope="coverage toolchain or generated coverage harness",
+            status="blocked",
+        )
+    symbolic_klee = state.status_for("symbolic_klee")
+    if symbolic_klee == "fail":
+        result = state.phases.get("symbolic_klee")
+        metadata = result.metadata if result is not None else {}
+        if _is_valid_relational_klee_metadata(metadata):
+            return FailureAnalysis(
+                family="klee_relational_counterexample",
+                owner_agent="failure_analyst",
+                next_action=(
+                    "Confirm the named bounded KLEE counterexample, localize the divergent "
+                    "observable, then apply a minimal generated HLS-C repair and rerun the full ladder."
+                ),
+                evidence_needed=(
+                    "coverage/klee_report.json",
+                    "named relational observable",
+                    "matching ktest counterexample",
+                    "symbolic driver",
+                ),
+                repair_scope="generated HLS-C only after the driver and contract are audited",
+            )
+        return FailureAnalysis(
+            family="symbolic_execution_failure",
+            owner_agent="shift_left_testbench_agent",
+            next_action="Inspect the KLEE report schema, scope, contract, and runner error; unvalidated symbolic evidence must not authorize an HLS-C mutation.",
+            evidence_needed=("symbolic_klee.log", "coverage/klee_report.json", "symbolic driver", "contract assumptions"),
+            repair_scope="symbolic harness, contract metadata, or toolchain (no automatic HLS-C mutation)",
+            status="blocked",
+        )
+
     if not run_vitis_requested:
         return FailureAnalysis(
             family="vitis_not_requested",
@@ -230,6 +345,17 @@ def classify_failure(
             continue
         text = _phase_text(state, phase)
         family = classify_log_family(phase, text)
+        if family == "local_hls_backend":
+            return FailureAnalysis(
+                family="local_hls_backend",
+                owner_agent="cosim_operator",
+                next_action="A local-hls (Bambu) csynth/cosim failure reflects the golden-C to RTL path "
+                "or a Bambu limitation, not a repairable HLS-C defect; inspect the Bambu log, or use the "
+                "Vitis backend for HLS-C-accurate cosim. HLS-C is left untouched.",
+                evidence_needed=("bambu log excerpt", "top function", "unsupported construct or mismatch"),
+                repair_scope="backend/toolchain (no HLS-C mutation)",
+                status="blocked",
+            )
         if family == "toolchain_unavailable":
             return FailureAnalysis(
                 family=family,

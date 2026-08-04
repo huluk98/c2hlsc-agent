@@ -1,0 +1,27 @@
+scope:
+  - c2hlsc_agent/**/*.py
+  - scripts/run_hls_nl_vitis_batch.py
+  - scripts/cosim_repair_loop.py
+  - tests/**/*.py
+objective: Maximize deterministic functional-safety cases correctly rejected or accepted.
+score_command: python3 .evolution/evaluators/safety_v1.py --repo .
+verify_commands:
+  - env PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests
+  - python3 .evolution/evaluators/safety_v1.py --repo .
+direction: maximize
+max_generations: 3
+candidates_per_generation: 3
+time_budget_minutes: 90
+minimum_improvement: 1
+secondary_objective: Reduce evaluator and pipeline wall time without changing results or weakening guards.
+evaluator_sha256: 8ba2fe1a9ef2883571604052d303893d23220670ae6c38e5daf9411a1c28079d
+protected_paths:
+  - .git/**
+  - .claude/worktrees/**
+  - .evolution/config.yaml
+  - .evolution/evaluators/**
+  - build/**
+  - runs/**
+  - data/hls_nl/**
+  - hls_nl_full_cosim_passes/**
+  - CLAUDE.md

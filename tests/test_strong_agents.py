@@ -14,18 +14,22 @@ import contextlib
 import io
 import json
 import os
+import re
 import subprocess
 import tempfile
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest import mock
 
 from c2hlsc_agent import llm as llm_module
 from c2hlsc_agent.analyze import analyze_source
-from c2hlsc_agent.candidates import select_best_candidate
+from c2hlsc_agent.candidates import CandidateScore, select_best_candidate
 from c2hlsc_agent.cli import build_parser, run_convert
 from c2hlsc_agent.config import AgentConfig, merge_cli_config
 from c2hlsc_agent.convert import (
+    GeneratedSource,
     generate_hls_source_candidates,
     generate_hls_sources,
     generate_reference_c,
@@ -54,20 +58,43 @@ void vector_add(const int32_t *a, const int32_t *b, int32_t *out, int n) {
 
 
 class SeqLLM:
-    """FakeLLM that returns one queued response per call and records prompts."""
+    """FakeLLM that maps each queued response to a specific generation attempt.
+
+    Candidate generation runs concurrently, so responses CANNOT be handed out by
+    call-arrival order (that would be a race). Both generator call sites stamp the
+    attempt number into the prompt ("independent candidate #N"), so attribute by that
+    instead; attempt 0 emits no marker and takes the first response. ``calls`` is
+    likewise recorded by attempt index, so ``calls[i]`` is always attempt i's prompt.
+    """
+
+    _ATTEMPT_RE = re.compile(r"independent (?:candidate|optimization attempt) #(\d+)")
 
     def __init__(self, responses: list[str], model: str = "fake-model") -> None:
         self.responses = list(responses)
         self.model = model
-        self.calls: list[tuple[str, str]] = []
+        self._by_attempt: dict[int, tuple[str, str]] = {}
+        self._lock = threading.Lock()
+        # Keying by attempt makes `calls` deterministic under concurrency, but a dict
+        # OVERWRITES -- so len(calls) alone cannot catch one attempt dispatched twice
+        # while another never fires. Count invocations separately to keep that check.
+        self.invocations = 0
+
+    @property
+    def calls(self) -> list[tuple[str, str]]:
+        with self._lock:
+            return [self._by_attempt[k] for k in sorted(self._by_attempt)]
 
     def complete(self, system: str, user: str, *, max_tokens: int = 8000) -> str:
-        self.calls.append((system, user))
+        match = self._ATTEMPT_RE.search(user)
+        attempt = int(match.group(1)) - 1 if match else 0
+        with self._lock:
+            self._by_attempt[attempt] = (system, user)
+            self.invocations += 1
         if not self.responses:
             raise AssertionError("SeqLLM ran out of queued responses")
-        if len(self.responses) == 1:
-            return self.responses[0]
-        return self.responses.pop(0)
+        if attempt < len(self.responses):
+            return self.responses[attempt]
+        return self.responses[-1]
 
 
 def _analysis(tmp: Path, config: AgentConfig, source_text: str = VECTOR_ADD, top: str = "vector_add"):
@@ -130,19 +157,79 @@ class ClaudeCLIBackendTests(unittest.TestCase):
 
     def test_cli_client_pipes_prompt_and_returns_stdout(self):
         client = ClaudeCLIClient(model="opus", cli_cmd="claude")
-        completed = subprocess.CompletedProcess(args=[], returncode=0, stdout="ANSWER", stderr="")
+        stdout = json.dumps({"result": "ANSWER", "is_error": False, "session_id": "abc"})
+        completed = subprocess.CompletedProcess(args=[], returncode=0, stdout=stdout, stderr="")
         with mock.patch.object(llm_module.subprocess, "run", return_value=completed) as run:
             result = client.complete("SYS", "USER")
         self.assertEqual(result, "ANSWER")
         argv = run.call_args.args[0]
         self.assertEqual(argv[:3], ["claude", "-p", "--model"])
         self.assertEqual(argv[3], "opus")
-        self.assertIn("SYS", run.call_args.kwargs["input"])
-        self.assertIn("USER", run.call_args.kwargs["input"])
+        self.assertEqual(argv[argv.index("--output-format") + 1], "json")
+        self.assertIn("--strict-mcp-config", argv)
+        self.assertIn("--no-session-persistence", argv)
+        self.assertIn("--system-prompt", argv)
+        self.assertEqual(argv[argv.index("--system-prompt") + 1], "SYS")
+        # The two empty-valued flags carry the isolation guarantee documented in CLAUDE.md:
+        # no user/project settings, no tools. Assert the VALUES, not just the flag names.
+        self.assertEqual(argv[argv.index("--setting-sources") + 1], "")
+        self.assertEqual(argv[argv.index("--tools") + 1], "")
+        # --tools is variadic (`--tools <tools...>`), so its empty value only stays empty
+        # because a '-'-prefixed token follows it. Pin that ordering.
+        self.assertTrue(argv[argv.index("--tools") + 2].startswith("-"))
+        self.assertEqual(run.call_args.kwargs["input"], "USER")
+        self.assertEqual(client.call_count, 1)
+
+    def test_cli_client_usage_totals_survive_concurrent_calls(self):
+        # One client is shared by the parallel best-of-N threads, so usage accounting
+        # must accumulate rather than race on a per-call "last value".
+        client = ClaudeCLIClient()
+        stdout = json.dumps({"result": "OK", "is_error": False, "total_cost_usd": 0.25})
+        completed = subprocess.CompletedProcess(args=[], returncode=0, stdout=stdout, stderr="")
+        with mock.patch.object(llm_module.subprocess, "run", return_value=completed):
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                list(pool.map(lambda _: client.complete("SYS", "USER"), range(40)))
+        self.assertEqual(client.call_count, 40)
+        self.assertAlmostEqual(client.total_cost_usd, 10.0)
 
     def test_cli_client_raises_on_nonzero_exit(self):
         client = ClaudeCLIClient()
         completed = subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="boom")
+        with mock.patch.object(llm_module.subprocess, "run", return_value=completed):
+            with self.assertRaises(RuntimeError):
+                client.complete("SYS", "USER")
+
+    def test_cli_client_surfaces_api_error_when_rc_nonzero_and_stderr_empty(self):
+        # A real API failure (e.g. 529 overload) exits rc=1, prints a full JSON envelope on
+        # stdout, and leaves stderr EMPTY. Checking rc first would discard the only
+        # description of the failure and report an empty reason to the caller.
+        client = ClaudeCLIClient()
+        stdout = json.dumps({
+            "is_error": True, "api_error_status": 529, "total_cost_usd": 0.000592,
+            "result": "API Error: 529 Overloaded. This is a server-side issue.",
+        })
+        completed = subprocess.CompletedProcess(args=[], returncode=1, stdout=stdout, stderr="")
+        with mock.patch.object(llm_module.subprocess, "run", return_value=completed):
+            with self.assertRaises(RuntimeError) as ctx:
+                client.complete("SYS", "USER")
+        msg = str(ctx.exception)
+        self.assertIn("529", msg)
+        self.assertIn("Overloaded", msg)
+        # Failed calls still report spend; it must be accounted, not dropped.
+        self.assertEqual(client.call_count, 1)
+        self.assertAlmostEqual(client.total_cost_usd, 0.000592)
+
+    def test_cli_client_raises_on_is_error_envelope(self):
+        client = ClaudeCLIClient()
+        stdout = json.dumps({"result": "something went wrong", "is_error": True})
+        completed = subprocess.CompletedProcess(args=[], returncode=0, stdout=stdout, stderr="")
+        with mock.patch.object(llm_module.subprocess, "run", return_value=completed):
+            with self.assertRaises(RuntimeError):
+                client.complete("SYS", "USER")
+
+    def test_cli_client_raises_on_malformed_json_stdout(self):
+        client = ClaudeCLIClient()
+        completed = subprocess.CompletedProcess(args=[], returncode=0, stdout="not json", stderr="")
         with mock.patch.object(llm_module.subprocess, "run", return_value=completed):
             with self.assertRaises(RuntimeError):
                 client.complete("SYS", "USER")
@@ -253,6 +340,26 @@ class NlSpecTests(unittest.TestCase):
 
 
 class CandidateSelectionTests(unittest.TestCase):
+    @staticmethod
+    def _generated_candidates(count: int) -> list[GeneratedSource]:
+        return [
+            GeneratedSource(
+                header="",
+                source=CANDIDATE_B.replace("#pragma HLS PIPELINE", f"#pragma HLS PIPELINE II={index + 1}"),
+            )
+            for index in range(count)
+        ]
+
+    @staticmethod
+    def _score(index: int, *, passed: bool = False, first_failure: int | None = 0) -> CandidateScore:
+        return CandidateScore(
+            index=index,
+            passed=passed,
+            mismatch_count=0 if passed else (1 if first_failure is not None else 0),
+            first_failure_index=None if passed else first_failure,
+            summary="host equivalence pass" if passed else "host equivalence fail",
+        )
+
     def test_candidates_are_deduplicated(self):
         with tempfile.TemporaryDirectory() as tmp:
             config = AgentConfig(use_llm=True, llm_candidates=3)
@@ -261,6 +368,8 @@ class CandidateSelectionTests(unittest.TestCase):
             candidates = generate_hls_source_candidates(analysis, config, llm, 3)
         self.assertEqual(len(candidates), 1)
         self.assertEqual(len(llm.calls), 3)
+        # Distinct attempts AND exactly one dispatch each (no duplicate/missing attempt).
+        self.assertEqual(llm.invocations, 3)
 
     def test_selection_prefers_passing_candidate(self):
         variant = CANDIDATE_B.replace("#pragma HLS PIPELINE", "#pragma HLS PIPELINE II=1")
@@ -273,7 +382,10 @@ class CandidateSelectionTests(unittest.TestCase):
                 PhaseResult("software_equivalence", "fail", stdout="Mismatch test=0 arg=out index=1 expected=3 actual=4 seed=1"),
                 PhaseResult("software_equivalence", "pass"),
             ]
-            with mock.patch("c2hlsc_agent.candidates.run_software_equivalence", side_effect=results):
+            with mock.patch(
+                "c2hlsc_agent.candidates.run_software_equivalence",
+                side_effect=lambda project: results[int(project.name.removeprefix("cand_"))],
+            ):
                 winner, scores = select_best_candidate(out_dir, analysis, config, llm)
         self.assertIsNotNone(winner)
         self.assertIn("II=1", winner.source)
@@ -293,7 +405,10 @@ class CandidateSelectionTests(unittest.TestCase):
                 PhaseResult("software_equivalence", "fail", stdout="Mismatch test=0 arg=out index=1 expected=3 actual=4 seed=1"),
                 PhaseResult("software_equivalence", "fail", stdout="Mismatch test=57 arg=out index=1 expected=3 actual=4 seed=1"),
             ]
-            with mock.patch("c2hlsc_agent.candidates.run_software_equivalence", side_effect=results):
+            with mock.patch(
+                "c2hlsc_agent.candidates.run_software_equivalence",
+                side_effect=lambda project: results[int(project.name.removeprefix("cand_"))],
+            ):
                 winner, scores = select_best_candidate(out_dir, analysis, config, llm)
         self.assertIsNotNone(winner)
         self.assertIn("UNROLL", winner.source)  # candidate 2 failed at test 57, later than test 0
@@ -310,10 +425,105 @@ class CandidateSelectionTests(unittest.TestCase):
                 PhaseResult("software_equivalence", "fail", stdout="compiler exploded"),  # no mismatch lines
                 PhaseResult("software_equivalence", "fail", stdout="Mismatch test=0 arg=out index=1 expected=3 actual=4 seed=1"),
             ]
-            with mock.patch("c2hlsc_agent.candidates.run_software_equivalence", side_effect=results):
+            with mock.patch(
+                "c2hlsc_agent.candidates.run_software_equivalence",
+                side_effect=lambda project: results[int(project.name.removeprefix("cand_"))],
+            ):
                 winner, _scores = select_best_candidate(out_dir, analysis, config, llm)
         self.assertIsNotNone(winner)
         self.assertIn("UNROLL", winner.source)
+
+    def test_host_scores_actually_overlap(self):
+        candidates = self._generated_candidates(4)
+        barrier = threading.Barrier(3)
+
+        def score(_scratch, _analysis, _candidate, _config, index):
+            if index:
+                barrier.wait(timeout=2)
+            return self._score(index, first_failure=index)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = AgentConfig(use_llm=True, llm_candidates=4, llm_candidate_workers=4)
+            analysis = _analysis(root, config)
+            with mock.patch("c2hlsc_agent.candidates.generate_hls_source_candidates", return_value=candidates), mock.patch(
+                "c2hlsc_agent.candidates._score_candidate", side_effect=score
+            ):
+                _winner, scores = select_best_candidate(root / "out", analysis, config, mock.Mock())
+
+        self.assertEqual([score.index for score in scores], [0, 1, 2, 3])
+
+    def test_out_of_order_completion_keeps_attempt_order_winner(self):
+        candidates = self._generated_candidates(3)
+        later_finished = threading.Event()
+        completion_order: list[int] = []
+        lock = threading.Lock()
+
+        def score(_scratch, _analysis, _candidate, _config, index):
+            if index == 1:
+                self.assertTrue(later_finished.wait(timeout=2))
+            if index == 2:
+                later_finished.set()
+            with lock:
+                completion_order.append(index)
+            return self._score(index, passed=index in {1, 2})
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = AgentConfig(use_llm=True, llm_candidates=3, llm_candidate_workers=3)
+            analysis = _analysis(root, config)
+            with mock.patch("c2hlsc_agent.candidates.generate_hls_source_candidates", return_value=candidates), mock.patch(
+                "c2hlsc_agent.candidates._score_candidate", side_effect=score
+            ):
+                winner, scores = select_best_candidate(root / "out", analysis, config, mock.Mock())
+
+        self.assertEqual(completion_order[0], 0)
+        self.assertGreater(completion_order.index(1), completion_order.index(2))
+        self.assertIs(winner, candidates[1])
+        self.assertEqual([score.index for score in scores], [0, 1])
+
+    def test_first_candidate_pass_avoids_redundant_scoring_and_pool(self):
+        candidates = self._generated_candidates(4)
+        scored: list[int] = []
+
+        def score(_scratch, _analysis, _candidate, _config, index):
+            scored.append(index)
+            return self._score(index, passed=index == 0)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = AgentConfig(use_llm=True, llm_candidates=4, llm_candidate_workers=4)
+            analysis = _analysis(root, config)
+            with mock.patch("c2hlsc_agent.candidates.generate_hls_source_candidates", return_value=candidates), mock.patch(
+                "c2hlsc_agent.candidates._score_candidate", side_effect=score
+            ), mock.patch("c2hlsc_agent.candidates.ThreadPoolExecutor") as executor:
+                winner, scores = select_best_candidate(root / "out", analysis, config, mock.Mock())
+
+        self.assertIs(winner, candidates[0])
+        self.assertEqual([score.index for score in scores], [0])
+        self.assertEqual(scored, [0])
+        executor.assert_not_called()
+
+    def test_one_worker_retains_serial_early_stop(self):
+        candidates = self._generated_candidates(4)
+        scored: list[int] = []
+
+        def score(_scratch, _analysis, _candidate, _config, index):
+            scored.append(index)
+            return self._score(index, passed=index == 1, first_failure=index)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = AgentConfig(use_llm=True, llm_candidates=4, llm_candidate_workers=1)
+            analysis = _analysis(root, config)
+            with mock.patch("c2hlsc_agent.candidates.generate_hls_source_candidates", return_value=candidates), mock.patch(
+                "c2hlsc_agent.candidates._score_candidate", side_effect=score
+            ):
+                winner, scores = select_best_candidate(root / "out", analysis, config, mock.Mock())
+
+        self.assertIs(winner, candidates[1])
+        self.assertEqual(scored, [0, 1])
+        self.assertEqual([score.index for score in scores], [0, 1])
 
 
 class RemoteVitisTests(unittest.TestCase):
@@ -336,6 +546,14 @@ class RemoteVitisTests(unittest.TestCase):
         self.assertIn("cd c2hlsc_runs/proj-", script)
         self.assertIn("source /tools/x/settings64.sh && ", script)
         self.assertIn("timeout -k 30s 600s vitis_hls -f run_cosim.tcl", script)
+
+    def test_phase_script_supports_unified_vitis_launcher(self):
+        remote = RemoteVitis(host="u@h", vitis_bin="/opt/AMD/Vitis/bin/vitis-run")
+        script = remote.phase_script(Path("/x/build/proj"), "cosim", 600)
+        self.assertIn(
+            "timeout -k 30s 600s /opt/AMD/Vitis/bin/vitis-run --mode hls --tcl run_cosim.tcl",
+            script,
+        )
 
     def test_phase_script_probes_settings_when_no_setup(self):
         remote = RemoteVitis(host="u@h")
@@ -360,7 +578,7 @@ class RemoteVitisTests(unittest.TestCase):
         remote.run_phase.side_effect = [
             PhaseResult("csim", "pass"),
             PhaseResult("csynth", "pass"),
-            PhaseResult("cosim", "pass"),
+            PhaseResult("cosim", "pass", stdout="C/RTL co-simulation finished: PASS"),
         ]
         remote.pull.return_value = PhaseResult("vitis_pull", "pass")
         with tempfile.TemporaryDirectory() as tmp:

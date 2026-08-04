@@ -125,11 +125,21 @@ newest addition (`scripts/cosim_repair_loop.py`) drives repairs through the **lo
 - **`_common_helpers(seed)`** — shared C++ stimulus templates (`random_value`, `bounded_scalar`, `patterned_value`, `output_sentinel`, `write_csv_value`, `make_trace_rng`).
 - **`_render_trace_tb(analysis, config, target_name, output_csv, include_block)`** — one trace testbench (golden `*_ref` or HLS top) writing header+roles+per-cycle CSV rows.
 - **`_compare_script()`** — emits `tb/leveri_compare.py`: static checks (header/role/cycle-count/stimulus-column equality) + dynamic output check with `values_match` float tolerance.
-- **`_klee_driver(analysis)`** — KLEE symbolic driver for the golden top (`klee_make_symbolic` + `klee_assume` range constraints).
+- **`_klee_driver(analysis)`** — bounded relational KLEE driver: one shared symbolic seed,
+  cloned golden/HLS-C scalars and buffers, one call to each implementation, return/full
+  pointer-post-state comparisons, and input-only mutation checks. It declares the
+  distinct-pointer/no-hidden-mutable-state model and rejects unsupported/vacuous contracts.
 - **`_gcov_script()`** — emits `tb/run_gcov.py`: builds both trace TBs with `--coverage`, runs them + the comparator, invokes gcov; passes iff instrumentation produced data (gcov's exit code is advisory).
-- **`_klee_script()`** — emits `tb/run_klee.py`: env-resolved klee/clang++ (no hardcoded paths), compile to LLVM bitcode, run KLEE with timeout, report ktest count; skips gracefully when tools are missing.
-- **`_manifest(analysis, config)`** — `tb/leveri_manifest.json`: policy, checks, coverage hooks, argument metadata.
-- **`generate_leveri_testbenches(analysis, config)`** — assembles the whole bundle.
+- **`_klee_script()`** — emits `tb/run_klee.py`: env-resolved KLEE/clang++/llvm-link,
+  separate driver and HLS-C bitcode compilation, one linked relational invocation, and
+  schema `c2hlsc-klee-report-v1` verdicts. Named relational counterexamples are FAIL;
+  unsupported contracts, contract violations, runtime errors, timeouts, and vacuity are
+  BLOCKED; missing tools are SKIPPED. Reports carry top/artifact SHA-256 provenance and
+  require a matching KTest for every named mismatch used by manual repair.
+- **`_manifest(analysis, config, hlsc_source=None)`** — `tb/leveri_manifest.json`: policy, argument metadata,
+  relational scope, observable count, symbolic bounds, model assumptions, and unsupported
+  reasons from both golden C and the actual generated HLS-C candidate.
+- **`generate_leveri_testbenches(analysis, config, hlsc_source=None)`** — assembles the whole bundle; project emission supplies the actual generated candidate for hidden-state preflight.
 
 ### `hls_project.py` — project emission (files on disk)
 - **`ProjectFiles`** — root + generated file list.
@@ -139,27 +149,47 @@ newest addition (`scripts/cosim_repair_loop.py`) drives repairs through the **lo
 - **`write_project(out_dir, analysis, generated, config)`** — writes input.c copy, src/, tb/ (oracle + 6 LeVeri artifacts), 4 TCLs, Makefile, run_all.sh; sets executable bits; returns `ProjectFiles`.
 
 ### `equivalence.py` — verification value types + subprocess runner
-- **`PhaseResult`** — name/status/returncode/stdout/stderr/log_path/summary (+`to_dict`, output truncated to 4000 chars).
+- **`PhaseResult`** — name/status/returncode/stdout/stderr/log_path/summary plus allowlisted
+  structured `metadata` (+`to_dict`, output truncated to 4000 chars).
 - **`Mismatch`** / **`format_mismatch`** — structured testbench mismatch (test index, argument, element, expected/actual, seed).
 - **`parse_mismatches(text)`** — regex-parses the testbench's `Mismatch test=… arg=… expected=… actual=… seed=…` lines (array and return forms).
 - **`run_command(command, cwd, phase, timeout)`** — Popen in its own session; on timeout SIGTERM→SIGKILL the process group; always writes `<phase>.log`.
 - **`VerificationState`** — phase map + mismatches; `add_phase`, `status_for` (default "skipped").
 
 ### `hls_runner.py` — the verifier ladder
-- **`PHASE_ORDER`** — `software_equivalence, csim, csynth, cosim`.
+- **`PHASE_ORDER`** — `software_equivalence, shift_left_trace, coverage_gcov, symbolic_klee,
+  csim, csynth, cosim`.
 - **`earliest_failing_phase(state, run_vitis)`** — first required phase not "pass", else `None`.
 - **`run_software_equivalence(project_dir)`** — `make test` (timeout 120s) → `PhaseResult`.
+- **`run_shift_left_checks(project_dir, enabled)`** — runs paired traces, gcov, and KLEE before
+  HLS. Paired traces gate; only an exact-schema, exact-scope, named golden/HLS-C KLEE
+  counterexample gates. gcov/KLEE tool, harness, timeout, or incomplete outcomes remain
+  explicit degraded evidence. PASS also requires non-vacuous paths/tests, exact modeled-domain
+  metadata, and revision hashes. KLEE PASS means bounded no-counterexample, not universal proof.
 - **`run_vitis(project_dir, run_requested)`** — CSim (600s) → CSynth (1200s) → CoSim (600s) via the per-phase TCLs, short-circuiting with "blocked" statuses; "vitis_hls not found" fails csim and blocks the rest.
 - **`_COSIM_FAILURE_MARKERS`** / **`_gate_cosim_on_log(result)`** — *(new)* downgrade CoSim pass→fail when the log carries an explicit co-simulation failure marker, so exit 0 can't defeat the equivalence gate.
-- **`verify_project(project_dir, run_vitis, verbose)`** — host equivalence (+`parse_mismatches`), blocked-cascade on failure, else the Vitis phases; returns `VerificationState`.
+- **`verify_project(project_dir, run_vitis, verbose, run_shift_left=True)`** — host equivalence
+  (+`parse_mismatches`), default-on shift-left phases, then Vitis; returns `VerificationState`.
+
+### `knowledge_graph.py` — live verification graph
+- **`write_knowledge_graph(...)`** — writes deterministic
+  `verification_knowledge_graph.json` nodes/edges for the design contract, arguments,
+  generated artifacts, canonical verification phases, repairs, and evidence/report references.
+- **`refresh_knowledge_graph(project_dir)`** — adds late coverage, QoR, PPA, and log artifact
+  references without embedding source, prompt, log, or evidence contents. The KLEE phase
+  distinguishes requested scope from validated evidence scope and stores only allowlisted
+  schema/outcome/bounds/assumptions/provenance hashes/path counts/named-observable metadata.
 
 ### `agent_loop.py` — the multi-agent architecture (declarative) + failure routing (live)
 - **`AgentProcedure`** — name/role/owns/inputs/outputs/stop_condition (+`to_dict`). **Descriptive, not executable.**
 - **`FailureAnalysis`** — family/owner_agent/next_action/evidence_needed/repair_scope/status.
-- **`multi_agent_procedures()`** — the 8 declared agents: `contract_planner`, `shift_left_testbench_agent`, `hlsc_generator_agent`, `cosim_operator`, `failure_analyst`, `hlsc_repair_agent`, `rtl_optimizer_agent`, `audit_memory_agent`.
+- **`multi_agent_procedures()`** — the 9 declared agents: `contract_planner`,
+  `shift_left_testbench_agent`, `hlsc_generator_agent`, `cosim_operator`, `failure_analyst`,
+  `hlsc_repair_agent`, `rtl_optimizer_agent`, `audit_memory_agent`,
+  `cross_reference_operator`.
 - **`_phase_text(state, phase)`** — summary+stdout+stderr for a phase.
 - **`classify_log_family(phase, text)`** — regex triage: toolchain_unavailable / timeout_or_deadlock / behavioral_mismatch / interface_contract / memory_pointer / numeric_bitwidth / loop_scheduling / non_synthesizable_construct / phase defaults.
-- **`classify_failure(state, run_vitis, diagnostics_has_errors)`** — maps the earliest failure to a `FailureAnalysis` with owner agent and next action (static-rejected → contract_planner; host mismatch → failure_analyst; TB/compile issues → testbench agent; csynth → repair agent; cosim mismatch → PMLC-style analysis; all-pass → rtl_optimizer, status "pass").
+- **`classify_failure(state, run_vitis, diagnostics_has_errors)`** — maps the earliest failure to a `FailureAnalysis` with owner agent and next action (static-rejected → contract_planner; host or validated relational KLEE mismatch → failure_analyst; unvalidated KLEE failure → blocked testbench/toolchain audit; csynth → repair agent; cosim mismatch → PMLC-style analysis; all-pass → rtl_optimizer, status "pass").
 - **`render_procedures_markdown()`** — docs rendering of the procedures.
 - **`hlsc_generator_policy()` / `leveri_testbench_policy()`** — contract dicts for reports.
 
@@ -183,7 +213,7 @@ newest addition (`scripts/cosim_repair_loop.py`) drives repairs through the **lo
 ### `report.py` — human + machine reports
 - **`_table(headers, rows)`** — markdown table helper.
 - **`final_status(state, run_vitis, diagnostics_has_errors)`** — overall pass/fail across required phases.
-- **`write_reports(project, analysis, generated, config, state, iterations, repairs)`** — writes `conversion_report.md` (status, inputs, files, type mapping, directions, pragmas, transformations, unsupported constructs, diagnostics, coverage summary, phase results, `classify_failure` assessment, repair audit table, mismatches) and `conversion_report.json` (same, machine-readable, incl. per-phase dicts).
+- **`write_reports(project, analysis, generated, config, state, iterations, repairs)`** — writes `conversion_report.md` (including the bounded/no-universal-proof KLEE interpretation), `conversion_report.json` (including allowlisted `relational_klee` metadata and per-phase dicts), and the verification knowledge graph.
 
 ---
 
@@ -275,12 +305,12 @@ newest addition (`scripts/cosim_repair_loop.py`) drives repairs through the **lo
 
 ## Adding real agents
 
-**Current state.** The 8 agents in `agent_loop.multi_agent_procedures()` are *declarative
-role descriptions*, not executable agents. The live pipeline is deterministic with exactly
-three model call sites: generation (`convert.generate_hls_sources`), in-loop repair
-(`hlsc_repair_agent._llm_repair`), and the standalone corpus repair loop
-(`scripts/cosim_repair_loop.py`, Claude-CLI-first). `classify_failure` already *routes*
-failures to named agent owners — the routing table is live, the agents behind it are not.
+**Current state.** The 9 records in `agent_loop.multi_agent_procedures()` are declarative
+role descriptions, not independently executing workers. Live model-call seams exist in
+generation, in-loop repair, the standalone corpus repair loop, QoR optimization, contract
+planning, and cross-reference generation. `classify_failure` routes failures to named owners;
+the routing table and several owned workflows are live even though the procedure records
+themselves do not launch agents.
 
 **The seams** (where a live agent can replace/augment deterministic logic):
 1. **`contract_planner`** over `analyze.analyze_source` — an LLM pass to propose argument
@@ -307,6 +337,22 @@ failures to named agent owners — the routing table is live, the agents behind 
 gated by the same dataclass), (2) contract_planner suggestions surfaced as config
 proposals, (3) testbench augmentation, (4) rtl_optimizer with full re-verification,
 (5) retrieval memory from `repair_audit.json`.
+
+**2026-07-23 addendum — increments now LIVE.** Increment (2) shipped as
+`contract_planner.py` + `--plan-contracts` (JSON proposals validated into
+`ArgumentConfig`, user config wins per-field, mandatory re-analyze, provenance in
+`contract_plan.json`). Increment (5) shipped as `audit_memory.py` + `--audit-memory`
+(chain-rule promotion — only the last applied repair per stage/family chain of a
+PASSING run; JSONL card store; retrieval by family + evidence overlap into
+`build_repair_prompt`'s `audit_cards` section). The cross-reference dual-generation
+workflow (the paper figure) shipped as `cross_reference.py` + the `cross-reference`
+subcommand (two isolated claude-CLI framings → structural gates →
+separate-translation-unit namespace oracle → corpus/needs_review/results JSONLs).
+Supporting refactors: the HLS_NL parser now lives in `nl_records.py` (the script
+imports it), and testgen's C++ stimulus/compare helpers are the shared
+`CPP_STIMULUS_HELPERS` constant. (4) was already live via `qor_optimizer.py`.
+Remaining declarative-only: shift-left testbench augmentation (3) and a live LLM
+`failure_analyst` (1) — `classify_failure` remains regex-based.
 
 **Do not break:** `extract_hls_source`/`is_plausible_translation_unit` structural gates,
 the deterministic fallback in `generate_hls_sources`, the never-hand-original-C-to-model

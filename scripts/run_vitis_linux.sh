@@ -20,7 +20,8 @@ Environment:
   VITIS_SETTINGS     Path to Xilinx/Vitis settings64.sh or .settings64-Vitis_HLS.sh.
   VITIS_HLS_ROOT     Path to the Vitis_HLS/<version> directory, for example
                      "/path/to/Vitis_HLS/2024.2".
-  VITIS_HLS_BIN      Direct path to the vitis_hls executable. This is the most explicit fallback.
+  VITIS_HLS_BIN      Direct path to vitis-run (Unified IDE) or vitis_hls (legacy).
+                     This is the most explicit fallback.
 
 Examples:
   VITIS_HLS_ROOT="/path/to/Vitis_HLS/2024.2" \
@@ -77,15 +78,27 @@ fi
 
 if [[ -z "${VITIS_SETTINGS:-}" ]]; then
   for candidate in \
+    /tools/Xilinx/Vitis/2026.1/settings64.sh \
+    /tools/Xilinx/Vitis/2025.2/settings64.sh \
+    /tools/Xilinx/Vitis/2025.1/settings64.sh \
     /tools/Xilinx/Vitis/2024.2/settings64.sh \
     /tools/Xilinx/Vitis/2023.2/settings64.sh \
     /tools/Xilinx/Vitis/2022.1/settings64.sh \
+    /tools/Xilinx/Vitis_HLS/2026.1/.settings64-Vitis_HLS.sh \
+    /tools/Xilinx/Vitis_HLS/2025.2/.settings64-Vitis_HLS.sh \
+    /tools/Xilinx/Vitis_HLS/2025.1/.settings64-Vitis_HLS.sh \
     /tools/Xilinx/Vitis_HLS/2024.2/.settings64-Vitis_HLS.sh \
     /tools/Xilinx/Vitis_HLS/2023.2/.settings64-Vitis_HLS.sh \
     /tools/Xilinx/Vitis_HLS/2022.1/.settings64-Vitis_HLS.sh \
+    /opt/Xilinx/Vitis/2026.1/settings64.sh \
+    /opt/Xilinx/Vitis/2025.2/settings64.sh \
+    /opt/Xilinx/Vitis/2025.1/settings64.sh \
     /opt/Xilinx/Vitis/2024.2/settings64.sh \
     /opt/Xilinx/Vitis/2023.2/settings64.sh \
     /opt/Xilinx/Vitis/2022.1/settings64.sh \
+    /opt/Xilinx/Vitis_HLS/2026.1/.settings64-Vitis_HLS.sh \
+    /opt/Xilinx/Vitis_HLS/2025.2/.settings64-Vitis_HLS.sh \
+    /opt/Xilinx/Vitis_HLS/2025.1/.settings64-Vitis_HLS.sh \
     /opt/Xilinx/Vitis_HLS/2024.2/.settings64-Vitis_HLS.sh \
     /opt/Xilinx/Vitis_HLS/2023.2/.settings64-Vitis_HLS.sh \
     /opt/Xilinx/Vitis_HLS/2022.1/.settings64-Vitis_HLS.sh; do
@@ -105,8 +118,15 @@ if [[ -n "${VITIS_SETTINGS:-}" ]]; then
   source "${VITIS_SETTINGS}"
 fi
 
-if ! command -v vitis_hls >/dev/null 2>&1; then
-  echo "vitis_hls is not on PATH." >&2
+VITIS_COMMAND="${VITIS_HLS_BIN:-}"
+if [[ -z "${VITIS_COMMAND}" ]] && command -v vitis-run >/dev/null 2>&1; then
+  VITIS_COMMAND="$(command -v vitis-run)"
+fi
+if [[ -z "${VITIS_COMMAND}" ]] && command -v vitis_hls >/dev/null 2>&1; then
+  VITIS_COMMAND="$(command -v vitis_hls)"
+fi
+if [[ -z "${VITIS_COMMAND}" ]]; then
+  echo "No native Vitis HLS launcher (vitis-run or vitis_hls) is on PATH." >&2
   echo "Set one of these and rerun:" >&2
   echo "  VITIS_HLS_ROOT=/path/to/Vitis_HLS/2024.2" >&2
   echo "  VITIS_HLS_BIN=/path/to/Vitis_HLS/2024.2/bin/vitis_hls" >&2
@@ -114,7 +134,7 @@ if ! command -v vitis_hls >/dev/null 2>&1; then
   exit 2
 fi
 
-echo "Using vitis_hls: $(command -v vitis_hls)"
+echo "Using Vitis HLS launcher: ${VITIS_COMMAND}"
 
 cd "${REPO_ROOT}"
 if [[ "${USE_ACTIVE_ENV}" == "1" || "${USE_ACTIVE_ENV}" == "true" ]]; then
@@ -123,8 +143,10 @@ if [[ "${USE_ACTIVE_ENV}" == "1" || "${USE_ACTIVE_ENV}" == "true" ]]; then
     exit 2
   fi
   echo "Using active Python: $(command -v python)"
-  python -m c2hlsc_agent.cli convert --run-vitis "$@"
+  python -m c2hlsc_agent.cli convert --run-vitis "$@" \
+    --cosim-backend vitis --vitis-bin "${VITIS_COMMAND}"
 else
   echo "Using Conda env: ${ENV_NAME}"
-  conda run -n "${ENV_NAME}" python -m c2hlsc_agent.cli convert --run-vitis "$@"
+  conda run -n "${ENV_NAME}" python -m c2hlsc_agent.cli convert --run-vitis "$@" \
+    --cosim-backend vitis --vitis-bin "${VITIS_COMMAND}"
 fi

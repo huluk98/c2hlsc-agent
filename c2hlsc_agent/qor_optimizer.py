@@ -11,8 +11,8 @@ Operates on a project that already passes the verification ladder. Loop:
    (seconds, no Vitis), then csim+csynth (local or over --vitis-ssh) to score it from
    its csynth report. Candidates that regress timing past the target clock are excluded.
 4. Promote the best strictly-improving candidate into the project and re-run the FULL
-   ladder (host equivalence -> CSim -> CSynth -> CoSim). Acceptance requires the ladder
-   to pass; otherwise the original source is restored.
+   ladder (host equivalence -> enabled shift-left checks -> CSim -> CSynth -> CoSim).
+   Acceptance requires the ladder to pass; otherwise the original source is restored.
 5. Emit the QoR delta report as JSON, Markdown, and a paper-ready LaTeX table, optionally
    enriched by the local yosys/OpenSTA PPA flow (--ppa-script).
 
@@ -37,6 +37,7 @@ from .config import AgentConfig
 from .hls_runner import run_software_equivalence, run_vitis, verify_project
 from .llm import LLMClient, build_qor_prompt, extract_full_file, is_plausible_translation_unit
 from .local_ppa import run_local_ppa
+from .nodes import resolve_node
 from .qor import (
     PPATargets,
     QoRMetrics,
@@ -48,6 +49,7 @@ from .qor import (
     qor_delta,
     render_latex_table,
     render_markdown,
+    slack_headroom,
 )
 from .remote import RemoteVitis
 from .report import final_status
@@ -191,10 +193,20 @@ def _stage_candidate(project_dir: Path, index: int, source: str) -> Path:
     return cand_dir
 
 
-def _synth_metrics(project_dir: Path, remote: RemoteVitis | None) -> tuple[QoRMetrics | None, str]:
+def _synth_metrics(
+    project_dir: Path,
+    remote: RemoteVitis | None,
+    vitis_bin: str = "vitis_hls",
+) -> tuple[QoRMetrics | None, str]:
     """csim+csynth the project and parse its csynth report. Returns (metrics, fail_note)."""
 
-    phases = run_vitis(project_dir, True, remote=remote, upto="csynth")
+    phases = run_vitis(
+        project_dir,
+        True,
+        remote=remote,
+        upto="csynth",
+        vitis_bin=vitis_bin,
+    )
     if phases["csim"].status != "pass":
         return None, f"csim_fail: {phases['csim'].summary or 'csim failed'}"
     if phases["csynth"].status != "pass":
@@ -254,16 +266,22 @@ def _pragma_summary(baseline_source: str, candidate_source: str) -> str:
     return "; ".join(parts) or "no pragma changes (refactor only)"
 
 
-def _targets_text(targets: PPATargets | None, gaps: list[str]) -> str:
+def _targets_text(
+    targets: PPATargets | None,
+    gaps: list[str],
+    metrics: QoRMetrics | None = None,
+    node: str = "nangate45",
+    time_unit: str = "ns",
+) -> str:
     if targets is None:
         return ""
-    lines = ["PPA targets — the design must meet ALL of these; close the gaps listed:"]
+    lines = [f"PPA targets on process node {node} — the design must meet ALL of these; close the gaps listed:"]
     if targets.max_latency_cycles is not None:
         lines.append(f"- latency (worst cycles) <= {targets.max_latency_cycles}")
     if targets.min_slack_ns is not None:
-        lines.append(f"- worst setup slack >= {targets.min_slack_ns} ns (post-synthesis STA)")
+        lines.append(f"- worst setup slack >= {targets.min_slack_ns} {time_unit} (post-synthesis STA, {node})")
     if targets.max_area_um2 is not None:
-        lines.append(f"- std-cell area <= {targets.max_area_um2} um^2 (yosys, Nangate45)")
+        lines.append(f"- std-cell area <= {targets.max_area_um2} um^2 (yosys, {node})")
     if targets.max_power_w is not None:
         lines.append(f"- total power <= {targets.max_power_w} W (OpenSTA)")
     if gaps:
@@ -271,6 +289,13 @@ def _targets_text(targets: PPATargets | None, gaps: list[str]) -> str:
         lines.extend(f"- {gap}" for gap in gaps)
     else:
         lines.append("The working design currently meets all targets; do not regress them.")
+        headroom = slack_headroom(metrics, targets) if metrics is not None else None
+        if headroom is not None and headroom > 0:
+            lines.append(
+                f"Slack headroom available: {headroom:.3f} {time_unit} above the floor — this is the "
+                "iteration budget. Spend it on functionality or performance (more work per cycle, "
+                "deeper unroll, higher clock), never by regressing below the slack floor."
+            )
     return "\n".join(lines) + "\n"
 
 
@@ -344,7 +369,12 @@ def optimize_project(
     if targets is not None and not targets.specified:
         targets = None
     needs_ppa = local_ppa or (targets is not None and targets.needs_local_ppa)
-    ppa_kwargs = dict(liberty=liberty, sta_bin=sta_bin, clock_port=clock_port, gate_sim=gate_sim, verbose=verbose)
+    node = getattr(config, "node", "nangate45")
+    time_unit = "ns" if liberty else resolve_node(node).time_unit
+    ppa_kwargs = dict(
+        liberty=liberty, sta_bin=sta_bin, clock_port=clock_port, gate_sim=gate_sim,
+        verbose=verbose, node=node,
+    )
 
     # 1. Baseline metrics: reuse the existing csynth report only when it is fresh
     # (newer than the sources it describes) and parseable; else synthesize once.
@@ -358,7 +388,7 @@ def optimize_project(
     if baseline is None:
         if verbose:
             print("No fresh csynth report in the project; running csim+csynth for the baseline.")
-        baseline, note = _synth_metrics(project_dir, remote)
+        baseline, note = _synth_metrics(project_dir, remote, config.vitis_bin)
         if baseline is None:
             raise RuntimeError(f"cannot establish baseline QoR: {note}")
     if needs_ppa:
@@ -374,7 +404,7 @@ def optimize_project(
     if baseline_score is None:
         raise RuntimeError("baseline csynth report lacks the metrics needed for the objective")
     if targets is not None:
-        met, gaps, gap = evaluate_targets(baseline, targets)
+        met, gaps, gap = evaluate_targets(baseline, targets, time_unit=time_unit)
         outcome.targets_met, outcome.target_gaps = met, gaps
         if met:
             outcome.summary = "Baseline already meets every PPA target; nothing to do."
@@ -411,7 +441,7 @@ def optimize_project(
             result.note = (equiv.summary or "host equivalence failed").strip()[:300]
             history.append({"index": index, "kind": kind, "status": "equiv_fail", "note": result.note})
             return result
-        metrics, fail_note = _synth_metrics(cand_dir, remote)
+        metrics, fail_note = _synth_metrics(cand_dir, remote, config.vitis_bin)
         strategy = _pragma_summary(baseline_source, source)
         if metrics is None:
             result.status = fail_note.split(":", 1)[0] if ":" in fail_note else "csynth_fail"
@@ -426,7 +456,7 @@ def optimize_project(
         result.score = score
         result.note = strategy
         if targets is not None:
-            result.targets_met, result.target_gaps, result.gap_score = evaluate_targets(metrics, targets)
+            result.targets_met, result.target_gaps, result.gap_score = evaluate_targets(metrics, targets, time_unit=time_unit)
         if metrics.timing_met is False and baseline.timing_met is not False:
             result.status = "timing_regressed"
             history.append({"index": index, "kind": kind, "status": "timing_regressed", "score": score, "note": strategy})
@@ -459,7 +489,14 @@ def optimize_project(
                 round_results.append(consider(index, round_no, "deterministic-pipeline", deterministic, ""))
                 index += 1
         if llm is not None:
-            targets_prompt = _targets_text(targets, working_gaps)
+            targets_prompt = _targets_text(targets, working_gaps, metrics=working_metrics, node=node, time_unit=time_unit)
+            # NOTE: these attempts are deliberately SEQUENTIAL, not concurrent. consider()
+            # appends each scored candidate (and its pragma strategy) to `history`, and the
+            # next attempt's prompt carries that as "Already-tried candidates (do NOT
+            # resubmit these strategies)". Generating a round's attempts in parallel would
+            # blind each one to its siblings and cost candidate diversity -- the loop trades
+            # wall-clock for a better search on purpose. Best-of-N generation in convert.py
+            # has no such chaining and IS parallelized.
             for attempt in range(max(0, iterations)):
                 source, note = _llm_candidate_source(
                     analysis, config, llm, working_source, working_metrics, objective, history,
@@ -513,7 +550,11 @@ def optimize_project(
         scored_any = any(c.status in ("scored", "timing_regressed") for c in outcome.candidates)
         infra_notes = [
             c.note for c in outcome.candidates
-            if "vitis_hls not found" in (c.note or "") or "remote vitis unavailable" in (c.note or "")
+            if (
+                "vitis_hls not found" in (c.note or "").lower()
+                or "remote vitis unavailable" in (c.note or "").lower()
+                or ("vitis" in (c.note or "").lower() and "not found" in (c.note or "").lower())
+            )
         ]
         if not scored_any and infra_notes:
             # Don't report a toolchain outage as an optimization result.
@@ -546,10 +587,23 @@ def optimize_project(
     promote_mtime = src_path.stat().st_mtime
     outcome.winner_index = best_index
     if cosim_winner:
-        state = verify_project(project_dir, True, verbose=verbose, remote=remote)
+        state = verify_project(
+            project_dir,
+            True,
+            verbose=verbose,
+            remote=remote,
+            run_shift_left=config.run_shift_left,
+            vitis_bin=config.vitis_bin,
+        )
         accepted = final_status(state, True, False) == "pass"
     else:
-        state = verify_project(project_dir, False, verbose=verbose)
+        state = verify_project(
+            project_dir,
+            False,
+            verbose=verbose,
+            run_shift_left=config.run_shift_left,
+            vitis_bin=config.vitis_bin,
+        )
         accepted = final_status(state, False, False) == "pass"
     if not accepted:
         src_path.write_text(baseline_source, encoding="utf-8")
@@ -627,7 +681,7 @@ def optimize_project(
     improvement = f"score {best_score} vs baseline {baseline_score}"
     targets_note = ""
     if targets is not None:
-        met, gaps_final, _gap = evaluate_targets(winner_metrics, targets)
+        met, gaps_final, _gap = evaluate_targets(winner_metrics, targets, time_unit=time_unit)
         outcome.targets_met, outcome.target_gaps = met, gaps_final
         rounds_used = len(outcome.rounds)
         if met:
@@ -680,3 +734,11 @@ def _write_reports(project_dir: Path, outcome: OptimizeOutcome) -> None:
         # A previous accepted run may have left a qor_table.tex; without this, a stale
         # table would contradict the fresh json/md that say the baseline was kept.
         (project_dir / "qor_table.tex").unlink(missing_ok=True)
+    from .knowledge_graph import FILENAME as KNOWLEDGE_GRAPH_FILENAME
+    from .knowledge_graph import refresh_knowledge_graph
+
+    if (project_dir / KNOWLEDGE_GRAPH_FILENAME).exists():
+        try:
+            refresh_knowledge_graph(project_dir)
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            print(f"warning: could not refresh verification knowledge graph: {exc}", file=sys.stderr)

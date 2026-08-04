@@ -10,6 +10,7 @@ from pathlib import Path
 
 from .agent_loop import classify_failure
 from .analyze import AnalysisResult
+from .audit_memory import retrieve_cards
 from .config import AgentConfig
 from .equivalence import VerificationState
 from .hls_runner import earliest_failing_phase
@@ -121,6 +122,7 @@ def repair_project(
     state: VerificationState,
     iteration: int,
     llm: LLMClient | None = None,
+    audit_store: Path | None = None,
 ) -> RepairOutcome:
     phase = earliest_failing_phase(state, config.run_vitis)
     decision = classify_failure(state, config.run_vitis, analysis.diagnostics.has_errors)
@@ -143,8 +145,14 @@ def repair_project(
             status = "applied"
             summary = f"Applied {len(changes)} auditable mechanical repair(s); rerun verification from software equivalence."
         elif llm is not None and getattr(config, "use_llm", False):
+            audit_cards: list[str] | None = None
+            if audit_store is not None:
+                # Retrieved success cards are prompt evidence only; the structural
+                # gates and the oscillation guard below stay the acceptors.
+                audit_cards = retrieve_cards(audit_store, decision.family, phase, evidence) or None
             llm_changes, oscillated = _llm_repair(
-                project_dir, analysis, decision, phase, evidence, llm, config=config, history=history
+                project_dir, analysis, decision, phase, evidence, llm, config=config, history=history,
+                audit_cards=audit_cards,
             )
             changes.extend(llm_changes)
             if llm_changes:
@@ -204,6 +212,7 @@ def _llm_repair(
     llm: LLMClient,
     config: object | None = None,
     history: list[RepairOutcome] | None = None,
+    audit_cards: list[str] | None = None,
 ) -> tuple[list[RepairFileChange], bool]:
     """Escalate to an LLM for a minimal patch to the generated HLS-C.
 
@@ -232,6 +241,7 @@ def _llm_repair(
         current,
         history=history,
         nl_spec=getattr(config, "nl_spec", None) if config is not None else None,
+        audit_cards=audit_cards,
     )
     try:
         response = llm.complete(system, user)
@@ -246,6 +256,15 @@ def _llm_repair(
     if not new_text or new_text.strip() == current.strip():
         return [], False
     if not is_plausible_translation_unit(new_text, top):
+        return [], False
+    oracle_violation = _reference_oracle_violation(new_text, top)
+    if oracle_violation:
+        print(
+            f"c2hlsc repair: rejected the candidate because {oracle_violation}. Delegating to "
+            "the macro-included golden source would pass every ladder phase by construction "
+            "(the DUT would BE the oracle); keeping the deterministic result.",
+            file=sys.stderr,
+        )
         return [], False
     if _sha256(new_text) in _known_candidate_hashes(history, current):
         return [], True
@@ -463,6 +482,47 @@ def _support_include_block(top_name: str) -> str:
 #undef {top_name}
 #endif
 """
+
+
+_ORACLE_ALIAS_SUFFIX = "_c2hlsc_repair_reference"
+_ORACLE_INCLUDE = '#include "../input.c"'
+
+
+def _reference_oracle_violation(candidate: str, top_name: str) -> str:
+    """Reason the candidate would make the DUT delegate to the golden oracle, else "".
+
+    ``_repair_missing_original_support`` injects ``#define <top> <top>_c2hlsc_repair_reference``
+    plus ``#include "../input.c"`` so a preserved top body can call the ORIGINAL HELPER
+    functions. Those helpers keep their own names; the alias is only the renamed top, and
+    exists purely so the include does not collide. So no legitimate HLS-C ever needs to
+    call it -- while a candidate that does (``void top(...) { top_c2hlsc_repair_reference(...); }``)
+    passes host equivalence, CSim, CSynth and CoSim BY CONSTRUCTION, because the DUT *is*
+    the oracle. The ladder cannot detect that; this gate must.
+
+    Deliberately NOT comment- or literal-stripped. A "skip lines that look like comments"
+    heuristic is itself a bypass -- a delegation formatted to resemble a continuation line
+    slips straight through it. Flagging an alias merely mentioned in a comment is a
+    harmless false positive; missing a real delegation is not.
+    """
+
+    alias = f"{top_name}{_ORACLE_ALIAS_SUFFIX}"
+    # Drop ONLY the support block's own rename directive, matched exactly. Whitelisting
+    # "any #define mentioning the alias" would be a trivially widened hole.
+    rename = re.compile(
+        rf"^[ \t]*#[ \t]*define[ \t]+{re.escape(top_name)}[ \t]+{re.escape(alias)}[ \t]*$"
+    )
+    residual = [line for line in candidate.splitlines() if not rename.match(line)]
+    if alias in "\n".join(residual):
+        return f"it references the golden-oracle alias {alias!r}"
+
+    # The support block contains exactly one oracle include; more than one, or one without
+    # the block's guard macro, means the candidate pulled the oracle in on its own terms.
+    includes = candidate.count(_ORACLE_INCLUDE)
+    if includes > 1:
+        return f"it includes the golden oracle {includes} times"
+    if includes == 1 and "C2HLSC_REPAIR_INCLUDE_ORIGINAL_SUPPORT" not in candidate:
+        return "it includes the golden oracle outside the repair support block"
+    return ""
 
 
 def _repair_missing_original_support(

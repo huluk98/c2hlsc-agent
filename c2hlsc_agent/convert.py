@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 
 from .analyze import AnalysisResult, FunctionArg
@@ -171,13 +172,37 @@ def generate_hls_source_candidates(
     llm: LLMClient,
     count: int,
 ) -> list[GeneratedSource]:
-    """Generate up to ``count`` independent LLM candidates (structural-gate filtered)."""
+    """Generate up to ``count`` independent LLM candidates (structural-gate filtered).
+
+    The candidates are independent by construction (each is a fresh completion that only
+    differs by a "take a different strategy" nudge), so the generation calls are issued
+    CONCURRENTLY -- each blocks on its own backend call, and overlapping them turns an
+    N-call wait into roughly a one-call wait. De-duplication then runs serially in
+    attempt order, so the returned list is identical to the sequential path.
+    """
 
     conservative = _generate_conservative_sources(analysis, config)
+    total = max(1, count)
+    workers = min(total, max(1, int(getattr(config, "llm_candidate_workers", 4))))
+    results: list[GeneratedSource | None]
+    if total == 1 or workers == 1:
+        results = [
+            _llm_candidate(analysis, config, llm, conservative, attempt=attempt)
+            for attempt in range(total)
+        ]
+    else:
+        results = [None] * total
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                pool.submit(_llm_candidate, analysis, config, llm, conservative, attempt): attempt
+                for attempt in range(total)
+            }
+            for future in as_completed(futures):
+                results[futures[future]] = future.result()
+
     candidates: list[GeneratedSource] = []
     seen: set[str] = set()
-    for attempt in range(max(1, count)):
-        candidate = _llm_candidate(analysis, config, llm, conservative, attempt=attempt)
+    for candidate in results:
         if candidate is None:
             continue
         key = "".join(candidate.source.split())

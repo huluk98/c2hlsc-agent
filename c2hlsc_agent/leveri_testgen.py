@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 
-from .analyze import AnalysisResult, FunctionArg
+from .analyze import AnalysisResult, FunctionArg, strip_comments
 from .config import AgentConfig
 
 
@@ -25,9 +26,10 @@ Core requirements:
   2. dynamic behavioral checking of output columns across the golden and HLS traces
 - Use deterministic directed and pseudo-random stimuli so failing rows are reproducible.
 - Collect concrete coverage with gcov when available.
-- Generate a KLEE symbolic driver for the golden C top when KLEE is available.
+- Generate a relational KLEE driver that calls both golden C and HLS-C from cloned
+  symbolic state, then checks return values and complete pointer post-state equality.
 - Treat generated traces as evidence, not proof; host equivalence, CSim, CSynth, and CoSim still decide acceptance.
-- Record enough metadata for a future HLS verification knowledge graph: function name, arguments, directions, lengths, generated files, and check types.
+- Record structured metadata for the live HLS verification knowledge graph: function name, arguments, directions, lengths, generated files, relational scope, bounds, assumptions, and check types.
 """
 
 
@@ -358,45 +360,272 @@ if __name__ == "__main__":
 """
 
 
+_KLEE_LENGTH_NAMES = {"n", "len", "length", "size", "count", "num", "limit", "samples", "elements"}
+
+
+def _klee_scalar_bounds(arg: FunctionArg, pointer_args: list[FunctionArg]) -> tuple[int, int] | None:
+    if arg.scalar_range is not None:
+        return arg.scalar_range
+    name = arg.name.lower()
+    related_lengths = [
+        pointer.length
+        for pointer in pointer_args
+        if pointer.length is not None
+        and (
+            name in _KLEE_LENGTH_NAMES
+            or name in {
+                f"{pointer.name.lower()}_n",
+                f"n_{pointer.name.lower()}",
+                f"{pointer.name.lower()}_len",
+                f"{pointer.name.lower()}_length",
+                f"{pointer.name.lower()}_size",
+                f"{pointer.name.lower()}_count",
+            }
+            or name.startswith("num_")
+            or name.endswith(("_len", "_length", "_size", "_count"))
+        )
+    ]
+    return (0, min(related_lengths)) if related_lengths else None
+
+
+def _static_storage_reasons(source: str, label: str) -> list[str]:
+    """Conservatively find variable static storage while allowing static functions."""
+
+    clean = strip_comments(source)
+    reasons: list[str] = []
+    for match in re.finditer(r"\bstatic\b", clean):
+        tail = clean[match.start() :]
+        semicolon = tail.find(";")
+        brace = tail.find("{")
+        delimiters = [index for index in (semicolon, brace) if index >= 0]
+        if not delimiters:
+            reasons.append(f"{label} contains unresolved static storage")
+            continue
+        end = min(delimiters)
+        declaration = " ".join(tail[: end + 1].split())
+        # `static int helper(int) {` and `static int helper(int);` are functions,
+        # not mutable storage. An initializer (`static int x = helper();`) is state.
+        if "(" in declaration and "=" not in declaration:
+            if declaration.endswith("{") or re.search(r"\)\s*;$", declaration):
+                continue
+        reasons.append(f"{label} static storage is outside the single-invocation model: {declaration[:80]}")
+    return reasons
+
+
+def _file_scope_state_reasons(source: str, label: str) -> list[str]:
+    clean = "\n".join(
+        line for line in strip_comments(source).splitlines() if not line.lstrip().startswith("#")
+    )
+    reasons: list[str] = []
+    depth = 0
+    statement: list[str] = []
+    for char in clean:
+        if char == "{":
+            depth += 1
+            if depth == 1:
+                statement = []
+            continue
+        if char == "}":
+            depth = max(0, depth - 1)
+            if depth == 0:
+                statement = []
+            continue
+        if depth:
+            continue
+        statement.append(char)
+        if char != ";":
+            continue
+        text = " ".join("".join(statement).split())
+        statement = []
+        if (
+            not text
+            or "(" in text
+            or re.match(r"^(?:typedef|using|struct|union|enum)\b", text)
+            or re.search(r"\bconst\b", text)
+        ):
+            continue
+        reasons.append(f"{label} mutable file-scope state is outside the relational model: {text[:80]}")
+    return reasons
+
+
+def _klee_unsupported_reasons(
+    analysis: AnalysisResult, hlsc_source: str | None = None
+) -> list[str]:
+    fn = analysis.function
+    reasons: list[str] = []
+    observable_count = (1 if fn.return_type != "void" else 0) + sum(
+        arg.length or 0 for arg in fn.args if arg.is_pointer_like
+    )
+    if observable_count == 0:
+        reasons.append("no return value or pointer post-state is available to compare")
+    if "*" in fn.return_type or "&" in fn.return_type:
+        reasons.append("pointer/reference return values are not relationally comparable")
+    type_texts = [("return", fn.return_type)] + [(arg.name, arg.c_type) for arg in fn.args]
+    for name, c_type in type_texts:
+        lowered = c_type.lower()
+        if any(
+            token in lowered
+            for token in ("float", "double", "ap_int", "ap_uint", "hls::", "struct ", "union ", "class ")
+        ):
+            reasons.append(f"{name} uses a symbolic type outside the supported integral subset: {c_type}")
+    for arg in fn.args:
+        if arg.pointer_depth > 1:
+            reasons.append(f"{arg.name} has pointer depth {arg.pointer_depth}; only one-dimensional buffers are supported")
+        if arg.is_pointer_like and (arg.length is None or arg.length <= 0):
+            reasons.append(f"{arg.name} has no positive finite buffer bound")
+        if not arg.is_pointer_like and "&" in arg.raw:
+            reasons.append(f"{arg.name} is a reference argument; scalar post-state cloning is unsupported")
+        if len(arg.array_dims) > 1 or any(dim and not dim.strip().isdigit() for dim in arg.array_dims):
+            reasons.append(f"{arg.name} uses a multidimensional or nonconstant array contract")
+    if "..." in fn.signature:
+        reasons.append("variadic signatures are unsupported")
+    try:
+        source = strip_comments(fn.source_path.read_text(encoding="utf-8"))
+    except OSError:
+        source = ""
+    reasons.extend(_static_storage_reasons(source, "golden C"))
+    reasons.extend(_file_scope_state_reasons(source, "golden C"))
+    if hlsc_source is not None:
+        reasons.extend(_static_storage_reasons(hlsc_source, "generated HLS-C"))
+        reasons.extend(_file_scope_state_reasons(hlsc_source, "generated HLS-C"))
+    return sorted(set(reasons))
+
+
 def _klee_driver(analysis: AnalysisResult) -> str:
     fn = analysis.function
+    pointer_args = [arg for arg in fn.args if arg.is_pointer_like]
     declarations: list[str] = []
     setup: list[str] = []
+    golden_contract_checks: list[str] = []
+    hlsc_contract_checks: list[str] = []
+    comparisons: list[str] = []
+
     for arg in fn.args:
         if arg.is_pointer_like:
-            declarations.append(f"  {_storage_type(arg)} {arg.name}[{arg.length}] = {{}};")
-            if arg.direction in {"input", "inout"}:
-                setup.append(f'  klee_make_symbolic({arg.name}, sizeof({arg.name}), "{arg.name}");')
-            else:
-                setup.append(f"  for (int i = 0; i < {arg.length}; ++i) {arg.name}[i] = static_cast<{_storage_type(arg)}>(0);")
+            storage_type = _storage_type(arg)
+            declarations.extend(
+                [
+                    f"  {storage_type} seed_{arg.name}[{arg.length}] = {{}};",
+                    f"  {storage_type} golden_{arg.name}[{arg.length}] = {{}};",
+                    f"  {storage_type} hlsc_{arg.name}[{arg.length}] = {{}};",
+                ]
+            )
+            setup.append(
+                f'  klee_make_symbolic(seed_{arg.name}, sizeof(seed_{arg.name}), "{arg.name}_initial");'
+            )
+            setup.append(f"  for (int i = 0; i < {arg.length}; ++i) {{")
+            setup.append(f"    golden_{arg.name}[i] = seed_{arg.name}[i];")
+            setup.append(f"    hlsc_{arg.name}[i] = seed_{arg.name}[i];")
+            setup.append("  }")
+            comparisons.append(f"  for (int i = 0; i < {arg.length}; ++i) {{")
+            comparisons.append(
+                f'    c2hlsc_require_equal(golden_{arg.name}[i], hlsc_{arg.name}[i], '
+                f'"C2HLSC_RELATIONAL_MISMATCH:{arg.name}");'
+            )
+            if arg.direction == "input":
+                golden_contract_checks.extend(
+                    [
+                        f"  for (int i = 0; i < {arg.length}; ++i) {{",
+                        f'    c2hlsc_require_unchanged(golden_{arg.name}[i], seed_{arg.name}[i], '
+                        f'"C2HLSC_INPUT_CONTRACT_MUTATION:golden:{arg.name}");',
+                        "  }",
+                    ]
+                )
+                hlsc_contract_checks.extend(
+                    [
+                        f"  for (int i = 0; i < {arg.length}; ++i) {{",
+                        f'    c2hlsc_require_unchanged(hlsc_{arg.name}[i], seed_{arg.name}[i], '
+                        f'"C2HLSC_INPUT_CONTRACT_MUTATION:hlsc:{arg.name}");',
+                        "  }",
+                    ]
+                )
+            comparisons.append("  }")
         else:
             scalar_type = _storage_type(arg)
-            declarations.append(f"  {scalar_type} {arg.name} = 0;")
-            setup.append(f'  klee_make_symbolic(&{arg.name}, sizeof({arg.name}), "{arg.name}");')
-            if arg.scalar_range:
-                lo, hi = arg.scalar_range
-                setup.append(f"  klee_assume({arg.name} >= static_cast<{scalar_type}>({lo}));")
-                setup.append(f"  klee_assume({arg.name} <= static_cast<{scalar_type}>({hi}));")
-    return_prefix = f"{fn.return_type} dut_return = " if fn.return_type != "void" else ""
-    if fn.return_type != "void":
-        setup.append("  (void)dut_return;")
+            declarations.extend(
+                [
+                    f"  {scalar_type} shared_{arg.name} = {{}};",
+                    f"  {scalar_type} golden_{arg.name} = {{}};",
+                    f"  {scalar_type} hlsc_{arg.name} = {{}};",
+                ]
+            )
+            setup.append(
+                f'  klee_make_symbolic(&shared_{arg.name}, sizeof(shared_{arg.name}), "{arg.name}");'
+            )
+            bounds = _klee_scalar_bounds(arg, pointer_args)
+            if bounds is not None:
+                lo, hi = bounds
+                setup.append(f"  klee_assume(shared_{arg.name} >= static_cast<{scalar_type}>({lo}));")
+                setup.append(f"  klee_assume(shared_{arg.name} <= static_cast<{scalar_type}>({hi}));")
+            setup.append(f"  golden_{arg.name} = shared_{arg.name};")
+            setup.append(f"  hlsc_{arg.name} = shared_{arg.name};")
+
+    golden_args = ", ".join(
+        f"golden_{arg.name}" for arg in fn.args
+    )
+    hlsc_args = ", ".join(
+        f"hlsc_{arg.name}" for arg in fn.args
+    )
+    calls: list[str] = []
+    if fn.return_type == "void":
+        calls.extend(
+            [
+                f"  {fn.name}_ref({golden_args});",
+                *golden_contract_checks,
+                f"  {fn.name}({hlsc_args});",
+                *hlsc_contract_checks,
+            ]
+        )
+    else:
+        calls.extend(
+            [
+                f"  {fn.return_type} golden_return = {fn.name}_ref({golden_args});",
+                *golden_contract_checks,
+                f"  {fn.return_type} hlsc_return = {fn.name}({hlsc_args});",
+                *hlsc_contract_checks,
+                '  c2hlsc_require_equal(golden_return, hlsc_return, "C2HLSC_RELATIONAL_MISMATCH:return");',
+            ]
+        )
 
     return f"""// Generated by c2hlsc_agent using {LEVERI_TESTBENCH_POLICY_ID}.
-// KLEE symbolic driver for the golden C top function.
+// Relational KLEE driver: golden C and HLS-C receive cloned symbolic initial state.
+// Proof scope assumes distinct/non-aliasing pointer arguments and no mutable hidden state.
+#include <cstddef>
 #include <cstdint>
 #include <klee/klee.h>
 
+#include "../src/hls_top.hpp"
+
 extern "C" {{
+#define restrict __restrict__
 #define {fn.name} {fn.name}_ref
 #include "../input.c"
 #undef {fn.name}
 }}
 
+[[noreturn]] static void c2hlsc_relational_mismatch(const char* observable) {{
+  klee_report_error(__FILE__, __LINE__, observable, "c2hlsc_relational.err");
+}}
+
+[[noreturn]] static void c2hlsc_input_contract_violation(const char* observable) {{
+  klee_report_error(__FILE__, __LINE__, observable, "c2hlsc_contract.err");
+}}
+
+template <typename GoldenT, typename HlscT>
+static void c2hlsc_require_equal(const GoldenT& golden, const HlscT& hlsc, const char* observable) {{
+  if (!(golden == hlsc)) c2hlsc_relational_mismatch(observable);
+}}
+
+template <typename ActualT, typename SeedT>
+static void c2hlsc_require_unchanged(const ActualT& actual, const SeedT& seed, const char* observable) {{
+  if (!(actual == seed)) c2hlsc_input_contract_violation(observable);
+}}
+
 int main() {{
 {chr(10).join(declarations)}
-{chr(10).join(setup[:-1] if fn.return_type != "void" else setup)}
-  {return_prefix}{fn.name}_ref({_call_args(fn.args)});
-{setup[-1] if fn.return_type != "void" else ""}
+{chr(10).join(setup)}
+{chr(10).join(calls)}
+{chr(10).join(comparisons)}
   return 0;
 }}
 """
@@ -408,6 +637,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -512,8 +742,10 @@ def _klee_script() -> str:
     return """#!/usr/bin/env python3
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -522,11 +754,68 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 COVERAGE_DIR = ROOT / "coverage"
 REPORT_PATH = COVERAGE_DIR / "klee_report.json"
+MANIFEST_PATH = ROOT / "tb" / "leveri_manifest.json"
+SCHEMA = "c2hlsc-klee-report-v1"
+SCOPE = "golden_hlsc_relational"
+PROVENANCE_FILES = (
+    "input.c",
+    "src/hls_top.hpp",
+    "src/hls_top.cpp",
+    "tb/klee_driver.cpp",
+    "tb/leveri_manifest.json",
+)
+
+
+def provenance() -> dict[str, object]:
+    hashes = {
+        relative: hashlib.sha256((ROOT / relative).read_bytes()).hexdigest()
+        for relative in PROVENANCE_FILES
+        if (ROOT / relative).is_file()
+    }
+    top = None
+    try:
+        manifest = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
+        if isinstance(manifest, dict) and isinstance(manifest.get("top"), str):
+            top = manifest["top"]
+    except (OSError, ValueError, TypeError):
+        pass
+    return {"top": top, "artifact_sha256": hashes}
 
 
 def write_report(payload: dict[str, object]) -> None:
     COVERAGE_DIR.mkdir(exist_ok=True)
-    REPORT_PATH.write_text(json.dumps(payload, indent=2) + "\\n", encoding="utf-8")
+    REPORT_PATH.write_text(
+        json.dumps({"schema": SCHEMA, "scope": SCOPE, **payload, **provenance()}, indent=2) + "\\n",
+        encoding="utf-8",
+    )
+
+
+def load_contract() -> dict[str, object]:
+    manifest = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
+    if not isinstance(manifest, dict):
+        raise ValueError("manifest must contain a JSON object")
+    coverage_hooks = manifest.get("coverage_hooks")
+    if not isinstance(coverage_hooks, dict):
+        raise ValueError("manifest has no coverage hook object")
+    contract = coverage_hooks.get("klee", {})
+    assumptions = contract.get("assumptions") if isinstance(contract, dict) else None
+    if (
+        not isinstance(contract, dict)
+        or contract.get("schema") != SCHEMA
+        or contract.get("scope") != SCOPE
+        or contract.get("invocations") != 1
+        or not isinstance(contract.get("observable_count"), int)
+        or (
+            contract.get("observable_count", 0) <= 0
+            and not contract.get("unsupported_reasons")
+        )
+        or not isinstance(assumptions, dict)
+        or assumptions.get("pointer_alias_model") != "distinct_pointer_arguments"
+        or assumptions.get("hidden_state_model") != "no_mutable_hidden_state"
+        or assumptions.get("comparison") != "return_and_complete_pointer_post_state"
+    ):
+        raise ValueError("manifest has no relational KLEE contract")
+    return contract
 
 
 def resolve_tool(env_name: str, *candidate_names: str) -> str | None:
@@ -540,6 +829,64 @@ def resolve_tool(env_name: str, *candidate_names: str) -> str | None:
         if found:
             return found
     return None
+
+
+def strip_source_comments(source: str) -> str:
+    source = re.sub(r"/\\*.*?\\*/", "", source, flags=re.S)
+    return re.sub(r"//.*", "", source)
+
+
+def current_hlsc_hidden_state() -> list[str]:
+    path = ROOT / "src" / "hls_top.cpp"
+    source = strip_source_comments(path.read_text(encoding="utf-8"))
+    reasons: list[str] = []
+    for match in re.finditer(r"\\bstatic\\b", source):
+        tail = source[match.start():]
+        semicolon = tail.find(";")
+        brace = tail.find("{")
+        delimiters = [index for index in (semicolon, brace) if index >= 0]
+        if not delimiters:
+            reasons.append("generated HLS-C contains unresolved static storage")
+            continue
+        end = min(delimiters)
+        declaration = " ".join(tail[:end + 1].split())
+        if "(" in declaration and "=" not in declaration:
+            if declaration.endswith("{") or re.search(r"\\)\\s*;$", declaration):
+                continue
+        reasons.append(f"generated HLS-C static storage: {declaration[:80]}")
+
+    top_level = "\\n".join(
+        line for line in source.splitlines() if not line.lstrip().startswith("#")
+    )
+    depth = 0
+    statement: list[str] = []
+    for char in top_level:
+        if char == "{":
+            depth += 1
+            if depth == 1:
+                statement = []
+            continue
+        if char == "}":
+            depth = max(0, depth - 1)
+            if depth == 0:
+                statement = []
+            continue
+        if depth:
+            continue
+        statement.append(char)
+        if char != ";":
+            continue
+        text = " ".join("".join(statement).split())
+        statement = []
+        if (
+            not text
+            or "(" in text
+            or re.match(r"^(?:typedef|using|struct|union|enum)\\b", text)
+            or re.search(r"\\bconst\\b", text)
+        ):
+            continue
+        reasons.append(f"generated HLS-C mutable file-scope state: {text[:80]}")
+    return sorted(set(reasons))
 
 
 def default_klee_include(klee_path: str | None) -> str | None:
@@ -560,69 +907,183 @@ def default_klee_include(klee_path: str | None) -> str | None:
 
 
 def main() -> int:
+    try:
+        contract = load_contract()
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        write_report({
+            "status": "blocked",
+            "outcome": "invalid_contract",
+            "failure_kind": "manifest_invalid",
+            "reason": str(exc),
+        })
+        return 1
+
+    unsupported = contract.get("unsupported_reasons") or []
+    if unsupported:
+        write_report({
+            "status": "blocked",
+            "outcome": "unsupported_contract",
+            "failure_kind": "unsupported_contract",
+            "reason": "; ".join(str(reason) for reason in unsupported),
+            "assumptions": contract.get("assumptions", {}),
+        })
+        print("KLEE relational check blocked: unsupported contract")
+        return 1
+
+    try:
+        current_hidden_state = current_hlsc_hidden_state()
+    except OSError as exc:
+        write_report({
+            "status": "blocked",
+            "outcome": "invalid_candidate",
+            "failure_kind": "candidate_preflight_failed",
+            "reason": str(exc),
+        })
+        return 1
+    if current_hidden_state:
+        write_report({
+            "status": "blocked",
+            "outcome": "unsupported_contract",
+            "failure_kind": "current_candidate_hidden_state",
+            "reason": "; ".join(current_hidden_state),
+            "assumptions": contract.get("assumptions", {}),
+        })
+        print("KLEE relational check blocked: current HLS-C has hidden state")
+        return 1
+
     klee = resolve_tool("KLEE", "klee")
     clangxx = resolve_tool("KLEE_CXX", "klee-clang++", "clang++")
+    llvm_link = resolve_tool("KLEE_LLVM_LINK", "llvm-link")
     klee_include = os.environ.get("KLEE_INCLUDE_DIR") or default_klee_include(klee)
     if klee is None:
-        write_report({"status": "skipped", "reason": "klee not found"})
-        print("KLEE coverage skipped: klee not found")
+        write_report({"status": "skipped", "outcome": "unavailable", "failure_kind": "tool_unavailable", "reason": "klee not found"})
+        print("KLEE relational check skipped: klee not found")
         return 0
     if clangxx is None:
-        write_report({"status": "skipped", "reason": "clang++ not found"})
-        print("KLEE coverage skipped: clang++ not found")
+        write_report({"status": "skipped", "outcome": "unavailable", "failure_kind": "tool_unavailable", "reason": "clang++ not found"})
+        print("KLEE relational check skipped: clang++ not found")
+        return 0
+    if llvm_link is None:
+        write_report({"status": "skipped", "outcome": "unavailable", "failure_kind": "tool_unavailable", "reason": "llvm-link not found"})
+        print("KLEE relational check skipped: llvm-link not found")
         return 0
     if klee_include is None or not Path(klee_include).exists():
-        write_report({"status": "skipped", "reason": "KLEE include directory not found", "klee_include": klee_include})
-        print("KLEE coverage skipped: include directory not found")
+        write_report({"status": "skipped", "outcome": "unavailable", "failure_kind": "tool_unavailable", "reason": "KLEE include directory not found"})
+        print("KLEE relational check skipped: include directory not found")
         return 0
 
     COVERAGE_DIR.mkdir(exist_ok=True)
-    bitcode = COVERAGE_DIR / "klee_driver.bc"
+    driver_bitcode = COVERAGE_DIR / "klee_driver.bc"
+    hlsc_bitcode = COVERAGE_DIR / "klee_hlsc.bc"
+    relational_bitcode = COVERAGE_DIR / "klee_relational.bc"
     klee_out = COVERAGE_DIR / "klee-out"
     if klee_out.exists():
         shutil.rmtree(klee_out)
 
-    compile_cmd = [
+    common_flags = [
         clangxx,
         "-std=c++17",
+        "-Wno-unknown-pragmas",
         "-I",
         ".",
+        "-I",
+        "src",
         "-I",
         klee_include,
         "-emit-llvm",
         "-c",
         "-g",
         "-O0",
-        "tb/klee_driver.cpp",
-        "-o",
-        str(bitcode),
     ]
+    compile_driver_cmd = [*common_flags, "tb/klee_driver.cpp", "-o", str(driver_bitcode)]
+    compile_hlsc_cmd = [*common_flags, "src/hls_top.cpp", "-o", str(hlsc_bitcode)]
+    link_cmd = [llvm_link, str(driver_bitcode), str(hlsc_bitcode), "-o", str(relational_bitcode)]
     timeout_s = int(os.environ.get("C2HLSC_KLEE_TIMEOUT", "60"))
     logs: list[dict[str, object]] = []
     try:
-        compiled = subprocess.run(compile_cmd, cwd=ROOT, text=True, capture_output=True, check=True)
-        logs.append({"cmd": compile_cmd, "returncode": compiled.returncode, "stdout": compiled.stdout[-4000:], "stderr": compiled.stderr[-4000:]})
-        klee_cmd = [klee, f"--output-dir={klee_out}", str(bitcode)]
+        for command in (compile_driver_cmd, compile_hlsc_cmd, link_cmd):
+            completed = subprocess.run(command, cwd=ROOT, text=True, capture_output=True, check=True)
+            logs.append({"cmd": command, "returncode": completed.returncode, "stdout": completed.stdout[-4000:], "stderr": completed.stderr[-4000:]})
+        klee_cmd = [klee, f"--output-dir={klee_out}", str(relational_bitcode)]
         executed = subprocess.run(klee_cmd, cwd=ROOT, text=True, capture_output=True, timeout=timeout_s, check=False)
         logs.append({"cmd": klee_cmd, "returncode": executed.returncode, "stdout": executed.stdout[-8000:], "stderr": executed.stderr[-8000:]})
         ktests = sorted(str(path.relative_to(ROOT)) for path in klee_out.glob("*.ktest"))
-        status = "pass" if executed.returncode == 0 else "fail"
+        error_paths = sorted(klee_out.glob("*.err"))
+        error_files = [str(path.relative_to(ROOT)) for path in error_paths]
+        relational_errors = [path for path in error_paths if path.name.endswith(".c2hlsc_relational.err")]
+        contract_errors = [path for path in error_paths if path.name.endswith(".c2hlsc_contract.err")]
+        other_errors = [path for path in error_paths if path not in relational_errors and path not in contract_errors]
+        counterexamples: list[dict[str, str]] = []
+        for path in relational_errors:
+            observable = "C2HLSC_RELATIONAL_MISMATCH:unknown"
+            marker = "C2HLSC_RELATIONAL_MISMATCH:"
+            for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+                if marker in line:
+                    observable = marker + line.split(marker, 1)[1].split()[0]
+                    break
+            counterexamples.append({"error_file": str(path.relative_to(ROOT)), "observable": observable})
+        path_matches = re.findall(r"completed paths\\s*=\\s*(\\d+)", executed.stdout + "\\n" + executed.stderr, flags=re.IGNORECASE)
+        completed_paths = int(path_matches[-1]) if path_matches else 0
+        if relational_errors:
+            status = "fail"
+            outcome = "counterexample"
+            failure_kind = "relational_counterexample"
+            reason = "KLEE found a golden-C versus HLS-C relational mismatch"
+        elif contract_errors:
+            status = "blocked"
+            outcome = "contract_violation"
+            failure_kind = "input_contract_violation"
+            reason = "KLEE found a mutation of an input-only buffer; audit the contract and candidate"
+        elif other_errors:
+            status = "blocked"
+            outcome = "execution_error"
+            failure_kind = "symbolic_execution_error"
+            reason = "KLEE emitted non-relational runtime errors"
+        elif executed.returncode != 0:
+            status = "blocked"
+            outcome = "incomplete"
+            failure_kind = "execution_incomplete"
+            reason = f"KLEE exited {executed.returncode} before clean completion"
+        elif completed_paths <= 0 or not ktests:
+            status = "blocked"
+            outcome = "incomplete"
+            failure_kind = "non_vacuity_missing"
+            reason = "KLEE produced no non-vacuous completed-path evidence"
+        else:
+            status = "pass"
+            outcome = "no_counterexample"
+            failure_kind = None
+            reason = "bounded relational exploration completed without a counterexample"
         write_report({
             "status": status,
+            "outcome": outcome,
+            "failure_kind": failure_kind,
+            "reason": reason,
             "policy_id": "hls_leveri_shift_left_v1",
+            "invocations": 1,
+            "observable_count": contract.get("observable_count"),
+            "assumptions": contract.get("assumptions", {}),
+            "bounded_lengths": contract.get("bounded_lengths", {}),
+            "scalar_ranges": contract.get("scalar_ranges", {}),
             "commands": logs,
+            "completed_paths": completed_paths,
+            "generated_tests": len(ktests),
             "ktest_count": len(ktests),
             "ktest_files": ktests,
+            "error_files": error_files,
+            "counterexamples": counterexamples,
+            "counterexample_names": sorted({item["observable"] for item in counterexamples}),
+            "timed_out": False,
         })
         print(f"KLEE report written to {REPORT_PATH}")
-        return executed.returncode
+        return 0 if status == "pass" else 1
     except subprocess.TimeoutExpired as exc:
         logs.append({"cmd": exc.cmd, "timeout_s": timeout_s, "stdout": (exc.stdout or "")[-4000:], "stderr": (exc.stderr or "")[-4000:]})
-        write_report({"status": "fail", "reason": "timeout", "commands": logs})
+        write_report({"status": "blocked", "outcome": "incomplete", "failure_kind": "timeout", "reason": "timeout", "completed_paths": 0, "generated_tests": 0, "error_files": [], "counterexamples": [], "counterexample_names": [], "timed_out": True, "commands": logs})
         return 1
     except subprocess.CalledProcessError as exc:
         logs.append({"cmd": exc.cmd, "returncode": exc.returncode, "stdout": (exc.stdout or "")[-4000:], "stderr": (exc.stderr or "")[-4000:]})
-        write_report({"status": "fail", "reason": "compile_failed", "commands": logs})
+        write_report({"status": "blocked", "outcome": "incomplete", "failure_kind": "compile_or_link_failed", "reason": "compile_or_link_failed", "completed_paths": 0, "generated_tests": 0, "error_files": [], "counterexamples": [], "counterexample_names": [], "timed_out": False, "commands": logs})
         return exc.returncode or 1
 
 
@@ -631,8 +1092,22 @@ if __name__ == "__main__":
 """
 
 
-def _manifest(analysis: AnalysisResult, config: AgentConfig) -> str:
+def _manifest(
+    analysis: AnalysisResult, config: AgentConfig, hlsc_source: str | None = None
+) -> str:
     fn = analysis.function
+    pointer_args = [arg for arg in fn.args if arg.is_pointer_like]
+    scalar_ranges = {
+        arg.name: list(bounds)
+        for arg in fn.args
+        if not arg.is_pointer_like and (bounds := _klee_scalar_bounds(arg, pointer_args)) is not None
+    }
+    bounded_lengths = {
+        arg.name: arg.length for arg in pointer_args if arg.length is not None
+    }
+    observable_count = (1 if fn.return_type != "void" else 0) + sum(
+        arg.length or 0 for arg in pointer_args
+    )
     payload = {
         "policy_id": LEVERI_TESTBENCH_POLICY_ID,
         "reference_repo": LEVERI_REFERENCE_REPO,
@@ -645,7 +1120,7 @@ def _manifest(analysis: AnalysisResult, config: AgentConfig) -> str:
             "stimulus_column_alignment",
             "dynamic_output_consistency",
             "gcov_concrete_coverage",
-            "klee_symbolic_path_exploration",
+            "klee_golden_hlsc_relational_check",
         ],
         "coverage_hooks": {
             "gcov": {
@@ -658,6 +1133,18 @@ def _manifest(analysis: AnalysisResult, config: AgentConfig) -> str:
                 "script": "tb/run_klee.py",
                 "report": "coverage/klee_report.json",
                 "make_target": "klee-coverage",
+                "schema": "c2hlsc-klee-report-v1",
+                "scope": "golden_hlsc_relational",
+                "invocations": 1,
+                "observable_count": observable_count,
+                "bounded_lengths": bounded_lengths,
+                "scalar_ranges": scalar_ranges,
+                "assumptions": {
+                    "pointer_alias_model": "distinct_pointer_arguments",
+                    "hidden_state_model": "no_mutable_hidden_state",
+                    "comparison": "return_and_complete_pointer_post_state",
+                },
+                "unsupported_reasons": _klee_unsupported_reasons(analysis, hlsc_source),
             },
         },
         "generated_files": [
@@ -683,9 +1170,14 @@ def _manifest(analysis: AnalysisResult, config: AgentConfig) -> str:
     return json.dumps(payload, indent=2) + "\n"
 
 
-def generate_leveri_testbenches(analysis: AnalysisResult, config: AgentConfig) -> LeVeriTestbenchBundle:
+def generate_leveri_testbenches(
+    analysis: AnalysisResult,
+    config: AgentConfig,
+    hlsc_source: str | None = None,
+) -> LeVeriTestbenchBundle:
     fn = analysis.function
     golden_include = f"""extern "C" {{
+#define restrict __restrict__
 #define {fn.name} {fn.name}_ref
 #include "../input.c"
 #undef {fn.name}
@@ -710,5 +1202,5 @@ def generate_leveri_testbenches(analysis: AnalysisResult, config: AgentConfig) -
         gcov_script=_gcov_script(),
         klee_driver=_klee_driver(analysis),
         klee_script=_klee_script(),
-        manifest_json=_manifest(analysis, config),
+        manifest_json=_manifest(analysis, config, hlsc_source),
     )

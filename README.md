@@ -168,7 +168,8 @@ python3 -m c2hlsc_agent.cli repair \
   --evidence /path/to/vitis_cosim.log
 ```
 
-After a repair, copy the repaired project back to Ubuntu and rerun from CSim. Avoid
+After a repair, copy the repaired project back to Ubuntu and rerun from host
+`software_equivalence`, then continue through the full ladder. Avoid
 `--auto-repair` on the server unless generation, Vitis, and repair are intentionally
 running in one local experiment.
 
@@ -189,7 +190,7 @@ single generation step. The intended agents are:
 1. `contract_planner`: extracts the top-function contract, argument bounds, legal input
    domain, and unsupported C constructs.
 2. `shift_left_testbench_agent`: builds the golden-C oracle testbench, directed/random
-   stimuli, and future coverage/KLEE/gcov augmentation.
+   stimuli, paired golden/HLS traces, gcov evidence, and bounded relational KLEE checks.
 3. `hlsc_generator_agent`: emits synthesizable HLS-C and records every transformation.
 4. `cosim_operator`: runs host equivalence, Vitis CSim, synthesis, and C/RTL CoSim in
    short-circuit order.
@@ -201,6 +202,30 @@ single generation step. The intended agents are:
    only after host equivalence, CSim, synthesis, and CoSim pass again.
 8. `audit_memory_agent`: stores reproducible artifacts and promotes only audited repair
    successes into retrieval memory.
+
+The live default verification order is:
+
+```text
+static contract -> host equivalence -> paired traces -> gcov -> KLEE
+                -> CSim -> CSynth -> C/RTL CoSim -> PPA
+```
+
+This is deliberately shift-left: the paired-trace comparison is a pre-synthesis
+correctness gate, gcov is an evidence phase, and KLEE is a bounded relational gate only
+when it emits an exact-schema, named golden-C↔HLS-C counterexample. The driver gives both
+implementations cloned copies of the same symbolic scalars and buffers, then compares the
+return value and the complete configured post-state of every pointer. Input-only buffers
+are also checked for forbidden mutation. Missing KLEE is `skipped`; unsupported contracts,
+instrumentation failures, timeouts, and toolchain problems are `blocked`, not semantic
+failures. A KLEE PASS means no counterexample was found within the configured bounds and
+model assumptions (distinct pointer arguments and no mutable hidden state); it is not a
+universal equivalence proof. Use `--no-shift-left` only when explicitly trading away those
+additional checks; host equivalence remains mandatory.
+
+Every conversion also writes `verification_knowledge_graph.json`, a deterministic
+dependency-free graph connecting the design contract, arguments, generated artifacts,
+verification phases, evidence references, repair outcomes, and later QoR/PPA reports.
+It stores references and metadata, never source code, logs, prompts, or evidence bodies.
 
 Important correction: Vitis C/RTL CoSim checks generated RTL against the HLS-C design
 under the supplied testbench. It does not, by itself, prove that RTL is equivalent to the
@@ -263,7 +288,13 @@ one cloud API:
 
 - **`claude-cli`** — the local Claude Code CLI (`claude -p`). Subscription auth: no API
   key, no per-token billing, no extra dependency. Model via `--llm-model` (default
-  `opus`); a custom command via `--llm-cli-cmd` (may be multi-word).
+  `opus`); a custom command via `--llm-cli-cmd` (may be multi-word). Each call is a lean,
+  fully isolated one-shot: `--output-format json` (errors surface from the envelope's
+  `is_error` instead of being guessed from stdout), plus `--strict-mcp-config`,
+  `--no-session-persistence`, `--setting-sources ""` and `--tools ""` so no MCP server,
+  saved session, settings file, or tool loop is loaded for what is a pure text completion.
+  Notably `--setting-sources ""` keeps pipeline calls from picking up this repo's own
+  `.claude/` skills and hooks, which exist for interactive sessions only.
 - **`openai`** — any OpenAI Chat Completions-compatible endpoint, using only the standard
   library (no extra dependency). This is how it runs on a **local model with no cloud
   key**: point `--llm-base-url` at Ollama / LM Studio / llama.cpp / vLLM. The same backend
@@ -349,10 +380,17 @@ Vitis, so no Vitis time is spent on losing candidates. Scores land in
 `<out>/candidate_scores.json`. A candidate that passes host equivalence wins immediately;
 otherwise the one with the fewest mismatches is taken and the repair loop drives it home.
 
+The N generations run **concurrently** (they are independent calls that each block on the
+backend), so best-of-N costs roughly one generation of wall-clock instead of N. Measured on
+`examples/vector_add` with `--candidates 3` against the `claude-cli` backend: 2m49s
+concurrent vs 6m52s serial, same winner. Tune with `--llm-candidate-workers N` (default 4;
+`1` restores fully serial generation). Scoring and de-duplication remain serial and in
+attempt order, so the selected winner is identical either way.
+
 ### Remote Vitis over SSH (`--vitis-ssh`)
 
 Keep everything on the Mac — analysis, generation, testbenches, host equivalence,
-classification, and every LLM call — and ship **only** the `vitis_hls` phases to a Linux
+classification, and every LLM call — and ship **only** the native Vitis HLS phases to a Linux
 box:
 
 ```bash
@@ -364,11 +402,12 @@ python -m c2hlsc_agent.cli convert \
 
 Per verification pass the project directory is rsynced to
 `<--vitis-remote-dir, default ~/c2hlsc_runs>/<project-name>` on the host, each phase runs
-as `ssh <host> 'cd <dir> && timeout <t> vitis_hls -f run_<phase>.tcl'` with the log
+as either `vitis-run --mode hls --tcl run_<phase>.tcl` (Unified IDE) or
+`vitis_hls -f run_<phase>.tcl` (legacy) with the log
 captured locally exactly like a local run (so classification and repair evidence work
 unchanged), and the synthesized RTL (`syn/`), cosim reports, and Vitis logs are rsynced
-back afterwards. `vitis_hls` is located on the remote via `--vitis-setup
-'source /tools/Xilinx/Vitis/2024.2/settings64.sh'`, `--vitis-bin /path/to/vitis_hls`, or
+back afterwards. The launcher is located on the remote via `--vitis-setup
+'source /tools/Xilinx/Vitis/2024.2/settings64.sh'`, `--vitis-bin /path/to/vitis-run`, or
 an automatic probe of the common Xilinx install locations. The host can also come from
 `C2HLSC_VITIS_SSH` or the config file (`vitis_ssh_host`, `vitis_remote_dir`,
 `vitis_setup`, `vitis_bin`). Requirements: ssh key auth + rsync on both sides; no Python,
@@ -379,6 +418,62 @@ the earliest failing Vitis stage remotely, classify locally, repair locally with
 Claude CLI, re-run the full ladder — no manual log ferrying (the `repair` subcommand
 remains available for air-gapped setups).
 
+### Local co-simulation without Vitis (`--cosim-backend local-hls`)
+
+On a machine without Vitis (e.g. an Apple Silicon Mac), the whole `csynth`/`cosim`
+ladder can run locally with the open-source [PandA Bambu](https://github.com/ferrandi/PandA-bambu)
+HLS tool instead of Xilinx. Bambu synthesizes the golden C reference to Verilog and
+co-simulates it against the C with Verilator; combined with the host
+`software_equivalence` check (generated HLS-C ≡ golden C), this proves the design is
+functionally equivalent to real RTL — no Vitis, no remote host.
+
+One-time setup (downloads the Bambu AppImage and builds a small amd64 runtime image;
+Bambu is x86, so on Apple Silicon it runs in a `linux/amd64` container via Docker):
+
+```bash
+bash scripts/setup_bambu.sh
+```
+
+Then select the backend:
+
+```bash
+python -m c2hlsc_agent.cli convert \
+  --config examples/vector_add/config.yaml --out build/vector_add \
+  --cosim-backend local-hls
+```
+
+Backends: `--cosim-backend` is one of `auto` (default), `vitis`, `vitis-ssh`,
+`local-hls`, or `none`. `auto` prefers a configured remote Vitis host, then a local
+`vitis_hls` on `PATH`, then `local-hls` if Bambu is installed, else skips the ladder.
+The Vitis and `--vitis-ssh` paths are unchanged — a Windows/Linux box with Vitis still
+uses them (`--cosim-backend auto` picks Vitis automatically when it is present), so the
+same config runs the accurate Vitis flow there and the local Bambu flow on the Mac.
+
+The synthesized Verilog is collected into the project's `rtl/` directory. Knobs:
+`C2HLSC_BAMBU_TESTS` (co-sim vector count, default 16), `C2HLSC_BAMBU_SIMULATOR`
+(`VERILATOR`, default), `C2HLSC_BAMBU_SETUP` (Bambu `--experimental-setup`; default is
+`BAMBU-BALANCED-MP` = `-O2`; use `BAMBU-AREA-MP` for ~2× smaller area, `BAMBU-PERFORMANCE`
+for speed), `C2HLSC_BAMBU_FLAGS` (any extra bambu flags), `C2HLSC_BAMBU_SQUASHFS`,
+`C2HLSC_BAMBU_IMAGE`, `C2HLSC_LOCAL_HLS_CMD` (replace the whole Bambu invocation, e.g. a
+native `bambu` on Linux).
+
+**Local PPA on Bambu RTL.** `--local-ppa` (or a `ppa:` criteria block) runs the local
+yosys/OpenSTA flow directly on the Bambu-synthesized `rtl/` after a passing ladder —
+yosys area + OpenSTA slack/power, keyed to Bambu's `clock` port. The Vitis-shaped
+self-checking gate testbench does not match Bambu's start/done + memory-bus protocol, so
+the gate-level sim is skipped (Bambu's own cosim already checked function); area/timing/
+power still report normally.
+
+**Auto-repair.** A `local-hls` csynth/cosim failure is classified as a backend
+limitation (`local_hls_backend`, blocked): because the backend synthesizes the *golden* C
+and host `software_equivalence` already proved HLS-C ≡ golden C, such a failure is a
+Bambu/design issue, not a repairable HLS-C defect. `--auto-repair` therefore reports it
+and leaves the HLS-C untouched rather than mutating correct source. For HLS-C-accurate
+cosim that drives repair, use the Vitis backend.
+
+**Scope:** the RTL is Bambu's, not Vitis's, so `local-hls` is a fast local *correctness*
+gate — Vitis QoR (post-P&R latency/area/timing) still comes from the Vitis path.
+
 ### Repair memory and oscillation guard
 
 Every repair is already recorded in `repair_audit.json`; the LLM repair prompt now
@@ -387,6 +482,53 @@ to repeat them, and evidence excerpts are **tail**-sliced so the model sees the 
 error at the end of a Vitis log rather than the tool banner. A proposed patch whose
 content hash matches any previously visited source state (an A→B→A cycle) is rejected as
 `oscillation_rejected`, which stops the loop instead of burning Vitis runs on a cycle.
+
+### Live contract planner (`--plan-contracts`)
+
+The declared `contract_planner` agent is live: after static analysis, an LLM pass
+proposes per-argument `direction` / `length` / `range` where the regex inference is
+uncertain, as a `{"arguments": {...}}` JSON proposal validated field-by-field. Your
+own config always wins per-field; validated proposals are merged and the source is
+re-analyzed so bounds take effect in the testbench. Everything is recorded in
+`contract_plan.json` and the conversion report, and the verifier ladder still gates —
+a wrong proposal can only ever produce a failing, fully-audited run. Implies
+`--use-llm`; any planner failure silently falls back to the analyzer's own contract.
+
+### Audit-memory knowledge base (`--audit-memory`, opt-in)
+
+The declared `audit_memory_agent` is live: when a convert run **passes** after
+repairs, the repairs that actually cleared their failure (last of each
+stage/family chain — intermediate attempts that demonstrably didn't work are never
+promoted) are distilled into repair-success cards in an append-only JSONL store
+(`--audit-memory-path`, `C2HLSC_AUDIT_MEMORY`, default `~/.c2hlsc/audit_memory.jsonl`).
+On later repairs, the top matching cards (same failure family, ranked by evidence
+overlap) are injected into the repair prompt as clearly-delimited strategy hints.
+Cards never contain golden `input.c` text, and retrieval never bypasses the
+structural gates or the oscillation guard.
+
+### Cross-reference dual generation (`cross-reference`)
+
+The paper-figure workflow is live as a subcommand: for each HLS_NL record, two
+INDEPENDENT generations (arm A: the instruction verbatim; arm B: a restructured
+spec — separate `claude -p` processes share no context) are normalized through the
+structural gates, compiled as separate translation units inside `xref_a`/`xref_b`
+namespaces (macros cannot leak across arms; `extern "C"` wrappers are stripped),
+and driven with byte-identical seeded stimulus. Verdicts: `cross_verified` (both
+agree on every vector), `divergent` (mismatch evidence recorded), `unavailable`
+(host oracle limits: `hls::stream`/`ap_*` types, compile failures), `unparseable`.
+
+```bash
+python3 -m c2hlsc_agent.cli cross-reference \
+  --records data/hls_nl/hls_nl_repaired.accepted.jsonl \
+  --out build/xref --limit 20 --num-vectors 16
+```
+
+`results.jsonl` is the append-only commit stream (resumable: completed records are
+skipped, LLM-backend failures are retried); `cross_referenced_corpus.jsonl` is
+schema-compatible with the accepted dataset, so the testbench generator and the
+Vitis batch runner consume it unchanged; `needs_review.jsonl` holds everything else.
+The dataset's reference implementation is never shown to either arm. Concurrent
+shards must use separate `--out` dirs.
 
 ## HLS-LeVeri-Style Testbench Generator
 
@@ -410,8 +552,9 @@ For every generated project, AUTO RTL now writes:
   `leveri_hls_trace.csv`
 - `tb/leveri_compare.py`: checks static trace alignment and dynamic output consistency
 - `tb/run_gcov.py`: compiles/runs the paired traces with gcov coverage flags
-- `tb/klee_driver.cpp`: symbolic KLEE driver for the golden C top function
-- `tb/run_klee.py`: optional KLEE runner that writes a skip report if KLEE is absent
+- `tb/klee_driver.cpp`: single-invocation bounded relational KLEE driver for golden C and HLS-C
+- `tb/run_klee.py`: compiles/links both implementations, runs KLEE, and writes a structured
+  pass, counterexample, blocked, or skipped verdict
 - `tb/leveri_manifest.json`: records KG-ready metadata for the testbench bundle
 
 Run the paired trace check with:
@@ -430,7 +573,20 @@ make coverage
 
 `gcov` reports are written to `coverage/gcov_report.json`. KLEE reports are written to
 `coverage/klee_report.json`; when KLEE is not installed, the script exits successfully
-with a `skipped` report so the generated project remains portable.
+with a `skipped` report so the generated project remains portable. Relational reports use
+schema `c2hlsc-klee-report-v1` and scope `golden_hlsc_relational`; only a FAIL with
+`failure_kind=relational_counterexample` and a named mismatching observable can gate HLS or
+authorize repair. Manual `repair --stage symbolic_klee` likewise requires this JSON report
+and rejects free-form evidence text. The report binds the verdict to the top and SHA-256
+hashes of `input.c`, the HLS header/source, driver, and manifest, and every named mismatch
+must have a matching KTest witness. The manifest preflights mutable hidden state in both the
+golden source and the generated HLS-C candidate.
+
+During `convert`, these targets now run automatically after the main host-equivalence
+test and before any HLS tool invocation. A PASS, SKIP, or structured BLOCKED verdict
+from a report must come from fresh JSON. Separately, a command failure without JSON is
+retained as unstructured degraded BLOCKED phase evidence, so a stale coverage result
+can never certify a new run.
 
 ## Standalone RTL (Verilog) Testbench
 
@@ -542,10 +698,58 @@ on the accepted design, entirely on the local machine:
    dumping `waves/<top>_gate.vcd` for GTKWave;
 3. **OpenSTA** reports worst setup/hold slack, TNS, and power → `syn/sta_report.txt`.
 
-Tool discovery: `--liberty` / `C2HLSC_LIBERTY` / `syn/lib/*.lib`; `--sta-bin` /
-`STA_BIN` / `~/tools/eda/opensta/bin/sta`; `--clock-port` (default `ap_clk`);
-`--no-gate-sim` skips step 2. Every measurement lands in the QoR report and drives the
-target check.
+Tool discovery: the process node's liberty set (see below) or an explicit `--liberty` /
+`C2HLSC_LIBERTY` override; `--sta-bin` / `STA_BIN` / `~/tools/eda/opensta/bin/sta`;
+`--clock-port` (default `ap_clk`); `--no-gate-sim` skips step 2. Every measurement lands
+in the QoR report and drives the target check.
+
+## PPA Workflow Criteria (process node + slack gate)
+
+The PPA step is a first-class, config-declared workflow criterion — not just an
+optimizer add-on. Declare it in the config `ppa:` block:
+
+```yaml
+ppa:
+  node: nangate45     # nangate45 (45nm, default) | sky130hd (130nm) | asap7 (7nm)
+  min_slack: 0.0      # worst-setup-slack floor, in the node's time unit (ns; ps for asap7)
+  # optional: max_area_um2, max_power_w, max_latency_cycles, run_local_ppa, liberty
+```
+
+The **process node (工艺节点)** picks which standard-cell library every slack/area/power
+number is measured against:
+
+| node | process | role | manufacturable | slack unit |
+|---|---|---|---|---|
+| `nangate45` | 45 nm FreePDK45 | citable open baseline (default) | no | ns |
+| `sky130hd` | SkyWater 130 nm HD | real foundry PDK (chipIgnite/MPW) | **yes** | ns |
+| `asap7` | ASAP7 7 nm RVT | modern-node scaling datapoint | no | ps |
+
+Liberty files are not vendored: they resolve from `<project>/syn/lib`, then the PDK cache
+(`$C2HLSC_PDK_DIR` or `~/.c2hlsc/pdk`), then an on-demand download from
+OpenROAD-flow-scripts (with a jsDelivr fallback). An explicit `--liberty` /
+`C2HLSC_LIBERTY` still overrides the node (legacy single-library path, ns units); a path
+that does not exist is a hard error, never a silent fall-through.
+
+**Where it runs.** During `convert`, once the equivalence ladder passes and RTL exists,
+a `ppa` verification phase synthesizes + times the design on the node and **fails the run
+(nonzero exit)** when a declared criterion is unmet or unverifiable — the headline status,
+`conversion_report.json`, and the exit code always agree. It also drives the `optimize`
+loop's target check. Any declared criterion enables the step automatically; a bare
+`ppa: {run_local_ppa: false}` with criteria declared is rejected as contradictory.
+
+**Standalone + iterate loop.** Every generated project ships a `make ppa` target and the
+`ppa` subcommand:
+
+```bash
+c2hlsc_agent ppa --project <dir> --node sky130hd --min-slack 0.5   # ns
+c2hlsc_agent ppa --project <dir> --node asap7 --min-slack 50       # ps
+make ppa                                                           # baked criteria
+```
+
+Each run writes `ppa_report.json` with the measured metrics and the **slack headroom**
+(measured slack minus the floor) — the iteration budget you can spend on functionality or
+frequency without dropping below the floor. The QoR optimizer surfaces that headroom in
+its candidate prompts so it spends, never overspends, the budget.
 
 Outputs, per run: `qor_report.json` (baseline, every candidate's metrics/status/target
 gaps, per-round trajectory, delta), `qor_report.md`, and `qor_table.tex` — a booktabs
@@ -620,14 +824,36 @@ VITIS_HLS_ROOT="/path/to/Vitis_HLS/2024.2" \
   --out build/vector_add
 ```
 
-If the settings script does not put `vitis_hls` on `PATH`, pass the binary directly:
+The runner accepts both AMD command-line generations: current Unified IDE
+`vitis-run --mode hls --tcl ...` and legacy `vitis_hls -f ...`. If the settings script
+does not put either launcher on `PATH`, pass the binary directly:
 
 ```bash
-VITIS_HLS_BIN="/path/to/Vitis_HLS/2024.2/bin/vitis_hls" \
+VITIS_HLS_BIN="/path/to/Vitis/2025.2/bin/vitis-run" \
   bash scripts/run_vitis_linux.sh \
   --config examples/vector_add/config.yaml \
   --out build/vector_add
 ```
+
+After a native run, require fresh Vitis evidence before treating the result as functional
+RTL/QoR evidence:
+
+```bash
+python -m c2hlsc_agent.vitis_evidence build/vector_add
+```
+
+This checks the same phase ledger used by the Bambu path, plus Vitis-specific proof: a
+fresh `csynth.xml`, emitted Verilog/SystemVerilog, and an explicit C/RTL CoSim PASS marker.
+It writes `vitis_evidence.json` with report and RTL hashes and the parsed synthesis metrics.
+
+### GitHub native Vitis verification
+
+`.github/workflows/vitis-verify.yml` runs the full shift-left → CSim → CSynth → CoSim
+ladder on a licensed self-hosted Linux/x64 runner and uploads the evidence bundle. Register
+the runner with labels `self-hosted`, `linux`, `x64`, and `vitis-hls`; set repository
+variable `C2HLSC_VITIS_CI=true` to enable push runs. Optional variables `VITIS_SETTINGS`
+and `VITIS_HLS_BIN` select the installation. Without that explicitly configured runner,
+the Vitis job is skipped rather than claiming a hosted unit-test run is RTL sign-off.
 
 There is also a Python wrapper that can read the binary path from a local text
 file. Put your path in `vitis_hls_bin_path.txt`, then run the wrapper:

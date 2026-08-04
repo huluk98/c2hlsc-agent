@@ -114,7 +114,10 @@ def _parse_arg(raw: str, metadata: ArgumentConfig | None = None) -> FunctionArg:
     type_tokens = [t for t in tokens[:-1] if t not in {"*", "restrict", "__restrict", "__restrict__"}]
     c_type = " ".join(type_tokens).strip()
     c_type = re.sub(r"\s+", " ", c_type)
-    is_const = "const" in c_type.split()
+    # For a pointer, only const before the first `*` qualifies the pointee.
+    # A top-level qualifier (`int * const p`) does not make `*p` immutable.
+    pointee_type = raw_no_arrays.split("*", 1)[0] if pointer_depth else c_type
+    is_const = "const" in pointee_type.split()
     if metadata is None:
         metadata = ArgumentConfig()
     direction = metadata.direction or ("input" if is_const or pointer_depth == 0 and not array_dims else "inout")
@@ -170,16 +173,35 @@ def _infer_pointer_directions(function: FunctionInfo, config: AgentConfig) -> No
         if arg.name in config.arguments and config.arguments[arg.name].direction:
             continue
         name = re.escape(arg.name)
-        write_pattern = rf"(?:\*\s*{name}|{name}\s*\[[^\]]+\])\s*(?:=(?!=)|\+=|-=|\*=|/=|%=|&=|\|=|\^=|<<=|>>=|\+\+|--)"
+        assign_ops = r"(?:=(?!=)|\+=|-=|\*=|/=|%=|&=|\|=|\^=|<<=|>>=|\+\+|--)"
+        # Recognize every shape a write can take. The original pattern only matched
+        # `*p =` and a SINGLE `p[i] =`, so writes through a second subscript
+        # (`p[i][j] =` -- the common HLS kernel shape), a struct member (`p->v =`),
+        # or offset arithmetic (`*(p + i) =`) all read as "no write" and the argument
+        # was classified `input`, which excludes it from every comparison.
+        write_pattern = (
+            rf"(?:"
+            rf"\*\s*{name}"                          # *p =
+            rf"|\*\s*\(\s*{name}\s*[+-][^)]*\)"      # *(p + i) =
+            rf"|{name}(?:\s*\[[^\]]*\])+"            # p[i] = / p[i][j] =
+            rf"|{name}\s*(?:->|\.)\s*\w+"            # p->v = / p.v =
+            rf")\s*{assign_ops}"
+        )
         writes = bool(re.search(write_pattern, body))
         body_without_lhs_writes = re.sub(write_pattern, "", body)
-        reads = bool(re.search(rf"(?:\*\s*{name}|{name}\s*\[[^\]]+\]|{name}\s*\+)", body_without_lhs_writes))
-        if writes and reads:
+        reads = bool(re.search(rf"(?:\*\s*{name}|{name}\s*\[[^\]]*\]|{name}\s*\+)", body_without_lhs_writes))
+        if arg.is_const:
+            # const-qualified: cannot be written through, so `input` is provable.
+            arg.direction = "input"
+        elif writes and reads:
             arg.direction = "inout"
         elif writes:
             arg.direction = "output"
         else:
-            arg.direction = "input"
+            # Only const qualification proves that a pointer is input-only. A mutable
+            # pointer that appears read-only here may still be changed by generated HLS
+            # code; keep it observable so equivalence checks catch that mutation.
+            arg.direction = "inout"
 
 
 def _unsupported(function: FunctionInfo) -> list[Diagnostic]:

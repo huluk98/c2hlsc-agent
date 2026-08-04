@@ -10,7 +10,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from c2hlsc_agent.analyze import analyze_source
 from c2hlsc_agent.config import AgentConfig, ArgumentConfig
 from c2hlsc_agent.convert import generate_hls_sources
-from c2hlsc_agent.hls_project import render_run_csim, render_run_cosim, render_run_csynth, render_run_hls, write_project
+from c2hlsc_agent.hls_project import (
+    render_makefile,
+    render_run_all,
+    render_run_csim,
+    render_run_cosim,
+    render_run_csynth,
+    render_run_hls,
+    write_project,
+)
 from c2hlsc_agent.testgen import generate_testbench
 
 
@@ -78,14 +86,23 @@ class ConvertTests(unittest.TestCase):
         self.assertIn("cosim_design -tool xsim -rtl verilog", cosim)
         self.assertNotIn("csynth_design", cosim)
 
+    def test_generated_helpers_use_unified_vitis_native_command(self):
+        _analysis, cfg = self._analysis()
+        cfg.vitis_bin = "/opt/AMD/Vitis/bin/vitis-run"
+        expected = "/opt/AMD/Vitis/bin/vitis-run --mode hls --tcl run_hls.tcl"
+        self.assertIn(expected, render_makefile(cfg))
+        self.assertIn(expected, render_run_all(cfg))
+
     def test_generated_testbench_compares_output_arrays(self):
         analysis, cfg = self._analysis()
         testbench = generate_testbench(analysis, cfg)
-        self.assertIn("// - out: direction=output length=4 compare first clamp(n, 4) elements", testbench)
-        self.assertIn("const int compare_len_out = clamp_count(static_cast<long long>(n), 4);", testbench)
+        self.assertIn("// - out: direction=output length=4 compare all 4 elements; active prefix is clamp(n, 4)", testbench)
+        self.assertIn("const int compare_len_out = 4;", testbench)
+        self.assertIn("const int active_len_out = clamp_count(static_cast<long long>(n), 4);", testbench)
         self.assertIn("for (int i = 0; i < compare_len_out; ++i)", testbench)
         self.assertIn("if (!values_equal(ref_out[i], hls_out[i]))", testbench)
         self.assertIn('<< " compare_len=" << compare_len_out', testbench)
+        self.assertIn('<< " active_len=" << active_len_out', testbench)
         self.assertIn('<< " n=" << static_cast<long long>(n)', testbench)
         self.assertIn('"Mismatch test=" << test_idx << " arg=out index="', testbench)
 
@@ -96,6 +113,44 @@ class ConvertTests(unittest.TestCase):
         self.assertIn("output_sentinel<int32_t>(test_idx, i)", testbench)
         self.assertIn("if (std::numeric_limits<T>::is_integer)", testbench)
         self.assertNotIn("if constexpr", testbench)
+
+    def test_generated_testbench_bounds_unconfigured_length_from_pointer_capacity(self):
+        analysis, cfg = self._analysis()
+        length = next(arg for arg in analysis.function.args if arg.name == "n")
+        length.scalar_range = None
+
+        testbench = generate_testbench(analysis, cfg)
+
+        self.assertIn("int n = bounded_scalar<int>(test_idx, rng, 0LL, 4LL);", testbench)
+        self.assertIn("// - n: inferred scalar range=[0, 4] from related pointer capacity", testbench)
+
+    def test_explicit_scalar_range_wins_over_inferred_pointer_capacity(self):
+        analysis, cfg = self._analysis()
+        length = next(arg for arg in analysis.function.args if arg.name == "n")
+        length.scalar_range = (1, 2)
+
+        testbench = generate_testbench(analysis, cfg)
+
+        self.assertIn("int n = bounded_scalar<int>(test_idx, rng, 1LL, 2LL);", testbench)
+
+    @unittest.skipUnless(shutil.which("g++") and shutil.which("make"), "g++ and make are required")
+    def test_generated_testbench_rejects_writes_past_active_prefix(self):
+        analysis, cfg = self._analysis()
+        generated = generate_hls_sources(analysis, cfg)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        project = Path(tmp.name) / "project"
+        write_project(project, analysis, generated, cfg)
+
+        source_path = project / "src" / "hls_top.cpp"
+        source = source_path.read_text(encoding="utf-8")
+        source_path.write_text(source.replace("i < n", "i < 4"), encoding="utf-8")
+
+        failing = subprocess.run(["make", "-C", str(project), "test"], text=True, capture_output=True)
+        output = failing.stdout + failing.stderr
+        self.assertNotEqual(failing.returncode, 0, output)
+        self.assertIn("Mismatch test=0 arg=out", output)
+        self.assertIn("active_len=0", output)
 
     @unittest.skipUnless(shutil.which("g++") and shutil.which("make"), "g++ and make are required")
     def test_generated_testbench_passes_and_rejects_mutated_hls(self):
