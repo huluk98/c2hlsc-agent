@@ -17,13 +17,13 @@ Branch: `claude/c2hlsc-agent-rtllmv2-f7apxo`
 | `3ed76e6` | Harness skeleton: `rtllm_bench.py`, `rtllm_agent.py`, `run_rtllm_v2.py`, tests, docs |
 | `9d8759f` | First full 50-design run. **Its headline numbers are superseded** — see §9 |
 | `eea70f4` | Correctness fixes: oracle-bypass gate, LLM sandboxing, empty-stub floor, 14 review findings |
-
-**Uncommitted in the working tree**: the `--external-rtl` comparison mode
-(`c2hlsc_agent/rtllm_bench.py`, `scripts/run_rtllm_v2.py`). It is implemented and working —
-the GPT-3.5/GPT-4 numbers in §8 were produced with it — but it was still being reviewed when the
-session ended. Commit it when you are satisfied.
+| `e48a7ad` | `--external-rtl` comparison mode + this handoff |
+| `+1` | `scripts/triage_rtllm_run.py` and §6 below |
 
 Test suite: `python -m pytest tests -q` → **377 passed, 15 subtests passed**.
+
+The one thing still outstanding: `rtllm_v2_results/` in the repo holds the superseded first-run
+numbers. Regenerate it from your own run before quoting anything out of it (§10, item 1).
 
 ---
 
@@ -64,7 +64,7 @@ then OpenAI.
 
 The `claude-cli` backend is sandboxed by the harness: file/shell/network tools disallowed, plan
 permission mode, and a fresh empty working directory that is deleted after each call. This is
-load-bearing — see §7.
+load-bearing — see §8.
 
 ---
 
@@ -103,9 +103,48 @@ If `--empty-baseline` is not 4/50, your oracle is not behaving as measured — d
 
 ---
 
-## 4. The four run modes
+## 4. The whole sequence, end to end
 
-### 4a. Reference (ceiling) — seconds
+If you only read one section, read this one. Copy-paste, in order:
+
+```bash
+export RTLLM_ROOT=~/RTLLM
+
+# 1. Calibrate: ceiling and floor. Seconds. MUST give 47/50 and 4/50 (§3).
+python3 scripts/run_rtllm_v2.py --benchmark $RTLLM_ROOT --reference \
+  --out-dir runs/reference --workers 8
+python3 scripts/run_rtllm_v2.py --benchmark $RTLLM_ROOT --empty-baseline \
+  --out-dir runs/empty --workers 8
+
+# 2. Smoke test three designs before spending 40 minutes. ~2-4 min.
+python3 scripts/run_rtllm_v2.py --benchmark $RTLLM_ROOT \
+  --out-dir runs/smoke --designs adder_8bit pulse_detect fsm \
+  --workers 3 --max-repair-rounds 1 --llm-backend claude-cli --llm-model opus --verbose
+
+# 3. The real sweep. ~30-45 min at --workers 8.
+python3 scripts/run_rtllm_v2.py --benchmark $RTLLM_ROOT \
+  --out-dir runs/agent --workers 8 --max-repair-rounds 2 \
+  --llm-backend claude-cli --llm-model opus --verbose
+
+# 4. Triage it. This is what turns a raw score into a defensible one (§6).
+python3 scripts/triage_rtllm_run.py \
+  --run runs/agent --reference runs/reference --empty runs/empty --markdown
+
+# 5. Optional: compare against the models the benchmark ships.
+python3 scripts/run_rtllm_v2.py --benchmark $RTLLM_ROOT \
+  --external-rtl $RTLLM_ROOT/_chatgpt4 --label gpt-4 --out-dir runs/gpt4 --workers 8
+python3 scripts/run_rtllm_v2.py --benchmark $RTLLM_ROOT \
+  --external-rtl $RTLLM_ROOT/_chatgpt35 --label gpt-3.5 --out-dir runs/gpt35 --workers 8
+```
+
+Steps 1 and 4 are not optional if you intend to quote a number. Step 1 tells you whether your
+environment is sane; step 4 tells you which designs your score is actually made of.
+
+---
+
+## 4b. The run modes in detail
+
+### Reference (ceiling) — seconds
 
 Scores the benchmark's own `verified_*.v` RTL. Tells you the maximum any model can achieve under
 your simulator.
@@ -115,7 +154,7 @@ python3 scripts/run_rtllm_v2.py --benchmark $RTLLM_ROOT --reference \
   --out-dir runs/reference --workers 8
 ```
 
-### 4b. Empty baseline (floor) — seconds
+### Empty baseline (floor) — seconds
 
 Scores a port-only module with **no logic**. Any design it passes has a vacuous oracle, and that
 design's score means nothing for any model.
@@ -125,7 +164,7 @@ python3 scripts/run_rtllm_v2.py --benchmark $RTLLM_ROOT --empty-baseline \
   --out-dir runs/empty --workers 8
 ```
 
-### 4c. Agent run (the actual benchmark) — ~30–45 min at `--workers 8`
+### Agent run (the actual benchmark) — ~30–45 min at `--workers 8`
 
 Natural-language spec → `rtl_planner` → `rtl_generator` → verifier → `failure_analyst` →
 `rtl_repair_agent`, looping until pass or `--max-repair-rounds` is spent.
@@ -164,7 +203,7 @@ Useful variants:
 `--workers` is network-bound, not CPU-bound; 8 parallel CLI agents ran clean here with no rate
 limiting. Ctrl-C once stops scheduling new designs and still writes the reports; twice aborts.
 
-### 4d. External RTL (comparison against other models) — seconds
+### External RTL (comparison against other models) — seconds
 
 Scores pre-generated RTL through the identical pipeline. The benchmark ships GPT-3.5 and GPT-4
 generations (5 trials × 29 designs each), which is the only true apples-to-apples comparison
@@ -214,7 +253,72 @@ Also distinguish, and never conflate:
 
 ---
 
-## 6. Failure taxonomy
+## 6. Calibrate and triage — the step that makes your outputs trustworthy
+
+A raw RTLLM score mixes four different things together. Only two of them say anything about your
+RTL generator. Run the triage after every sweep:
+
+```bash
+python3 scripts/triage_rtllm_run.py \
+  --run runs/agent_opus --reference runs/reference --empty runs/empty
+```
+
+Add `--markdown` for tables you can paste into a report, or `--json` for the raw buckets.
+
+It sorts every design into one of five buckets, using three facts: does the empty stub pass it, does
+the reference RTL pass it, do you pass it.
+
+| bucket | what it means | what to do |
+| --- | --- | --- |
+| **free** — empty stub passes | The testbench is vacuous; a module with no logic scores | Exclude. A pass here is not evidence |
+| **unscorable** — neither reference nor you pass | No RTL is known to satisfy this testbench under iverilog | Exclude. Failing it is not your defect |
+| **reference wrong** — you pass, reference fails | The shipped `verified_*.v` is wrong but the testbench *is* satisfiable | **Count it. This is a win over the benchmark** |
+| **passed** | Reference passes, empty fails, you pass | The score |
+| **REAL FAILURE** | Reference passes, empty fails, you fail | The only designs worth debugging |
+
+The first two buckets are noise; the last three are the **signal basis**, and that is the
+denominator to quote.
+
+Measured on the run in §9:
+
+```
+free (empty stub passes -- vacuous oracle)                   4  comparator_3bit, comparator_4bit, sequence_detector, square_wave
+unscorable (neither reference nor you pass)                  1  ring_counter
+reference wrong (you pass a testbench the reference fails)   2  clkgenerator, radix2_div
+real signal -- passed                                       42
+REAL FAILURE                                                 1  serial2parallel
+
+signal basis: 45/50 designs (5 excluded as uninformative)
+functional pass, signal basis: 44/45 (97.8%)
+first-round pass (no repair):   30/45 (66.7%)
+lifted by the repair loop:      14
+```
+
+### Why this differs from `report.json → adjusted`
+
+`adjusted` (42/43) excludes all three `KNOWN_ORACLE_ISSUES`, which drops `clkgenerator` and
+`radix2_div` — two designs you *passed* and the reference failed. The triage keeps them, because a
+satisfiable testbench is a real test even when the shipped reference RTL is wrong. Both are
+defensible; **44/45 is the one that does not throw away wins over the benchmark**, and 42/43 is the
+more conservative. Quote whichever you like, but say which, and never quote the bare 50-design
+number.
+
+### The four kinds of issue, kept separate
+
+1. **Benchmark defects** (the *free*, *unscorable* and *reference wrong* buckets) — properties of
+   RTLLM as shipped. They are stable across runs: calibrate once with step 1 of §4, subtract forever.
+2. **Simulator differences** — iverilog vs the paper's VCS, plus the two testbench shims (§10).
+   These matter when comparing your numbers to *published* ones, not when comparing two models on
+   your own machine.
+3. **Harness bugs** — these make measurements wrong rather than models wrong. Three were found and
+   fixed here (uncopied support files producing false `missing_golden_data`, the `$display` oracle
+   bypass, the backend reading the testbench off disk). §3 exists to catch a recurrence.
+4. **Model failures** — the *REAL FAILURE* bucket. The only category that says anything about the
+   RTL generator, and the only one worth your debugging time.
+
+---
+
+## 7. Failure taxonomy
 
 `failure_family` on every failing round:
 
@@ -233,7 +337,7 @@ Also distinguish, and never conflate:
 
 ---
 
-## 7. Benchmark integrity — what the harness enforces and why
+## 8. Benchmark integrity — what the harness enforces and why
 
 1. **The model never sees the golden RTL or the testbench source.** It gets the natural-language
    `design_description.txt`, its own previous RTL, and tool output from its own failing run.
@@ -254,7 +358,7 @@ Also distinguish, and never conflate:
 
 ---
 
-## 8. Measured results
+## 9. Measured results
 
 All numbers below are from this harness: iverilog 12.0 `-g2012`, identical oracle, identical shims.
 
@@ -295,7 +399,7 @@ matches the benchmark's own reference RTL on this subset.
 The illegal-system-task gate rejected **0 samples** in both GPT sets, so it costs them nothing and
 the comparison is not distorted by it.
 
-Reproduce the GPT rows with the §4d commands.
+Reproduce the GPT rows with the §4b External RTL commands.
 
 **Fairness caveats — state these whenever you quote the comparison:**
 
@@ -307,7 +411,7 @@ Reproduce the GPT rows with the §4d commands.
 
 ---
 
-## 9. Open items and known limits
+## 10. Open items and known limits
 
 1. **`rtllm_v2_results/` in the repo is stale.** It holds the superseded first-run numbers (43/50)
    and, in the older `report.md` text, a claim that the benchmark's golden data files are missing.
@@ -339,7 +443,7 @@ deliberately wrong RTL so a shim cannot manufacture a pass. Disable with `--no-s
 
 ---
 
-## 10. Exit codes
+## 11. Exit codes
 
 | code | meaning |
 | --- | --- |
