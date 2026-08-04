@@ -73,7 +73,7 @@ constructs; the default (`--keep-going`) matches CHStone's own Vitis flow, which
 | --- | --- |
 | native self-check (calibration) | **12/12 pass** |
 | deterministic converter, **with repair** | **0/12** |
-| LLM generator, **with repair** | **2/4** (`dfadd`, `dfmul` pass; `mips`, `sha` fail) |
+| LLM generator, **with repair** | **6/12** (`aes`, `dfadd`, `dfdiv`, `dfmul`, `dfsin`, `gsm`) |
 | Vitis CSim / CSynth / CoSim | not attempted (no `vitis_hls`) |
 
 **Run the repair loop.** `--auto-repair --max-iterations N` is independent of `--use-llm`:
@@ -84,11 +84,18 @@ of this harness gated `--auto-repair` behind `--use-llm`, so the first determini
 published here measured single-shot generation and called it the agent. Both numbers above
 now include repair.
 
-The LLM generator is the headline: it clears a bar the deterministic converter cannot reach
-at all. On `dfmul` it emitted a self-contained 566-line translation — the SoftFloat call
-graph inlined into a namespace, `printf` guarded behind `#ifndef __SYNTHESIS__`, the
-256-entry `countLeadingZeros32` table replaced by a branchless cascade — and passed host
-equivalence with `all 100 tests passed`. Each run took 9–13 minutes per benchmark.
+The LLM generator is the headline: **6/12**, against 0/12 for the deterministic converter
+under identical repair settings. On `dfmul` it emitted a self-contained 566-line translation
+— the SoftFloat call graph inlined into a namespace, `printf` guarded behind
+`#ifndef __SYNTHESIS__`, the 256-entry `countLeadingZeros32` table replaced by a branchless
+cascade — and passed with `all 100 tests passed`. `gsm` (714 lines) and `aes` (659 lines)
+likewise pass, each after 2 repair iterations. Runs take 8–20 minutes per benchmark.
+
+Read the 6/12 against what the flow can actually score. Four benchmarks
+(`adpcm`, `blowfish`, `jpeg`, `motion`) fail because CHStone's C is not valid C++ and never
+reach the model's output, and one (`mips`) fails on the golden-vs-candidate symbol
+collision. **On the 7 benchmarks where the flow itself works, the LLM generator passes 6**
+— `sha` is the single genuine generation failure.
 
 The two LLM failures are **not** wrong logic. Both are link-time symbol collisions: the
 golden reference and the generated HLS-C are compiled into one binary, and both define the
@@ -116,6 +123,10 @@ definitions"* — and the wall moves. The 0/12 is now **three distinct causes**:
 | `golden_candidate_symbol_collision` | 5 | `aes`, `dfadd`, `dfdiv`, `dfmul`, `dfsin` | the equivalence harness |
 | `original_c_not_valid_cpp` | 4 | `adpcm`, `blowfish`, `jpeg`, `motion` | the C-vs-C++ flow |
 | `generated_hlsc_does_not_compile` | 3 | `gsm`, `mips`, `sha` | the converter |
+
+Note which five the symbol collision blocks: `aes`, `dfadd`, `dfdiv`, `dfmul`, `dfsin` are
+exactly the five the LLM generator goes on to pass. It sidesteps the collision by putting
+its translation in a namespace — something nothing in the prompt asks it to do.
 
 Only the last three are the converter's reach. The other nine are properties of the flow:
 
