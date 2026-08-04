@@ -84,6 +84,7 @@ class BenchmarkResult:
     duration_s: float = 0.0
     project_dir: str | None = None
     vitis_followup_cmd: str | None = None
+    notes: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, object]:
         payload = dict(self.__dict__)
@@ -186,12 +187,22 @@ def run_native(bench: ChstoneBenchmark, workdir: Path, timeout: int) -> Benchmar
 # --------------------------------------------------------------------------- #
 
 
-def _classify_conversion(report: dict, log_text: str) -> tuple[str, str | None]:
-    """Map a conversion_report.json onto (rung reached, failure family)."""
+#: The generated testbench prints this on success.
+_EQUIV_PASS_RE = re.compile(r"all\s+\d+\s+tests passed", re.I)
 
+
+def _classify_conversion(report: dict, log_text: str) -> tuple[str, str | None]:
+    """Map the host-equivalence log (authoritative) + conversion_report onto (rung, family).
+
+    The log wins over conversion_report.json's phase field: the report records the phase as
+    the converter saw it, before sibling sources were staged, so it can be stale.
+    """
+
+    if _EQUIV_PASS_RE.search(log_text):
+        return "host_equivalence", None
     phases = report.get("phases") or {}
     software = str(phases.get("software_equivalence", "")).lower()
-    if software == "pass":
+    if software == "pass" and "error:" not in log_text.lower():
         return "host_equivalence", None
     assessment = report.get("multi_agent") or report.get("assessment") or {}
     family = assessment.get("failure_family") if isinstance(assessment, dict) else None
@@ -266,6 +277,27 @@ def run_agent(bench: ChstoneBenchmark, out_dir: Path, args: argparse.Namespace) 
         result.evidence = str(exc)
         result.duration_s = round(time.time() - started, 2)
         return result
+
+    # CHStone tops #include their sibling sources ("softfloat.c", "softfloat-macros", ...).
+    # The converter copies only --input into the project as input.c, so the GOLDEN reference
+    # cannot compile until those siblings sit next to it. Stage them and re-run host
+    # equivalence, otherwise a missing-include error in the reference is misread as a defect
+    # in the generated HLS-C.
+    if project.exists():
+        for sibling in sorted(staged.iterdir()):
+            if not sibling.is_file() or sibling.name in {top_copy.name, "hls.tcl"}:
+                continue
+            target = project / sibling.name
+            if not target.exists():
+                shutil.copy(sibling, target)
+        try:
+            retest = subprocess.run(["make", "test"], capture_output=True, text=True,
+                                    timeout=args.timeout, cwd=str(project))
+            combined = ((retest.stdout or "") + (retest.stderr or ""))
+            (project / "software_equivalence.log").write_text(combined, encoding="utf-8")
+            result.notes.append("host equivalence re-run after staging sibling sources")
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            combined += f"\nmake test after staging siblings failed: {exc}"
 
     report_path = project / "conversion_report.json"
     equivalence_log = project / "software_equivalence.log"
