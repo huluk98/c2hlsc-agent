@@ -108,4 +108,10 @@ ablations; failure modes and limitations; artifacts and reproducibility.
 Separate author claims from demonstrated evidence and mark every unreported field.
 ```
 
+Create one row per source with this evidence-ledger template:
+
+| Source/version/date | Source task | Target artifact | Dataset or cases | Transformations | Tool/device/clock | Correctness gates reported | QoR metrics | Evidence inspected | Author claims | Missing or unresolved evidence |
+|---|---|---|---|---|---|---|---|---|---|---|
+| Fill from the source | Fill | Fill | Fill | Fill | Fill or unreported | Fill or unreported | Fill or unreported | Exact pages/tables/artifacts | Keep separate | State what still needs verification |
+
 No focus string can guarantee complete ingestion of a research field. Maintain an evidence ledger with paper/version/date, exact supported claim, evaluation context, and unresolved conflict; refresh searches and vendor documentation for time-sensitive conclusions.

@@ -169,6 +169,62 @@
 
     .library-shell { display: grid; grid-template-columns: minmax(16rem, 0.72fr) minmax(0, 1.28fr); gap: 1rem; margin-top: 1.5rem; }
     .library-card { min-width: 0; padding: 1.25rem; border: 1px solid var(--line); border-radius: 1.35rem; background: var(--surface-solid); box-shadow: var(--shadow); }
+    .reading-route { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 16rem), 1fr)); gap: 0.75rem; margin-top: 1.3rem; }
+    .reading-step { padding: 1rem; border: 1px solid var(--line); border-radius: 1rem; background: rgba(255, 255, 255, 0.72); box-shadow: var(--shadow-soft); }
+    .reading-step h3 { margin: 0.35rem 0 0.45rem; font-size: 1rem; }
+    .reading-step p { margin: 0; color: var(--muted); font-size: 0.88rem; }
+    .route-label { color: var(--purple); font-size: 0.7rem; font-weight: 800; letter-spacing: 0.1em; text-transform: uppercase; }
+    .reading-coach { margin-bottom: 0.9rem; padding: 1rem; border: 1px solid rgba(99, 91, 255, 0.20); border-radius: 1rem; background: linear-gradient(145deg, rgba(99, 91, 255, 0.055), rgba(0, 166, 199, 0.035)); }
+    .coach-head { display: flex; justify-content: space-between; gap: 1rem; align-items: flex-start; }
+    .coach-badge { display: inline-block; margin-bottom: 0.35rem; color: var(--purple); font-size: 0.7rem; font-weight: 800; letter-spacing: 0.09em; text-transform: uppercase; }
+    .coach-controls { display: grid; flex: 0 0 min(100%, 15rem); gap: 0.3rem; }
+    .coach-controls label { color: var(--muted); font-size: 0.74rem; font-weight: 700; }
+    .coach-controls select { min-height: 44px; padding: 0.55rem 2rem 0.55rem 0.7rem; border: 1px solid var(--line); border-radius: 0.75rem; background: #fff; }
+    .coach-summary { margin: 0.7rem 0; color: var(--muted); font-size: 0.88rem; }
+    .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+    .coach-sync { margin: 0.8rem 0; padding: 0.8rem; border: 1px solid rgba(35, 105, 166, 0.18); border-radius: 0.85rem; background: rgba(242, 247, 251, 0.82); }
+    .coach-sync-head { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 0.5rem; align-items: center; }
+    .coach-sync-head h4 { margin: 0; font-size: 0.9rem; }
+    .coach-sync-state { padding: 0.2rem 0.48rem; border-radius: 999px; color: #8b5a00; background: #fff3cf; font-size: 0.68rem; font-weight: 800; text-transform: uppercase; }
+    .coach-sync-state.ready { color: #176144; background: #def5e9; }
+    .coach-sync-message { margin: 0.45rem 0 0.7rem; color: var(--muted); font-size: 0.78rem; }
+    .coach-sync fieldset { min-width: 0; margin: 0; padding: 0; border: 0; }
+    .coach-sync-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.55rem; }
+    .coach-sync label { display: grid; gap: 0.25rem; color: var(--muted); font-size: 0.72rem; font-weight: 700; }
+    .coach-sync input[type="text"], .coach-sync input[type="number"], .coach-sync select { width: 100%; min-height: 42px; padding: 0.5rem 0.6rem; border: 1px solid var(--line); border-radius: 0.65rem; color: var(--ink); background: #fff; }
+    .coach-sync-check { display: flex !important; grid-column: 1 / -1; grid-template-columns: auto 1fr; min-height: 40px; align-items: center; }
+    .coach-sync-check input { width: 1rem; height: 1rem; }
+    .coach-locators { display: grid; gap: 0.5rem; margin-top: 0.65rem; }
+    .coach-locator { display: grid; grid-template-columns: minmax(0, 1fr) minmax(7rem, 0.32fr) auto; gap: 0.5rem; align-items: end; }
+    .coach-locator .coach-sync-check { grid-column: auto; min-height: 42px; }
+    .coach-sync-actions, .coach-output-actions { display: flex; flex-wrap: wrap; gap: 0.6rem; align-items: center; margin-top: 0.7rem; }
+    .coach-sync-save-status, .coach-output-status { color: var(--muted); font-size: 0.76rem; }
+    .coach-steps { margin: 0.65rem 0 0.8rem; padding-left: 1.25rem; font-size: 0.88rem; }
+    .coach-resource-section { margin-top: 0.9rem; }
+    .coach-resource-section h4 { margin: 0 0 0.55rem; font-size: 0.86rem; }
+    .coach-resource-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.65rem; }
+    .coach-resource { min-width: 0; padding: 0.75rem; border: 1px solid rgba(10, 37, 64, 0.10); border-radius: 0.8rem; background: rgba(255, 255, 255, 0.84); }
+    .coach-resource-top { display: flex; flex-wrap: wrap; gap: 0.35rem; align-items: center; }
+    .coach-resource-kind { padding: 0.16rem 0.4rem; border-radius: 999px; color: var(--purple); background: rgba(99, 91, 255, 0.09); font-size: 0.64rem; font-weight: 800; letter-spacing: 0.06em; text-transform: uppercase; }
+    .coach-resource-stage { color: var(--muted); font-size: 0.7rem; font-weight: 700; }
+    .coach-resource h5 { margin: 0.45rem 0 0.35rem; font-size: 0.9rem; }
+    .coach-resource h5 a { color: var(--ink); text-underline-offset: 0.18em; }
+    .coach-resource p { margin: 0.32rem 0; color: var(--muted); font-size: 0.76rem; }
+    .coach-resource strong { color: var(--ink); }
+    .coach-resource-availability { padding-top: 0.35rem; border-top: 1px solid rgba(10, 37, 64, 0.08); }
+    .coach-resource-locator { color: #176144 !important; }
+    .coach-proof { display: grid; gap: 0.45rem; padding: 0.75rem; border-radius: 0.8rem; background: rgba(255, 255, 255, 0.78); font-size: 0.84rem; }
+    .coach-proof p { margin: 0; }
+    .coach-handoff { margin-top: 0.75rem; }
+    .coach-handoff summary { min-height: 44px; padding: 0.6rem 0; color: var(--ink); font-weight: 750; cursor: pointer; }
+    .coach-handoff p { color: var(--muted); font-size: 0.82rem; }
+    .coach-prompt { max-height: 15rem; margin: 0.6rem 0; font-size: 0.75rem; white-space: pre-wrap; }
+    .coach-copy-row { display: flex; flex-wrap: wrap; gap: 0.65rem; align-items: center; }
+    .coach-status { color: var(--muted); font-size: 0.8rem; }
+    .coach-output { margin-top: 0.9rem; padding: 0.8rem; border: 1px solid rgba(36, 122, 87, 0.18); border-radius: 0.85rem; background: rgba(245, 252, 248, 0.78); }
+    .coach-output h4 { margin: 0; font-size: 0.9rem; }
+    .coach-output p { margin: 0.35rem 0 0; color: var(--muted); font-size: 0.78rem; }
+    .coach-output pre { max-height: 18rem; margin-top: 0.65rem; font-size: 0.72rem; }
     .drop-zone { display: grid; place-items: center; min-height: 10.5rem; padding: 1.3rem; border: 1.5px dashed rgba(99, 91, 255, 0.38); border-radius: 1rem; background: linear-gradient(145deg, rgba(99, 91, 255, 0.06), rgba(0, 166, 199, 0.045)); text-align: center; transition: border-color 160ms ease, background 160ms ease, transform 160ms ease; }
     .drop-zone.dragover { border-color: var(--purple); background: rgba(99, 91, 255, 0.11); transform: scale(1.005); }
     .drop-zone strong { display: block; margin-bottom: 0.35rem; font-size: 1.05rem; }
@@ -232,6 +288,11 @@
       .concept-chain { grid-template-columns: 1fr; }
       .finish ul { columns: 1; }
       .pdf-viewer-head { display: block; }
+      .coach-head { display: grid; }
+      .coach-sync-grid { grid-template-columns: 1fr; }
+      .coach-locator { grid-template-columns: 1fr; }
+      .coach-locator .coach-sync-check { grid-column: 1; }
+      .coach-resource-list { grid-template-columns: 1fr; }
       .viewer-actions { justify-content: flex-start; margin-top: 0.8rem; }
       .viewer-frame, .viewer-frame iframe { min-height: 24rem; }
     }
@@ -258,7 +319,7 @@
     <div class="nav-inner shell">
       <a href="#map">Concept map</a>
       <a href="#plan">Three-day plan</a>
-      <a href="#library">PDF shelf</a>
+      <a href="#reading-route">Reading route</a>
       <a href="#lesson">Waveform lesson</a>
       <a href="#quiz">Quiz</a>
       <a href="#finish">Finish line</a>
@@ -284,7 +345,7 @@
     <section id="plan">
       <p class="eyebrow">18–24 focused hours</p>
       <h2>Your three-day route</h2>
-      <p class="section-intro">Use the local, manual, and external gates in the <a href="ordered_exercises.md">ordered exercise sheet</a>, with the supplied <a href="pdf_reading_map.md">PDF reading map</a>. Reading supports the work; the required output and its named gate establish each skill.</p>
+      <p class="section-intro">Use the local, manual, and external gates in the <a href="ordered_exercises.md">ordered exercise sheet</a>, following the <a href="#reading-route">just-in-time reading route</a> below. Reading supports the work; the required output and its named gate establish each skill.</p>
       <div class="day-grid">
         <article class="day-card" style="--accent:#2369a6">
           <span class="day-label">Day 1</span>
@@ -294,7 +355,7 @@
             <li>Truth tables, Boolean equations, gates</li>
             <li>Widths, signedness, combinational RTL, latches</li>
           </ul>
-          <div class="task"><input class="progress" id="d1-read" type="checkbox"><label for="d1-read">Complete exercise stages 1–4</label></div>
+          <div class="task"><input class="progress" id="d1-read" type="checkbox"><label for="d1-read">Read, produce, and pass stages 1-4</label></div>
           <div class="task"><input class="progress" id="d1-build" type="checkbox"><label for="d1-build">Pass exhaustive truth-table and lint gates</label></div>
         </article>
         <article class="day-card" style="--accent:#8b5a00">
@@ -305,7 +366,7 @@
             <li>Reset, FSMs, valid, ready, stalls</li>
             <li>Predict, then verify, the waveform below</li>
           </ul>
-          <div class="task"><input class="progress" id="d2-read" type="checkbox"><label for="d2-read">Complete exercise stages 5–8</label></div>
+          <div class="task"><input class="progress" id="d2-read" type="checkbox"><label for="d2-read">Read, produce, and pass stages 5-8</label></div>
           <div class="task"><input class="progress" id="d2-quiz" type="checkbox" disabled><label for="d2-quiz">Machine-set after scoring at least 8/10</label></div>
         </article>
         <article class="day-card" style="--accent:#247a57">
@@ -316,7 +377,7 @@
             <li>Lint, synthesis, and evidence limits</li>
             <li>Defined C → HLS-C → RTL validation ladder</li>
           </ul>
-          <div class="task"><input class="progress" id="d3-read" type="checkbox"><label for="d3-read">Run <code>make verify</code> and inspect evidence</label></div>
+          <div class="task"><input class="progress" id="d3-read" type="checkbox"><label for="d3-read">Complete stages 9-12; run <code>make verify</code></label></div>
           <div class="task"><input class="progress" id="d3-explain" type="checkbox"><label for="d3-explain">Fill the generation contract for a capstone</label></div>
         </article>
       </div>
@@ -325,7 +386,24 @@
     <section id="library" aria-labelledby="library-title">
       <p class="eyebrow">Private reading shelf</p>
       <h2 id="library-title">Keep the full PDF beside the lesson</h2>
-      <p class="section-intro">Add complete PDFs from your computer, select one, and read it without leaving the study flow. Files stay in this browser profile on this exact local address; nothing is sent to a server. Use the <a href="pdf_reading_map.md">PDF reading map</a> to connect each source to an exercise.</p>
+      <p class="section-intro">Add complete PDFs from your computer, select one, and read it without leaving the study flow. Files stay in this browser profile on this exact local address; nothing is sent to a server. The corrected <a href="pdf_reading_map.md">PDF reading workflow</a> now tells you what to read, understand, produce, and pass for every stage.</p>
+      <div class="reading-route" id="reading-route" aria-label="Three-day PDF reading route">
+        <article class="reading-step">
+          <span class="route-label">Day 1 / Stages 1-4</span>
+          <h3>Turn behavior into logic</h3>
+          <p>Pair Chapters 1-2 with the exact Chapter 4-5 HDL sections needed for each truth table, equation, gate, width, and RTL artifact.</p>
+        </article>
+        <article class="reading-step">
+          <span class="route-label">Day 2 / Stages 5-8</span>
+          <h3>Predict state at each edge</h3>
+          <p>Use Chapter 3 for state and FSMs, then use the local waveform lab and explicit transfer rule for pipeline and ready/valid reasoning.</p>
+        </article>
+        <article class="reading-step">
+          <span class="route-label">Day 3 / Stages 9-12</span>
+          <h3>Separate claims from evidence</h3>
+          <p>Combine HDL and synthesis reading, HLStrans pages 1-2, and exact vendor documentation without inventing unavailable HLS results.</p>
+        </article>
+      </div>
       <div class="library-shell">
         <div class="library-card">
           <div class="pdf-list-head">
@@ -343,7 +421,7 @@
               <input id="pdf-input" type="file" accept=".pdf,application/pdf" multiple hidden>
             </div>
           </div>
-          <p class="privacy-note"><strong>Private by design:</strong> PDFs are stored in IndexedDB for <code>127.0.0.1:4173</code>. Keep your originals—private browsing, clearing site data, storage pressure, or using a different hostname/port can remove or hide this shelf.</p>
+          <p class="privacy-note"><strong>Private by design:</strong> PDFs, source confirmation, and page locators are stored in IndexedDB for <code>127.0.0.1:4173</code>. Nothing is parsed or transmitted automatically. Keep your originals—private browsing, clearing site data, storage pressure, or using a different hostname/port can remove or hide this shelf.</p>
           <p class="pdf-status" id="pdf-status" role="status" aria-live="polite" aria-atomic="true">Ready for your first PDF.</p>
           <div class="pdf-list" id="pdf-list" aria-label="Saved PDF files" aria-busy="false">
             <p class="empty-state">No PDFs added yet.</p>
@@ -362,6 +440,115 @@
               <button class="button danger" id="remove-pdf" type="button" disabled>Remove</button>
             </div>
           </div>
+          <aside class="reading-coach" id="reading-coach" aria-labelledby="coach-title">
+            <div class="coach-head">
+              <div>
+                <span class="coach-badge" id="coach-badge">No PDF selected</span>
+                <h3 id="coach-title">Select a PDF to get a reading assignment</h3>
+              </div>
+              <div class="coach-controls">
+                <label for="coach-stage">Current study block</label>
+                <select id="coach-stage">
+                  <option value="day1">Day 1 / Stages 1-4</option>
+                  <option value="day2">Day 2 / Stages 5-8</option>
+                  <option value="day3">Day 3 / Stages 9-12</option>
+                </select>
+              </div>
+            </div>
+            <p class="coach-summary" id="coach-summary">The coach will match known source filenames locally. It never sends shelf PDFs to Codex or another server.</p>
+            <span class="sr-only" id="coach-announcement" role="status" aria-live="polite"></span>
+            <form class="coach-sync" id="coach-sync-form">
+              <div class="coach-sync-head">
+                <h4>Synchronize readings to this uploaded PDF</h4>
+                <span class="coach-sync-state" id="coach-sync-state">No PDF selected</span>
+              </div>
+              <p class="coach-sync-message" id="coach-sync-message">Select a PDF, then confirm its identity and two locators for the current day. Filename matching is only a suggestion.</p>
+              <fieldset id="coach-sync-fields" disabled>
+                <div class="coach-sync-grid">
+                  <label>Actual source type
+                    <select id="coach-source-type" required>
+                      <option value="">Choose after checking the PDF</option>
+                      <option value="textbook">Digital Design and Computer Architecture</option>
+                      <option value="hlstrans">HLStrans arXiv v3</option>
+                      <option value="unmapped">Other / uploaded source</option>
+                    </select>
+                  </label>
+                  <label>Exact title and author/organization
+                    <input id="coach-source-identity" type="text" autocomplete="off" placeholder="Copy from the title page" required>
+                  </label>
+                  <label>Edition, version, date, or identifier
+                    <input id="coach-source-version" type="text" autocomplete="off" placeholder="Example: arXiv:2507.04315v3" required>
+                  </label>
+                  <label>Page-number convention
+                    <input id="coach-page-convention" type="text" autocomplete="off" placeholder="Example: viewer p. 76 = printed p. 51" required>
+                  </label>
+                  <label class="coach-sync-check"><input id="coach-identity-confirmed" type="checkbox"> I checked these identity fields against the opened PDF.</label>
+                </div>
+                <div class="coach-locators">
+                  <div class="coach-locator">
+                    <label>Reading 1 locator in this PDF
+                      <input id="coach-locator-1" type="text" autocomplete="off" placeholder="Section/chapter title and printed page">
+                    </label>
+                    <label>PDF viewer page
+                      <input id="coach-locator-1-page" type="number" min="1" step="1" inputmode="numeric" placeholder="1">
+                    </label>
+                    <label class="coach-sync-check"><input id="coach-locator-1-confirmed" type="checkbox"> Checked</label>
+                  </div>
+                  <div class="coach-locator">
+                    <label>Reading 2 locator in this PDF
+                      <input id="coach-locator-2" type="text" autocomplete="off" placeholder="Section/chapter title and printed page">
+                    </label>
+                    <label>PDF viewer page
+                      <input id="coach-locator-2-page" type="number" min="1" step="1" inputmode="numeric" placeholder="1">
+                    </label>
+                    <label class="coach-sync-check"><input id="coach-locator-2-confirmed" type="checkbox"> Checked</label>
+                  </div>
+                </div>
+                <div class="coach-sync-actions">
+                  <button class="button secondary" id="save-coach-sync" type="submit">Save PDF synchronization</button>
+                  <span class="coach-sync-save-status" id="coach-sync-save-status" role="status" aria-live="polite"></span>
+                </div>
+              </fieldset>
+            </form>
+            <ol class="coach-steps" id="coach-steps">
+              <li>Add or select a PDF from your shelf.</li>
+              <li>Confirm the source identity before following its assignment.</li>
+            </ol>
+            <section class="coach-resource-section" aria-labelledby="coach-readings-title">
+              <h4 id="coach-readings-title">Two targeted readings</h4>
+              <div class="coach-resource-list" id="coach-readings">
+                <p class="empty-state">Select a PDF to map two readings.</p>
+              </div>
+            </section>
+            <section class="coach-resource-section" aria-labelledby="coach-runs-title">
+              <h4 id="coach-runs-title">Two video or guided runs</h4>
+              <div class="coach-resource-list" id="coach-runs">
+                <p class="empty-state">Select a PDF to load two trusted runs.</p>
+              </div>
+            </section>
+            <div class="coach-proof">
+              <p><strong>Produce:</strong> <span id="coach-artifact">A stage-specific artifact will appear here.</span></p>
+              <p><strong>Gate:</strong> <span id="coach-gate">A matching evidence gate will appear here.</span></p>
+            </div>
+            <section class="coach-output" aria-labelledby="coach-output-title">
+              <h4 id="coach-output-title">Ready-to-fill output worksheet</h4>
+              <p id="coach-output-help">Synchronize the PDF identity and both reading locators to unlock a worksheet tied to this PDF and day.</p>
+              <pre id="coach-output-worksheet">Select and synchronize a PDF to generate the worksheet.</pre>
+              <div class="coach-output-actions">
+                <button class="button secondary" id="copy-output-worksheet" type="button" disabled>Copy output worksheet</button>
+                <span class="coach-output-status" id="coach-output-status" role="status" aria-live="polite"></span>
+              </div>
+            </section>
+            <details class="coach-handoff">
+              <summary>Codex analysis request for this PDF</summary>
+              <p>The shelf remains private. For an unfamiliar source, attach the PDF separately in this conversation, then paste this request.</p>
+              <pre class="coach-prompt" id="coach-prompt">Select a PDF to generate the request.</pre>
+              <div class="coach-copy-row">
+                <button class="button secondary" id="copy-coach-prompt" type="button" disabled>Copy analysis request</button>
+                <span class="coach-status" id="coach-status" role="status" aria-live="polite"></span>
+              </div>
+            </details>
+          </aside>
           <div class="viewer-frame">
             <p class="viewer-placeholder" id="pdf-placeholder">Your selected PDF will open here. The browser’s native viewer provides page navigation, zoom, search, print, and download controls.</p>
             <iframe id="pdf-viewer" title="PDF reader" hidden></iframe>
@@ -431,7 +618,7 @@ end</code></pre>
             <a href="generation_contract.md">Precise code-generation input contract</a>
             <a href="ordered_exercises.md">Ordered exercises and mastery gates</a>
             <a href="fundamentals_field_guide.md">Fundamentals field guide and scope</a>
-            <a href="pdf_reading_map.md">PDF-to-exercise reading map</a>
+            <a href="pdf_reading_map.md">Full three-day PDF workflow</a>
             <a href="waveform_walkthrough.md">Full waveform walkthrough</a>
             <a href="cycle_table.md">Detailed cycle table</a>
             <a href="expected_waveform.json">Checked WaveDrom data (offline-safe)</a>
@@ -580,6 +767,7 @@ end</code></pre>
     const savedScore = localStorage.getItem("rtl-quiz-score");
     if (savedScore !== null) score.textContent = `${savedScore}/10 saved`;
   </script>
+  <script src="reading_coach.js" defer></script>
   <script src="pdf_shelf.js" defer></script>
 </body>
 </html>

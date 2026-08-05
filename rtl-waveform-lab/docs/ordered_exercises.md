@@ -135,7 +135,17 @@ Gate (**LOCAL**): lint and Yosys structural checks pass with no unintended latch
 
 ### Stage 11: C → HLS-C → RTL evidence ladder
 
-Input: a defined, tested reference-C function plus the HLS fields in `generation_contract.md`.
+#### Stage 11A: literature comprehension
+
+Input: HLStrans PDF pages 1-2 plus the paper-ingestion focus and evidence-ledger template in `fundamentals_field_guide.md`.
+
+Required output: one evidence-ledger row that separates the source task, target artifact, dataset-entry contents, five transformation categories, synthesis-derived annotations, author claims, evidence visible on pages 1-2, and evidence still unverified.
+
+Gate (**MANUAL**): the row is source-faithful and does not treat a paired testbench, synthesis annotation, or author performance claim as proof that a new candidate is correct or fairly compared.
+
+#### Stage 11B: actual HLS execution
+
+Input: a defined, tested reference-C function plus the HLS fields in `generation_contract.md` and documentation matching the installed HLS tool version.
 
 Required output:
 
@@ -148,7 +158,7 @@ C/RTL CoSim: generated RTL checked against transaction-level C behavior
 Implementation/STA: device mapping and timing evidence
 ```
 
-Gate (**EXTERNAL**): for a real HLS tool run, preserve the exact command, version, part, clock, tests, report, and CoSim result. This repository does not fabricate that evidence when Vitis HLS is absent.
+Gate (**EXTERNAL**): for a real HLS tool run, preserve the exact command, version, part, clock, directives, tests, report, and CoSim result. Literature comprehension cannot satisfy this gate, and this repository does not fabricate the evidence when Vitis HLS is absent.
 
 ### Stage 12: capstone
 

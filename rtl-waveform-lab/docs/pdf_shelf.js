@@ -19,6 +19,40 @@ const pdfPlaceholder = document.querySelector("#pdf-placeholder");
 const openPdf = document.querySelector("#open-pdf");
 const downloadPdf = document.querySelector("#download-pdf");
 const removePdf = document.querySelector("#remove-pdf");
+const coachStage = document.querySelector("#coach-stage");
+const coachBadge = document.querySelector("#coach-badge");
+const coachTitle = document.querySelector("#coach-title");
+const coachSummary = document.querySelector("#coach-summary");
+const coachAnnouncement = document.querySelector("#coach-announcement");
+const coachSteps = document.querySelector("#coach-steps");
+const coachReadings = document.querySelector("#coach-readings");
+const coachRuns = document.querySelector("#coach-runs");
+const coachSyncForm = document.querySelector("#coach-sync-form");
+const coachSyncFields = document.querySelector("#coach-sync-fields");
+const coachSyncState = document.querySelector("#coach-sync-state");
+const coachSyncMessage = document.querySelector("#coach-sync-message");
+const coachSourceType = document.querySelector("#coach-source-type");
+const coachSourceIdentity = document.querySelector("#coach-source-identity");
+const coachSourceVersion = document.querySelector("#coach-source-version");
+const coachPageConvention = document.querySelector("#coach-page-convention");
+const coachIdentityConfirmed = document.querySelector("#coach-identity-confirmed");
+const coachLocator1 = document.querySelector("#coach-locator-1");
+const coachLocator2 = document.querySelector("#coach-locator-2");
+const coachLocator1Page = document.querySelector("#coach-locator-1-page");
+const coachLocator2Page = document.querySelector("#coach-locator-2-page");
+const coachLocator1Confirmed = document.querySelector("#coach-locator-1-confirmed");
+const coachLocator2Confirmed = document.querySelector("#coach-locator-2-confirmed");
+const saveCoachSync = document.querySelector("#save-coach-sync");
+const coachSyncSaveStatus = document.querySelector("#coach-sync-save-status");
+const coachArtifact = document.querySelector("#coach-artifact");
+const coachGate = document.querySelector("#coach-gate");
+const coachOutputHelp = document.querySelector("#coach-output-help");
+const coachOutputWorksheet = document.querySelector("#coach-output-worksheet");
+const copyOutputWorksheet = document.querySelector("#copy-output-worksheet");
+const coachOutputStatus = document.querySelector("#coach-output-status");
+const coachPrompt = document.querySelector("#coach-prompt");
+const copyCoachPrompt = document.querySelector("#copy-coach-prompt");
+const coachStatus = document.querySelector("#coach-status");
 
 let pdfDbPromise;
 let activePdfUrl = "";
@@ -28,6 +62,327 @@ let selectionGeneration = 0;
 function setPdfStatus(message, isError = false) {
   pdfStatus.textContent = message;
   pdfStatus.setAttribute("role", isError ? "alert" : "status");
+}
+
+function setCoachStatus(message, isError = false) {
+  coachStatus.textContent = message;
+  coachStatus.setAttribute("role", isError ? "alert" : "status");
+}
+
+function setSyncSaveStatus(message, isError = false) {
+  coachSyncSaveStatus.textContent = message;
+  coachSyncSaveStatus.setAttribute("role", isError ? "alert" : "status");
+}
+
+function setOutputStatus(message, isError = false) {
+  coachOutputStatus.textContent = message;
+  coachOutputStatus.setAttribute("role", isError ? "alert" : "status");
+}
+
+function getStoredCoachProfile(metadata) {
+  const coach = window.RTL_READING_COACH;
+  const fallback = coach?.createEmptyProfile?.() || {
+    revision: 1,
+    sourceOverride: "",
+    identity: { titleAndAuthor: "", version: "", pageConvention: "", confirmed: false },
+    blocks: {
+      day1: { locators: [{ value: "", viewerPage: 0, confirmed: false }, { value: "", viewerPage: 0, confirmed: false }] },
+      day2: { locators: [{ value: "", viewerPage: 0, confirmed: false }, { value: "", viewerPage: 0, confirmed: false }] },
+      day3: { locators: [{ value: "", viewerPage: 0, confirmed: false }, { value: "", viewerPage: 0, confirmed: false }] }
+    }
+  };
+  return metadata?.coachProfile && typeof metadata.coachProfile === "object" ? metadata.coachProfile : fallback;
+}
+
+function profileForCoach(metadata) {
+  return { ...getStoredCoachProfile(metadata), pdfId: metadata?.id || "" };
+}
+
+function resetSyncControls() {
+  coachSyncFields.disabled = true;
+  saveCoachSync.disabled = true;
+  coachSyncState.textContent = "No PDF selected";
+  coachSyncState.classList.remove("ready");
+  coachSyncMessage.textContent = "Select a PDF, then confirm its identity and two locators for the current day. Filename matching is only a suggestion.";
+  coachSourceType.value = "";
+  coachSourceIdentity.value = "";
+  coachSourceVersion.value = "";
+  coachPageConvention.value = "";
+  coachIdentityConfirmed.checked = false;
+  coachLocator1.value = "";
+  coachLocator2.value = "";
+  coachLocator1Page.value = "";
+  coachLocator2Page.value = "";
+  coachLocator1Confirmed.checked = false;
+  coachLocator2Confirmed.checked = false;
+  setSyncSaveStatus("");
+}
+
+function renderSyncControls(metadata, assignment) {
+  if (!metadata || !assignment) {
+    resetSyncControls();
+    return;
+  }
+  const profile = getStoredCoachProfile(metadata);
+  const blockProfile = profile.blocks?.[coachStage.value] || {};
+  const locators = Array.isArray(blockProfile.locators) ? blockProfile.locators : [];
+  coachSyncFields.disabled = false;
+  saveCoachSync.disabled = false;
+  coachSyncState.textContent = assignment.sync.ready
+    ? "Sync ready"
+    : assignment.sync.identityConfirmed ? "Locators pending" : "Identity pending";
+  coachSyncState.classList.toggle("ready", assignment.sync.ready);
+  coachSyncMessage.textContent = assignment.sync.message;
+  coachSourceType.value = profile.sourceOverride || "";
+  coachSourceIdentity.value = profile.identity?.titleAndAuthor || "";
+  coachSourceVersion.value = profile.identity?.version || "";
+  coachPageConvention.value = profile.identity?.pageConvention || "";
+  coachIdentityConfirmed.checked = Boolean(profile.identity?.confirmed);
+  coachLocator1.value = locators[0]?.value || "";
+  coachLocator2.value = locators[1]?.value || "";
+  coachLocator1Page.value = locators[0]?.viewerPage || "";
+  coachLocator2Page.value = locators[1]?.viewerPage || "";
+  coachLocator1Confirmed.checked = Boolean(locators[0]?.confirmed);
+  coachLocator2Confirmed.checked = Boolean(locators[1]?.confirmed);
+}
+
+function copyProfileForEdit(profile) {
+  const coach = window.RTL_READING_COACH;
+  const copy = coach?.createEmptyProfile?.() || getStoredCoachProfile(null);
+  copy.revision = Number.isInteger(profile.revision) && profile.revision > 0 ? profile.revision : 1;
+  copy.sourceOverride = profile.sourceOverride || "";
+  copy.identity = {
+    titleAndAuthor: profile.identity?.titleAndAuthor || "",
+    version: profile.identity?.version || "",
+    pageConvention: profile.identity?.pageConvention || "",
+    confirmed: Boolean(profile.identity?.confirmed)
+  };
+  for (const block of ["day1", "day2", "day3"]) {
+    const locators = profile.blocks?.[block]?.locators;
+    copy.blocks[block] = {
+      locators: [0, 1].map((index) => ({
+        value: Array.isArray(locators) ? locators[index]?.value || "" : "",
+        viewerPage: Array.isArray(locators) && Number.isSafeInteger(Number(locators[index]?.viewerPage))
+          ? Math.max(0, Number(locators[index]?.viewerPage))
+          : 0,
+        confirmed: Boolean(Array.isArray(locators) && locators[index]?.confirmed)
+      }))
+    };
+  }
+  return copy;
+}
+
+function collectCoachProfile() {
+  const sourceOverride = coachSourceType.value;
+  const identity = {
+    titleAndAuthor: coachSourceIdentity.value.trim(),
+    version: coachSourceVersion.value.trim(),
+    pageConvention: coachPageConvention.value.trim(),
+    confirmed: coachIdentityConfirmed.checked
+  };
+  const locatorValues = [coachLocator1.value.trim(), coachLocator2.value.trim()];
+  const locatorPages = [Number(coachLocator1Page.value), Number(coachLocator2Page.value)];
+  const locatorChecks = [coachLocator1Confirmed.checked, coachLocator2Confirmed.checked];
+  if (!sourceOverride) throw new Error("Choose the actual source type after checking the opened PDF.");
+  if (identity.confirmed && (!identity.titleAndAuthor || !identity.version || !identity.pageConvention)) {
+    throw new Error("Fill the title/author, version, and page-number convention before confirming identity.");
+  }
+  locatorChecks.forEach((confirmed, index) => {
+    if (confirmed && !locatorValues[index]) throw new Error(`Enter Reading ${index + 1}'s locator before checking it.`);
+    if (confirmed && (!Number.isSafeInteger(locatorPages[index]) || locatorPages[index] < 1)) {
+      throw new Error(`Enter Reading ${index + 1}'s positive PDF viewer page before checking it.`);
+    }
+  });
+
+  const previous = getStoredCoachProfile(activePdfRecord);
+  const next = copyProfileForEdit(previous);
+  const previousIdentityKey = [
+    previous.sourceOverride || "",
+    previous.identity?.titleAndAuthor || "",
+    previous.identity?.version || "",
+    previous.identity?.pageConvention || ""
+  ].join("\n");
+  const nextIdentityKey = [sourceOverride, identity.titleAndAuthor, identity.version, identity.pageConvention].join("\n");
+  const hadSavedIdentity = Boolean(previous.sourceOverride || previous.identity?.titleAndAuthor || previous.identity?.version);
+  const identityChanged = hadSavedIdentity && previousIdentityKey !== nextIdentityKey;
+  if (identityChanged) {
+    next.revision += 1;
+    for (const block of ["day1", "day2", "day3"]) {
+      next.blocks[block].locators.forEach((locator) => {
+        locator.confirmed = false;
+      });
+    }
+  }
+  next.sourceOverride = sourceOverride;
+  next.identity = identity;
+  next.blocks[coachStage.value] = {
+    locators: locatorValues.map((value, index) => ({
+      value,
+      viewerPage: Number.isSafeInteger(locatorPages[index]) && locatorPages[index] > 0 ? locatorPages[index] : 0,
+      confirmed: identityChanged ? false : locatorChecks[index]
+    }))
+  };
+  return next;
+}
+
+function renderCoachPlaceholder(container, message) {
+  const placeholder = document.createElement("p");
+  placeholder.className = "empty-state";
+  placeholder.textContent = message;
+  container.replaceChildren(placeholder);
+}
+
+function appendCoachDetail(card, label, value, className = "") {
+  const row = document.createElement("p");
+  if (className) row.className = className;
+  const heading = document.createElement("strong");
+  heading.textContent = `${label}: `;
+  row.append(heading, document.createTextNode(value));
+  card.appendChild(row);
+}
+
+function jumpToPdfPage(requestedPage) {
+  const page = Number(requestedPage);
+  if (!activePdfRecord || !activePdfUrl || !Number.isSafeInteger(page) || page < 1) {
+    setPdfStatus("Select a synchronized PDF reading with a valid viewer page first.", true);
+    return;
+  }
+  pdfViewer.src = `${activePdfUrl}#page=${page}`;
+  const scrollBehavior = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth";
+  pdfViewer.scrollIntoView({ behavior: scrollBehavior, block: "start" });
+  setPdfStatus(`Requested PDF viewer page ${page} for ${activePdfRecord.name}.`);
+}
+
+function renderCoachResources(container, resources) {
+  container.replaceChildren();
+  resources.forEach((resource) => {
+    const card = document.createElement("article");
+    card.className = "coach-resource";
+
+    const top = document.createElement("div");
+    top.className = "coach-resource-top";
+    const kind = document.createElement("span");
+    kind.className = "coach-resource-kind";
+    kind.textContent = resource.kind;
+    const stage = document.createElement("span");
+    stage.className = "coach-resource-stage";
+    stage.textContent = resource.stage;
+    top.append(kind, stage);
+
+    const title = document.createElement("h5");
+    if (resource.url) {
+      const link = document.createElement("a");
+      link.href = resource.url;
+      link.textContent = resource.title;
+      if (resource.url.startsWith("https://")) {
+        link.target = "_blank";
+        link.rel = "noopener noreferrer";
+      }
+      title.appendChild(link);
+    } else {
+      title.textContent = resource.title;
+    }
+
+    const detail = document.createElement("p");
+    detail.textContent = resource.detail;
+    card.append(top, title, detail);
+    appendCoachDetail(card, "Produce", resource.artifact);
+    appendCoachDetail(card, "Gate", resource.gate);
+    appendCoachDetail(card, "Source", resource.source);
+    if (resource.kind === "reading") {
+      appendCoachDetail(
+        card,
+        resource.locatorConfirmed ? "Synced locator" : "Locator",
+        resource.locator,
+        resource.locatorConfirmed ? "coach-resource-locator" : ""
+      );
+      if (resource.locatorConfirmed && Number.isSafeInteger(resource.viewerPage) && resource.viewerPage > 0) {
+        const jumpButton = document.createElement("button");
+        jumpButton.type = "button";
+        jumpButton.className = "button secondary coach-jump";
+        jumpButton.textContent = `Jump to PDF page ${resource.viewerPage}`;
+        jumpButton.addEventListener("click", () => jumpToPdfPage(resource.viewerPage));
+        card.appendChild(jumpButton);
+      }
+    }
+    appendCoachDetail(card, "Availability", resource.availability, "coach-resource-availability");
+    container.appendChild(card);
+  });
+}
+
+function renderReadingCoach(metadata) {
+  setCoachStatus("");
+  setOutputStatus("");
+  coachAnnouncement.textContent = "";
+  if (!metadata) {
+    coachBadge.textContent = "No PDF selected";
+    coachTitle.textContent = "Select a PDF to get a reading assignment";
+    coachSummary.textContent = "The coach will match known source filenames locally. It never sends shelf PDFs to Codex or another server.";
+    coachSteps.replaceChildren();
+    [
+      "Add or select a PDF from your shelf.",
+      "Confirm the source identity before following its assignment."
+    ].forEach((step) => {
+      const item = document.createElement("li");
+      item.textContent = step;
+      coachSteps.appendChild(item);
+    });
+    renderCoachPlaceholder(coachReadings, "Select a PDF to map two readings.");
+    renderCoachPlaceholder(coachRuns, "Select a PDF to load two trusted runs.");
+    renderSyncControls(null, null);
+    coachArtifact.textContent = "A stage-specific artifact will appear here.";
+    coachGate.textContent = "A matching evidence gate will appear here.";
+    coachOutputHelp.textContent = "Synchronize the PDF identity and both reading locators to unlock a worksheet tied to this PDF and day.";
+    coachOutputWorksheet.textContent = "Select and synchronize a PDF to generate the worksheet.";
+    copyOutputWorksheet.disabled = true;
+    coachPrompt.textContent = "Select a PDF to generate the request.";
+    copyCoachPrompt.disabled = true;
+    return;
+  }
+
+  const coach = window.RTL_READING_COACH;
+  if (!coach) {
+    coachBadge.textContent = "Coach unavailable";
+    coachTitle.textContent = "Reload the study page";
+    coachSummary.textContent = "The reading-coach data did not load; your PDF remains stored and untouched.";
+    coachSteps.replaceChildren();
+    renderCoachPlaceholder(coachReadings, "Reading assignments are unavailable until the page reloads.");
+    renderCoachPlaceholder(coachRuns, "Video and guided-run assignments are unavailable until the page reloads.");
+    renderSyncControls(null, null);
+    coachArtifact.textContent = "Use the full PDF workflow manually.";
+    coachGate.textContent = "Do not mark a reading stage complete until the coach or map is available.";
+    coachOutputHelp.textContent = "The output worksheet is unavailable until the reading coach reloads.";
+    coachOutputWorksheet.textContent = "Reload the page to generate the worksheet.";
+    copyOutputWorksheet.disabled = true;
+    coachPrompt.textContent = "Reload to generate the analysis request.";
+    copyCoachPrompt.disabled = true;
+    return;
+  }
+
+  const profile = profileForCoach(metadata);
+  const assignment = coach.getReadingAssignment(metadata.name, coachStage.value, profile);
+  coachBadge.textContent = assignment.badge;
+  coachTitle.textContent = assignment.title;
+  coachSummary.textContent = assignment.summary;
+  coachSteps.replaceChildren();
+  assignment.steps.forEach((step) => {
+    const item = document.createElement("li");
+    item.textContent = step;
+    coachSteps.appendChild(item);
+  });
+  renderCoachResources(coachReadings, assignment.readings);
+  renderCoachResources(coachRuns, assignment.runs);
+  renderSyncControls(metadata, assignment);
+  coachArtifact.textContent = assignment.artifact;
+  coachGate.textContent = assignment.gate;
+  coachOutputHelp.textContent = assignment.sync.ready
+    ? "This worksheet is tied to the selected PDF record, identity revision, day, two locators, and two trusted runs."
+    : "SYNC PENDING: save a learner-confirmed identity plus both section labels and positive viewer pages for this day.";
+  coachOutputWorksheet.textContent = coach.buildOutputWorksheet(metadata.name, coachStage.value, profile);
+  copyOutputWorksheet.disabled = !assignment.sync.ready;
+  coachPrompt.textContent = coach.buildCodexPrompt(metadata.name, coachStage.value, profile);
+  copyCoachPrompt.disabled = false;
+  coachAnnouncement.textContent = `${assignment.blockLabel}: two readings and two video/guided runs loaded. ${assignment.sync.message}`;
 }
 
 function requestResult(request) {
@@ -93,6 +448,14 @@ async function getPdfBlob(id) {
   const record = await requestResult(transaction.objectStore(PDF_BLOB_STORE).get(id));
   await completed;
   return record;
+}
+
+async function updatePdfMetadata(metadata) {
+  const db = await openPdfDb();
+  const transaction = db.transaction(PDF_META_STORE, "readwrite");
+  const completed = transactionComplete(transaction);
+  transaction.objectStore(PDF_META_STORE).put(metadata);
+  await completed;
 }
 
 async function storePdf(file) {
@@ -178,6 +541,7 @@ function clearPdfViewer() {
   downloadPdf.tabIndex = -1;
   localStorage.removeItem(PDF_SELECTION_KEY);
   updateSelectedPdfButton();
+  renderReadingCoach(null);
 }
 
 async function selectPdf(metadata) {
@@ -207,6 +571,7 @@ async function selectPdf(metadata) {
     downloadPdf.tabIndex = 0;
     localStorage.setItem(PDF_SELECTION_KEY, metadata.id);
     updateSelectedPdfButton();
+    renderReadingCoach(metadata);
     setPdfStatus(`${metadata.name} is ready to read.`);
   } catch (error) {
     if (generation === selectionGeneration) setPdfStatus(readableStorageError(error), true);
@@ -301,6 +666,66 @@ pdfInput.addEventListener("change", () => addPdfFiles(pdfInput.files));
   });
 });
 pdfDropZone.addEventListener("drop", (event) => addPdfFiles(event.dataTransfer.files));
+coachStage.addEventListener("change", () => {
+  setSyncSaveStatus("");
+  renderReadingCoach(activePdfRecord);
+});
+coachSyncForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (!activePdfRecord) return;
+  let coachProfile;
+  try {
+    coachProfile = collectCoachProfile();
+  } catch (error) {
+    setSyncSaveStatus(error.message || "The PDF synchronization fields are incomplete.", true);
+    return;
+  }
+
+  const recordId = activePdfRecord.id;
+  const generation = selectionGeneration;
+  const updatedRecord = { ...activePdfRecord, coachProfile };
+  saveCoachSync.disabled = true;
+  setSyncSaveStatus("Saving synchronization on this device...");
+  try {
+    await updatePdfMetadata(updatedRecord);
+    if (generation !== selectionGeneration || activePdfRecord?.id !== recordId) return;
+    activePdfRecord = updatedRecord;
+    await renderPdfList();
+    renderReadingCoach(activePdfRecord);
+    const assignment = window.RTL_READING_COACH.getReadingAssignment(
+      activePdfRecord.name,
+      coachStage.value,
+      profileForCoach(activePdfRecord)
+    );
+    setSyncSaveStatus(assignment.sync.ready
+      ? "Saved. Both reading cards now jump to this PDF, and the output worksheet is unlocked."
+      : assignment.sync.message);
+  } catch (error) {
+    setSyncSaveStatus(readableStorageError(error), true);
+  } finally {
+    if (generation === selectionGeneration && activePdfRecord?.id === recordId) saveCoachSync.disabled = false;
+  }
+});
+copyOutputWorksheet.addEventListener("click", async () => {
+  if (!activePdfRecord || copyOutputWorksheet.disabled || !coachOutputWorksheet.textContent) return;
+  try {
+    if (!navigator.clipboard?.writeText) throw new Error("Clipboard API unavailable");
+    await navigator.clipboard.writeText(coachOutputWorksheet.textContent);
+    setOutputStatus("Output worksheet copied. Fill it as you read and run each resource.");
+  } catch (error) {
+    setOutputStatus("Automatic copy is unavailable. Select and copy the visible worksheet manually.", true);
+  }
+});
+copyCoachPrompt.addEventListener("click", async () => {
+  if (!activePdfRecord || !coachPrompt.textContent) return;
+  try {
+    if (!navigator.clipboard?.writeText) throw new Error("Clipboard API unavailable");
+    await navigator.clipboard.writeText(coachPrompt.textContent);
+    setCoachStatus("Analysis request copied. Attach the PDF in this conversation before pasting it.");
+  } catch (error) {
+    setCoachStatus("Automatic copy is unavailable. Select and copy the visible request manually.", true);
+  }
+});
 removePdf.addEventListener("click", async () => {
   if (!activePdfRecord) return;
   const record = activePdfRecord;
@@ -321,4 +746,5 @@ removePdf.addEventListener("click", async () => {
 window.addEventListener("pagehide", (event) => {
   if (!event.persisted) revokeActivePdfUrl();
 });
+renderReadingCoach(null);
 renderPdfList(true);
