@@ -7,6 +7,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+# Who may run the csynth/cosim ladder. The CLI enforces this via argparse `choices`;
+# load_config enforces the same set so a typo in a YAML/JSON config cannot leave
+# cosim_backend unmatched by every dispatch branch — which would silently skip the
+# whole RTL ladder and still report a pass (final_status only requires
+# software_equivalence when run_vitis is false).
+COSIM_BACKENDS = ("auto", "vitis", "vitis-ssh", "local-hls", "none")
+
 
 @dataclass
 class ArgumentConfig:
@@ -229,6 +236,15 @@ def _argument_config(data: Any) -> ArgumentConfig:
     )
 
 
+def _cosim_backend(data: dict[str, Any]) -> str:
+    backend = str(data.get("cosim_backend", "auto"))
+    if backend not in COSIM_BACKENDS:
+        raise ValueError(
+            f"unknown cosim_backend {backend!r}; expected one of {', '.join(COSIM_BACKENDS)}"
+        )
+    return backend
+
+
 def _ppa_block(data: dict[str, Any]) -> dict[str, Any]:
     """Parse the `ppa:` criteria block. Presence of the block enables the local PPA
     step by default (that is what "hardwired into the workflow" means) — it can still
@@ -319,7 +335,7 @@ def load_config(path: Path | None) -> AgentConfig:
         vitis_remote_dir=str(data.get("vitis_remote_dir", "~/c2hlsc_runs")),
         vitis_setup=(str(data["vitis_setup"]) if data.get("vitis_setup") else None),
         vitis_bin=str(data.get("vitis_bin", "vitis_hls")),
-        cosim_backend=str(data.get("cosim_backend", "auto")),
+        cosim_backend=_cosim_backend(data),
         **_ppa_block(data),
     )
 
