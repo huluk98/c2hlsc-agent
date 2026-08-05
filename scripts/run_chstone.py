@@ -28,7 +28,9 @@ misread as a synthesized or cosimulated design. Each row also carries the exact
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -191,6 +193,27 @@ def run_native(bench: ChstoneBenchmark, workdir: Path, timeout: int) -> Benchmar
 _EQUIV_PASS_RE = re.compile(r"all\s+\d+\s+tests passed", re.I)
 
 
+def _phase_status(report: dict, phase: str) -> str:
+    """Status string for one verifier phase, tolerating both conversion_report layouts.
+
+    ``conversion_report.json`` records ``phases[name]`` as a serialized ``PhaseResult``
+    (``{"name": ..., "status": "pass", ...}``) and *also* mirrors the status as a flat
+    top-level ``report[name]`` string. Reading ``phases[name]`` through ``str()`` compared a
+    dict repr against ``"pass"`` / ``"skipped"``, so both of the branches that consume this
+    were dead whenever a phase had actually run: an equivalence pass whose log did not carry
+    the "all N tests passed" line was scored FAIL, and a benchmark the converter rejected
+    before equivalence (status ``skipped``) was reported at the ``generated`` rung instead of
+    ``analyzed`` -- i.e. with the wrong earliest-failing stage.
+    """
+
+    value = (report.get("phases") or {}).get(phase)
+    if isinstance(value, dict):
+        value = value.get("status")
+    if value is None:
+        value = report.get(phase)
+    return str(value or "").lower()
+
+
 def _classify_conversion(report: dict, log_text: str) -> tuple[str, str | None]:
     """Map the host-equivalence log (authoritative) + conversion_report onto (rung, family).
 
@@ -200,8 +223,7 @@ def _classify_conversion(report: dict, log_text: str) -> tuple[str, str | None]:
 
     if _EQUIV_PASS_RE.search(log_text):
         return "host_equivalence", None
-    phases = report.get("phases") or {}
-    software = str(phases.get("software_equivalence", "")).lower()
+    software = _phase_status(report, "software_equivalence")
     if software == "pass" and "error:" not in log_text.lower():
         return "host_equivalence", None
     assessment = report.get("multi_agent") or report.get("assessment") or {}
@@ -352,7 +374,27 @@ def run_agent(bench: ChstoneBenchmark, out_dir: Path, args: argparse.Namespace) 
 # --------------------------------------------------------------------------- #
 
 
-def _summarise(rows: list[BenchmarkResult], mode: str, elapsed: float, benchmarks: int) -> dict:
+def row_from_dict(payload: dict) -> BenchmarkResult | None:
+    """Rebuild a row recorded by an earlier run, or None if it is not a usable row.
+
+    ``--resume`` has to fold the rows already on disk back into the report; without them the
+    final report.md of a resumed sweep covers only the benchmarks this invocation happened to
+    run ("passed: 1/2" for a 12-benchmark suite).
+    """
+
+    if not isinstance(payload, dict):
+        return None
+    names = {f.name for f in dataclasses.fields(BenchmarkResult)}
+    kwargs = {key: value for key, value in payload.items() if key in names}
+    kwargs["rungs_not_attempted"] = tuple(kwargs.get("rungs_not_attempted") or ())
+    try:
+        return BenchmarkResult(**kwargs)
+    except TypeError:
+        return None
+
+
+def _summarise(rows: list[BenchmarkResult], mode: str, elapsed: float, benchmarks: int,
+               resumed: int = 0) -> dict:
     reached: dict[str, int] = {}
     families: dict[str, int] = {}
     for row in rows:
@@ -363,6 +405,7 @@ def _summarise(rows: list[BenchmarkResult], mode: str, elapsed: float, benchmark
         "mode": mode,
         "benchmarks": benchmarks,
         "completed": len(rows),
+        "resumed": resumed,
         "passed": sum(1 for r in rows if r.ok),
         "rung_reached": reached,
         "failure_families": families,
@@ -438,15 +481,31 @@ def main(argv: list[str] | None = None) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     results_path = out_dir / "results.jsonl"
     done: set[str] = set()
+    prior: dict[str, BenchmarkResult] = {}
     if args.resume and results_path.exists():
+        wanted = {b.name for b in benchmarks}
         for line in results_path.read_text(encoding="utf-8").splitlines():
             try:
-                done.add(json.loads(line)["benchmark"])
-            except (json.JSONDecodeError, KeyError):
+                payload = json.loads(line)
+                name = payload["benchmark"]
+            except (json.JSONDecodeError, KeyError, TypeError):
                 continue
+            done.add(name)
+            row = row_from_dict(payload)
+            # Rows for benchmarks outside this selection stay in the file but out of the
+            # report; the last row for a benchmark wins if it was recorded more than once.
+            if row is not None and name in wanted:
+                prior[name] = row
+    elif results_path.exists() and results_path.stat().st_size:
+        # Keep the previous sweep recoverable and stop this run's rows from being appended
+        # to it: a mixed file makes a later --resume skip everything, and mixing a native
+        # sweep's rows with an agent sweep's rows silently doubles the suite.
+        os.replace(results_path, results_path.with_name(results_path.name + ".prev"))
     todo = [b for b in benchmarks if b.name not in done]
     mode = "native" if args.native_baseline else "agent"
     log(f"CHStone [{mode}]: {len(benchmarks)} benchmarks, {len(todo)} to run, {args.workers} worker(s)")
+    if args.resume:
+        log(f"resume: {len(benchmarks) - len(todo)} benchmarks already done, {len(todo)} to run")
     if mode == "agent":
         log("note: vitis_hls is not used by this harness; CSim/CSynth/CoSim are NOT attempted")
 
@@ -466,9 +525,12 @@ def main(argv: list[str] | None = None) -> int:
         return row
 
     with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
-        rows = list(pool.map(run_one, todo))
+        fresh = list(pool.map(run_one, todo))
 
-    summary = _summarise(rows, mode, time.time() - started, len(benchmarks))
+    # The report covers the whole suite, not just what this invocation ran, so a resumed
+    # sweep still reports 12/12 rather than the tail it happened to finish.
+    rows = sorted([*prior.values(), *fresh], key=lambda r: r.benchmark)
+    summary = _summarise(rows, mode, time.time() - started, len(benchmarks), resumed=len(prior))
     (out_dir / "report.json").write_text(
         json.dumps({**summary, "results": [r.to_dict() for r in rows]}, indent=2, sort_keys=True),
         encoding="utf-8")

@@ -1,17 +1,32 @@
 #!/usr/bin/env python3
-"""Run the Rosetta HLS benchmark suite's software path and report what is verifiable.
+"""Run the Rosetta HLS benchmark suite and report what is verifiable.
 
 Rosetta ships six FPGA applications built for Xilinx SDAccel/SDSoC. The Xilinx-only
 headers sit behind ``#ifdef OCL`` / ``#ifdef SDSOC`` guards, so the ``src/sw`` kernel plus
-``src/host`` builds and runs with a plain ``g++ -DSW`` -- that software path is what this
-harness exercises.
+``src/host`` builds and runs with a plain ``g++ -DSW``.
+
+Two modes, and you should run both:
+
+``--sw-baseline`` (default)
+    Build and run each app's own software path and judge it against the shipped golden
+    output. This is the calibration rung -- the Rosetta counterpart of CHStone's
+    ``--native-baseline``. If an app cannot be judged here, nothing downstream means
+    anything for it.
+
+``--agent``
+    Drive the app's ``src/sw`` kernel through this repo's C -> HLS-C conversion and run
+    **host software equivalence** (original kernel vs generated HLS-C, same stimuli). That
+    is rung 1 of the repo's four-rung ladder. ``--use-llm`` swaps the deterministic
+    generator for the repo's LLM generator; ``--auto-repair`` runs the repair loop and is
+    independent of ``--use-llm`` (``hlsc_repair_agent`` applies mechanical repairs with no
+    model at all and escalates to an LLM patch only when one is configured).
 
 **Nothing here synthesizes anything.** SDAccel/SDSoC/Vitis are not required and are not
-faked; every row carries ``xilinx_available`` and ``rungs_not_attempted``.
+faked; every row in either mode carries ``xilinx_available`` and ``rungs_not_attempted``.
 
-The oracle is the honest part of this harness. Three apps ship ``outputs_golden.txt`` and
-their host code writes ``outputs.txt``, so the run can be compared against a golden result.
-The rest have no shipped golden output, and this harness reports them as
+The oracle is the honest part of the software mode. Three apps ship ``outputs_golden.txt``
+and their host code writes ``outputs.txt``, so the run can be compared against a golden
+result. The rest have no shipped golden output, and this harness reports them as
 ``no_trustworthy_oracle`` rather than scoring an exit code as a pass -- an exit code proves
 the program did not crash, not that it computed anything correct.
 """
@@ -19,10 +34,13 @@ the program did not crash, not that it computed anything correct.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
+import os
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -35,6 +53,14 @@ EVIDENCE_LIMIT = 4000
 
 #: Rungs needing Xilinx tooling; never attempted by this harness.
 XILINX_RUNGS = ("hls_synthesis", "sdaccel", "sdsoc")
+
+#: Ordered rungs the agent mode can reach without any Xilinx tooling.
+AGENT_RUNG_ORDER = ("discovered", "analyzed", "generated", "host_equivalence")
+
+#: Rosetta predates the stricter libstdc++ header hygiene of modern GCC and relies on
+#: transitive includes that no longer happen. Forcing these in is a pure portability fix --
+#: it adds no symbol the sources do not already use. Both modes need it.
+PORTABILITY_INCLUDES = ("cstdio", "iostream", "cstring", "cstdlib")
 
 _MAKE_VAR_RE = r"^{name}\s*=\s*(.*?)(?<!\\)$"
 #: "\t 1878 / 2000 correct!" -- the accuracy line both outputs.txt and the golden file carry.
@@ -169,9 +195,13 @@ def run_sw(app: RosettaApp, out_dir: Path, timeout: int) -> AppResult:
     result.built = True
 
     # Run inside a copy of the app directory so data files resolve and outputs.txt is ours.
+    # outputs.txt is excluded from the copy on purpose: a checkout that was ever built in
+    # place carries one, and judging *that* file would report a PASS for a binary that
+    # crashed before writing anything.
     sandbox = work / "run"
     shutil.rmtree(sandbox, ignore_errors=True)
-    shutil.copytree(app.directory, sandbox, ignore=shutil.ignore_patterns("src", ".git"))
+    shutil.copytree(app.directory, sandbox,
+                    ignore=shutil.ignore_patterns("src", ".git", "outputs.txt"))
     try:
         run = subprocess.run([str(binary)], capture_output=True, text=True,
                              timeout=timeout, cwd=str(sandbox))
@@ -224,7 +254,25 @@ def run_sw(app: RosettaApp, out_dir: Path, timeout: int) -> AppResult:
     return result
 
 
-def _summarise(rows: list[AppResult], apps: int, elapsed: float) -> dict:
+def row_from_dict(payload: dict) -> AppResult | None:
+    """Rebuild a row recorded by an earlier run, or None if it is not a usable row.
+
+    ``--resume`` has to fold the rows already on disk back into the report; without them the
+    final report covers only the apps this invocation happened to run.
+    """
+
+    if not isinstance(payload, dict):
+        return None
+    names = {f.name for f in dataclasses.fields(AppResult)}
+    kwargs = {key: value for key, value in payload.items() if key in names}
+    kwargs["rungs_not_attempted"] = tuple(kwargs.get("rungs_not_attempted") or ())
+    try:
+        return AppResult(**kwargs)
+    except TypeError:
+        return None
+
+
+def _summarise(rows: list[AppResult], apps: int, elapsed: float, resumed: int = 0) -> dict:
     judged = [r for r in rows if r.ok is not None]
     families: dict[str, int] = {}
     for row in rows:
@@ -234,6 +282,7 @@ def _summarise(rows: list[AppResult], apps: int, elapsed: float) -> dict:
         "mode": "sw",
         "apps": apps,
         "completed": len(rows),
+        "resumed": resumed,
         "built": sum(1 for r in rows if r.built),
         "ran": sum(1 for r in rows if r.ran),
         "judged": len(judged),
@@ -303,14 +352,29 @@ def main(argv: list[str] | None = None) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     results_path = out_dir / "results.jsonl"
     done: set[str] = set()
+    prior: dict[str, AppResult] = {}
     if args.resume and results_path.exists():
+        wanted = {a.name for a in apps}
         for line in results_path.read_text(encoding="utf-8").splitlines():
             try:
-                done.add(json.loads(line)["app"])
-            except (json.JSONDecodeError, KeyError):
+                payload = json.loads(line)
+                name = payload["app"]
+            except (json.JSONDecodeError, KeyError, TypeError):
                 continue
+            done.add(name)
+            row = row_from_dict(payload)
+            # Rows for apps outside this selection stay in the file but out of the report;
+            # the last row for an app wins if it was recorded more than once.
+            if row is not None and name in wanted:
+                prior[name] = row
+    elif results_path.exists() and results_path.stat().st_size:
+        # Keep the previous sweep recoverable and stop this run's rows from being appended
+        # to it: a mixed file makes a later --resume skip everything.
+        os.replace(results_path, results_path.with_name(results_path.name + ".prev"))
     todo = [a for a in apps if a.name not in done]
     log(f"Rosetta [sw]: {len(apps)} apps, {len(todo)} to run, {args.workers} worker(s)")
+    if args.resume:
+        log(f"resume: {len(apps) - len(todo)} apps already done, {len(todo)} to run")
     log("note: no Xilinx tooling is used; HLS synthesis / SDAccel / SDSoC are NOT attempted")
     started = time.time()
 
@@ -329,9 +393,11 @@ def main(argv: list[str] | None = None) -> int:
         return row
 
     with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
-        rows = list(pool.map(run_one, todo))
+        fresh = list(pool.map(run_one, todo))
 
-    summary = _summarise(rows, len(apps), time.time() - started)
+    # The report covers the whole suite, not just what this invocation ran.
+    rows = sorted([*prior.values(), *fresh], key=lambda r: r.app)
+    summary = _summarise(rows, len(apps), time.time() - started, resumed=len(prior))
     (out_dir / "report.json").write_text(
         json.dumps({**summary, "results": [r.to_dict() for r in rows]}, indent=2, sort_keys=True),
         encoding="utf-8")
