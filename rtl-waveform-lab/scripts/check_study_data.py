@@ -388,4 +388,27 @@ for required_source_marker in (
     if required_source_marker not in pdf_shelf_source:
         fail(f"pdf_shelf.js is missing synchronization/jump behavior: {required_source_marker}")
 
+controller_contract = {
+    'coachSyncForm.addEventListener("submit"': (
+        "coachProfile = collectCoachProfile()",
+        "await updatePdfMetadata(updatedRecord)",
+        "activePdfRecord = updatedRecord",
+        "renderReadingCoach(activePdfRecord)",
+        "profileForCoach(activePdfRecord)",
+    ),
+    'copyOutputWorksheet.addEventListener("click"': (
+        "copyOutputWorksheet.disabled",
+        "navigator.clipboard.writeText(coachOutputWorksheet.textContent)",
+    ),
+}
+for binding, required_steps in controller_contract.items():
+    start = pdf_shelf_source.find(binding)
+    end = pdf_shelf_source.find("\n});", start)
+    if start < 0 or end < 0:
+        fail(f"pdf_shelf.js is missing controller binding: {binding}")
+    handler = pdf_shelf_source[start:end]
+    for step in required_steps:
+        if step not in handler:
+            fail(f"pdf_shelf.js controller binding {binding} is missing step: {step}")
+
 print("PASS: strict UTF-8 assets, WaveJSON, E0-E10 trace, study links, ASCII-safe PDF workflow, learner-confirmed PDF sync, one-click page locators, 2+2 reading/run worksheet contract, PDF shelf structure, quiz count, and JavaScript syntax agree.")
