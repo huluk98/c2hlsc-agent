@@ -225,11 +225,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     optimize.add_argument("--iterations", type=int, default=4, help="number of LLM optimization candidates per round (default 4)")
     optimize.add_argument(
-        "--no-cosim-winner",
-        action="store_true",
-        help="accept the winner after host equivalence plus enabled shift-left checks (skip the full Vitis re-ladder); NOT recommended",
-    )
-    optimize.add_argument(
         "--ppa-script",
         help="script run in the project dir after acceptance (e.g. syn/run_ppa.sh); its "
         "yosys_area.rpt / sta_report.txt enrich the QoR report with area/slack/power",
@@ -1073,16 +1068,24 @@ def _optimize_local_hls_baseline(project_dir: Path, config, analysis, verbose: b
     so a pragma-variant search cannot move QoR. Synthesize the local RTL if needed and
     report its baseline PPA (graded against any configured criteria) instead."""
 
-    rtl = sorted((project_dir / "rtl").glob("*.v"))
-    if not rtl:
-        backend = LocalHlsCosim.from_config(config, analysis, project_dir)
-        if backend is None:
-            _, reason = local_hls_available()
-            raise SystemExit(f"no rtl/ to measure and local-hls is unavailable: {reason}")
-        print("optimize[local-hls]: no rtl/ found; synthesizing with Bambu for a baseline...")
-        phases = backend.run(project_dir)
-        if phases["csynth"].status != "pass":
-            raise SystemExit(f"local-hls synthesis failed: {phases['csynth'].summary}")
+    backend = LocalHlsCosim.from_config(config, analysis, project_dir)
+    if backend is None:
+        _, reason = local_hls_available()
+        raise SystemExit(f"local-hls baseline verification is unavailable: {reason}")
+    print("optimize[local-hls]: re-verifying the baseline with Bambu before PPA measurement...")
+    baseline_state = verify_project(
+        project_dir,
+        True,
+        verbose=verbose,
+        local=backend,
+        run_shift_left=config.run_shift_left,
+        vitis_bin=config.vitis_bin,
+    )
+    if final_status(baseline_state, True, False) != "pass":
+        raise SystemExit(
+            "local-hls baseline failed the full host/shift-left/CSynth/CoSim ladder; "
+            "refusing to report QoR"
+        )
     config.run_local_ppa = True
     phase = _ppa_gate_phase(project_dir, config, verbose=verbose, clock_port="clock", gate_sim=False)
     print(
@@ -1097,6 +1100,7 @@ def _optimize_local_hls_baseline(project_dir: Path, config, analysis, verbose: b
                 "backend": "local-hls",
                 "optimization": "not_applicable",
                 "reason": "Bambu ignores HLS performance pragmas; no pragma-driven QoR search is possible.",
+                "baseline_verification": "pass",
                 "baseline_ppa_status": phase.status,
                 "baseline_ppa": phase.summary,
             },
@@ -1167,7 +1171,7 @@ def run_optimize(args: argparse.Namespace) -> int:
             remote,
             objective=args.objective,
             iterations=args.iterations,
-            cosim_winner=not args.no_cosim_winner,
+            cosim_winner=True,
             ppa_script=args.ppa_script,
             targets=targets if targets.specified else None,
             max_rounds=args.max_rounds,

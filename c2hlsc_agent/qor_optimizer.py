@@ -112,6 +112,8 @@ class OptimizeOutcome:
     target_gaps: list[str] = field(default_factory=list)
     rounds: list[dict[str, object]] = field(default_factory=list)
     local_ppa: dict[str, object] = field(default_factory=dict)
+    baseline_verified: bool = False
+    winner_verification: str = "not_run"
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -129,6 +131,8 @@ class OptimizeOutcome:
             "target_gaps": list(self.target_gaps),
             "rounds": list(self.rounds),
             "local_ppa": dict(self.local_ppa),
+            "baseline_verified": self.baseline_verified,
+            "winner_verification": self.winner_verification,
         }
 
 
@@ -363,6 +367,12 @@ def optimize_project(
     on each scored candidate's Vitis RTL.
     """
 
+    if not cosim_winner:
+        raise RuntimeError(
+            "host-only QoR acceptance is disabled: every winner must pass the full "
+            "host/shift-left/CSim/CSynth/CoSim ladder"
+        )
+
     src_path = project_dir / "src" / "hls_top.cpp"
     baseline_source = src_path.read_text(encoding="utf-8")
     top = analysis.function.name
@@ -375,6 +385,24 @@ def optimize_project(
         liberty=liberty, sta_bin=sta_bin, clock_port=clock_port, gate_sim=gate_sim,
         verbose=verbose, node=node,
     )
+
+    # A fresh synthesis report is QoR evidence, not functional sign-off. Re-run the
+    # complete baseline ladder before trusting it or returning early because targets
+    # already appear to be met. This also refreshes the in-place synthesis/CoSim
+    # artifacts against the current source and testbench revision.
+    baseline_state = verify_project(
+        project_dir,
+        True,
+        verbose=verbose,
+        remote=remote,
+        run_shift_left=config.run_shift_left,
+        vitis_bin=config.vitis_bin,
+    )
+    if final_status(baseline_state, True, False) != "pass":
+        raise RuntimeError(
+            "baseline project failed the full host/shift-left/CSim/CSynth/CoSim ladder; "
+            "refusing QoR optimization"
+        )
 
     # 1. Baseline metrics: reuse the existing csynth report only when it is fresh
     # (newer than the sources it describes) and parseable; else synthesize once.
@@ -398,7 +426,12 @@ def optimize_project(
     else:
         collect_local_ppa(project_dir, baseline)
     baseline_score = objective_score(baseline, objective, baseline)
-    outcome = OptimizeOutcome(objective=objective, baseline=baseline, targets=targets)
+    outcome = OptimizeOutcome(
+        objective=objective,
+        baseline=baseline,
+        targets=targets,
+        baseline_verified=True,
+    )
     if needs_ppa:
         outcome.local_ppa["baseline"] = base_ppa.to_dict()
     if baseline_score is None:
@@ -407,7 +440,9 @@ def optimize_project(
         met, gaps, gap = evaluate_targets(baseline, targets, time_unit=time_unit)
         outcome.targets_met, outcome.target_gaps = met, gaps
         if met:
-            outcome.summary = "Baseline already meets every PPA target; nothing to do."
+            outcome.summary = (
+                "Verified baseline already meets every PPA target; nothing to do."
+            )
             _write_reports(project_dir, outcome)
             return outcome
     else:
@@ -586,25 +621,16 @@ def optimize_project(
     src_path.write_text(best_source, encoding="utf-8")
     promote_mtime = src_path.stat().st_mtime
     outcome.winner_index = best_index
-    if cosim_winner:
-        state = verify_project(
-            project_dir,
-            True,
-            verbose=verbose,
-            remote=remote,
-            run_shift_left=config.run_shift_left,
-            vitis_bin=config.vitis_bin,
-        )
-        accepted = final_status(state, True, False) == "pass"
-    else:
-        state = verify_project(
-            project_dir,
-            False,
-            verbose=verbose,
-            run_shift_left=config.run_shift_left,
-            vitis_bin=config.vitis_bin,
-        )
-        accepted = final_status(state, False, False) == "pass"
+    state = verify_project(
+        project_dir,
+        True,
+        verbose=verbose,
+        remote=remote,
+        run_shift_left=config.run_shift_left,
+        vitis_bin=config.vitis_bin,
+    )
+    accepted = final_status(state, True, False) == "pass"
+    outcome.winner_verification = "pass" if accepted else "fail"
     if not accepted:
         src_path.write_text(baseline_source, encoding="utf-8")
         outcome.rolled_back = True
@@ -630,14 +656,13 @@ def optimize_project(
     # Refresh from the acceptance run's report ONLY when that run actually re-synthesized
     # in place (cosim path) and the report postdates the promotion — otherwise the file
     # is the baseline's report and would zero every delta.
-    if cosim_winner:
-        xml = find_csynth_xml(project_dir)
-        if xml is not None and xml.stat().st_mtime >= promote_mtime:
-            try:
-                winner_metrics = parse_csynth_xml(xml)
-                outcome.candidates[best_index].metrics = winner_metrics
-            except RuntimeError:
-                pass  # keep the candidate-directory metrics
+    xml = find_csynth_xml(project_dir)
+    if xml is not None and xml.stat().st_mtime >= promote_mtime:
+        try:
+            winner_metrics = parse_csynth_xml(xml)
+            outcome.candidates[best_index].metrics = winner_metrics
+        except RuntimeError:
+            pass  # keep the candidate-directory metrics
 
     if needs_ppa:
         # Authoritative post-acceptance synthesis + waveform + STA on the promoted design.

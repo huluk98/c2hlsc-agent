@@ -12,6 +12,10 @@ This blueprint combines two complementary ideas from the provided papers:
 The result should be a loop of cooperating agents, not one monolithic "generate RTL"
 agent.
 
+For the current live implementation, including the backend branches, knowledge graph,
+QoR rollback gates, and online runner requirements, see
+[C2HLSC Agent Workflow](agent_workflow.md).
+
 ## Definition of Done
 
 The practical signoff target is:
@@ -180,5 +184,8 @@ write report and audit memory
   infrastructure/incomplete runs remain blocked evidence. The next step is to feed uncovered
   gcov branches back into stimulus refinement and minimize KLEE counterexample witnesses.
 - Add PMLC instrumentation for CSim/CoSim mismatches.
-- Add an optimizer queue that snapshots candidates and rolls back rejected QoR changes.
-- Add a structured audit ledger and repair-card store.
+- The optimizer queue, isolated candidate snapshots, full-ladder baseline/winner gates,
+  and rollback are live. The remaining operational gap is native Vitis/Vivado runner
+  availability for authoritative AMD QoR evidence.
+- The structured repair audit and opt-in repair-card store are live. The next step is
+  richer human review metadata and retrieval-quality evaluation across benchmark suites.

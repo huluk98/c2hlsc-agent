@@ -246,6 +246,10 @@ static contract -> host equivalence -> paired traces -> gcov -> KLEE
                 -> CSim -> CSynth -> C/RTL CoSim -> PPA
 ```
 
+See [the end-to-end agent workflow](docs/agent_workflow.md) for the component graph,
+failure/repair hand-offs, backend branches, evidence artifacts, and the vitalness of each
+stage.
+
 This is deliberately shift-left: the paired-trace comparison is a pre-synthesis
 correctness gate, gcov is an evidence phase, and KLEE is a bounded relational gate only
 when it emits an exact-schema, named golden-C↔HLS-C counterexample. The driver gives both
@@ -688,9 +692,10 @@ python -m c2hlsc_agent.cli optimize --project build/vector_add \
   --vitis-ssh luke@linux-box          # Vitis phases remote, everything else local
 ```
 
-The loop: (1) baseline QoR is read from the project's Vitis synthesis report
-(`c2hlsc_project/solution1/syn/report/csynth.xml` — the remote pull brings it back), or
-one csim+csynth run establishes it; (2) candidates are proposed — a deterministic
+The loop: (1) the current baseline is re-verified through the full ladder before its QoR
+is trusted, then metrics are read from the refreshed Vitis synthesis report
+(`c2hlsc_project/solution1/syn/report/csynth.xml` — the remote pull brings it back);
+(2) candidates are proposed — a deterministic
 `PIPELINE II=1` on innermost loops, then LLM candidates grounded in the report, the
 objective, and the already-tried history; (3) each candidate is gated in an isolated
 scratch project under `<project>/.qor/`: local host equivalence first (seconds), then
