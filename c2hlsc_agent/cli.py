@@ -15,7 +15,7 @@ from .contract_planner import plan_contracts
 from .convert import ReferenceGenerationError, generate_hls_sources, generate_reference_c
 from .hlsc_repair_agent import clear_repair_audit, load_repair_audit, repair_project
 from .hls_project import write_project
-from .hls_runner import verify_project
+from .hls_runner import run_impl, verify_project
 from .knowledge_graph import FILENAME as KNOWLEDGE_GRAPH_FILENAME
 from .knowledge_graph import refresh_knowledge_graph, write_knowledge_graph
 from .llm import build_llm_client, missing_llm_reason
@@ -285,6 +285,21 @@ def build_parser() -> argparse.ArgumentParser:
     ppa.add_argument("--clock-port", default="ap_clk", help="clock port name for STA (default ap_clk)")
     ppa.add_argument("--no-gate-sim", action="store_true", help="skip the gate-level waveform simulation step")
     ppa.add_argument("--verbose", action="store_true", help="print progress")
+    impl = sub.add_parser(
+        "impl",
+        help="post-place-and-route sign-off: run Vivado synthesis + P&R via "
+        "export_design -flow impl on an already-verified project and write impl_report.json",
+    )
+    impl.add_argument("--project", required=True, help="generated project directory that already passed the ladder")
+    impl.add_argument("--config", help="YAML/JSON config file used for the original conversion")
+    impl.add_argument(
+        "--allow-unverified",
+        action="store_true",
+        help="sign off a project whose conversion_report.json is not a pass; NOT recommended — "
+        "post-P&R numbers for a design that failed equivalence describe nothing worth citing",
+    )
+    _add_remote_vitis_arguments(impl)
+    impl.add_argument("--verbose", action="store_true", help="print progress")
     xref = sub.add_parser(
         "cross-reference",
         help="dual-generation differential oracle over HLS_NL records: two independent "
@@ -1228,6 +1243,85 @@ def run_ppa(args: argparse.Namespace) -> int:
     return 0 if phase.status in ("pass", "skipped") else 1
 
 
+def run_impl_signoff(args: argparse.Namespace) -> int:
+    """Post-place-and-route sign-off on an already-verified project.
+
+    Separate from `convert` and `optimize` on purpose: P&R costs minutes to tens of
+    minutes, so it is a deliberate, explicit step on a design that has already passed
+    the ladder — never something the acceptance path or the candidate search triggers.
+    """
+
+    from .qor import find_impl_report, parse_impl_report
+
+    project_dir = Path(args.project).resolve()
+    config = merge_cli_config(load_config(_config_path(args)), args)
+    if not (project_dir / "run_impl.tcl").exists():
+        raise SystemExit(
+            f"{project_dir / 'run_impl.tcl'} is missing; regenerate the project with a "
+            "current c2hlsc-agent convert before post-implementation sign-off"
+        )
+
+    # Refuse to put a sign-off number on a design the ladder did not accept. A
+    # placed-and-routed area for a functionally wrong design is worse than no number:
+    # it looks citable.
+    status = None
+    report_path = project_dir / "conversion_report.json"
+    if report_path.exists():
+        try:
+            status = json.loads(report_path.read_text(encoding="utf-8")).get("status")
+        except (OSError, ValueError):
+            status = None
+    if status != "pass" and not args.allow_unverified:
+        raise SystemExit(
+            f"refusing post-implementation sign-off: conversion_report.json status is "
+            f"{status!r}, not 'pass'. Re-run the full ladder first, or pass "
+            "--allow-unverified if you deliberately want numbers for an unverified design."
+        )
+
+    remote = RemoteVitis.from_config(config)
+    where = f"{remote.host}" if remote is not None else "locally"
+    print(f"impl: running Vivado synthesis + place & route {where}; this takes minutes to tens of minutes...")
+    phase = run_impl(project_dir, remote=remote, vitis_bin=config.vitis_bin)
+    if phase.status != "pass":
+        print(f"impl: {phase.status} — {phase.summary or phase.stderr.strip()[-400:]}", file=sys.stderr)
+        return 1
+
+    found = find_impl_report(project_dir)
+    if found is None:
+        print(
+            "impl: export_design reported success but no report was found under "
+            "c2hlsc_project/*/impl/report/ — nothing to sign off",
+            file=sys.stderr,
+        )
+        return 1
+    try:
+        metrics = parse_impl_report(found)
+    except RuntimeError as exc:
+        print(f"impl: {exc}", file=sys.stderr)
+        return 1
+
+    payload = {
+        "status": "pass",
+        "top": config.top or _load_project_top(project_dir),
+        "part": config.part,
+        "target_clock_ns": config.clock,
+        "report_path": str(found.relative_to(project_dir)),
+        "impl": metrics.impl,
+    }
+    out = project_dir / "impl_report.json"
+    out.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    achieved = metrics.impl.get("cp_achieved_ns")
+    timing = "" if achieved is None else f", CP achieved {achieved} ns (target {config.clock} ns)"
+    resources = ", ".join(
+        f"{name.upper()} {metrics.impl[name]}"
+        for name in ("lut", "ff", "dsp", "bram", "uram", "srl", "slice")
+        if name in metrics.impl
+    )
+    print(f"impl: pass — {resources}{timing}")
+    print(f"Report: {out}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -1237,6 +1331,8 @@ def main(argv: list[str] | None = None) -> int:
         return run_repair(args)
     if args.command == "optimize":
         return run_optimize(args)
+    if args.command == "impl":
+        return run_impl_signoff(args)
     if args.command == "ppa":
         return run_ppa(args)
     if args.command == "cross-reference":

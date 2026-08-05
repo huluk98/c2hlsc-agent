@@ -48,6 +48,11 @@ class QoRMetrics:
     sta_worst_slack_max_ns: float | None = None
     sta_worst_slack_min_ns: float | None = None
     sta_total_power_w: float | None = None
+    # Post-place-and-route sign-off (Vivado, via export_design -flow impl). Kept as one
+    # dict rather than a field per resource: these are measured sign-off numbers, not
+    # scoring inputs, and they must stay out of area_proxy/qor_delta so the candidate
+    # search cannot start optimizing against a metric that costs a P&R run to evaluate.
+    impl: dict[str, object] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -68,6 +73,7 @@ class QoRMetrics:
             "sta_worst_slack_max_ns": self.sta_worst_slack_max_ns,
             "sta_worst_slack_min_ns": self.sta_worst_slack_min_ns,
             "sta_total_power_w": self.sta_total_power_w,
+            "impl": dict(self.impl),
         }
 
     @property
@@ -202,6 +208,63 @@ def parse_sta_report(path: Path, metrics: QoRMetrics | None = None) -> QoRMetric
     total_row = re.search(r"^Total\s+.*?([0-9.]+e[+-]?\d+)\s+100\.?\d*%", text, re.M)
     if total_row:
         metrics.sta_total_power_w = float(total_row.group(1))
+    return metrics
+
+
+_IMPL_RESOURCE_KEYS = {
+    "SLICE": "slice",
+    "LUT": "lut",
+    "FF": "ff",
+    "DSP": "dsp",
+    "BRAM": "bram",
+    "SRL": "srl",
+    "URAM": "uram",
+    "LATCH": "latch",
+}
+
+
+def find_impl_report(project_dir: Path) -> Path | None:
+    """Locate the Vivado post-implementation report written by ``export_design -flow impl``.
+
+    The filename and language subdirectory moved between Vitis versions, so prefer the
+    canonical ``export_impl.rpt`` and fall back to any report under ``impl/report/``.
+    """
+
+    hits = sorted(project_dir.glob("c2hlsc_project/*/impl/report/**/*.rpt"))
+    if not hits:
+        return None
+    for path in hits:
+        if path.name == "export_impl.rpt":
+            return path
+    return hits[0]
+
+
+def parse_impl_report(path: Path, metrics: QoRMetrics | None = None) -> QoRMetrics:
+    """Parse post-place-and-route resources and the achieved clock period.
+
+    These are the only *measured* FPGA numbers the pipeline produces — every other
+    resource and timing figure in a report is a csynth estimate. Raises when the file
+    carries no recognisable result block, so an empty or truncated report becomes a
+    loud failure rather than a silently empty sign-off.
+    """
+
+    metrics = metrics or QoRMetrics()
+    text = path.read_text(encoding="utf-8", errors="replace")
+    impl: dict[str, object] = {}
+    for key, name in _IMPL_RESOURCE_KEYS.items():
+        found = re.search(rf"^\s*-\s*{key}:\s*(\d+)\s*$", text, re.M | re.I)
+        if found:
+            impl[name] = int(found.group(1))
+    achieved = re.search(r"CP achieved post-implementation:\s*(-?[0-9.]+)", text, re.I)
+    if achieved:
+        impl["cp_achieved_ns"] = float(achieved.group(1))
+    required = re.search(r"CP required:\s*(-?[0-9.]+)", text, re.I)
+    if required:
+        impl["cp_required_ns"] = float(required.group(1))
+    if not impl:
+        raise RuntimeError(f"no post-implementation results found in {path}")
+    impl["report"] = path.name
+    metrics.impl = impl
     return metrics
 
 

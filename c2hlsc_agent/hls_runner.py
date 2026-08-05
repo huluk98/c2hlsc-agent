@@ -12,7 +12,10 @@ from .vitis_command import find_vitis_executable, vitis_tcl_command
 
 SHIFT_LEFT_PHASES = ("shift_left_trace", "coverage_gcov", "symbolic_klee")
 PHASE_ORDER = ("software_equivalence", *SHIFT_LEFT_PHASES, "csim", "csynth", "cosim")
-PHASE_TIMEOUTS = {"csim": 600, "csynth": 1200, "cosim": 600}
+# "impl" is Vivado synthesis + place & route behind Vitis's export_design. It is an
+# order of magnitude slower than csynth, hence the much larger budget, and it is NOT in
+# PHASE_ORDER: it is post-acceptance sign-off, never part of the acceptance ladder.
+PHASE_TIMEOUTS = {"csim": 600, "csynth": 1200, "cosim": 600, "impl": 14400}
 # Runner-authored timeout summaries use this phrase.  ``agent_loop`` keys on the
 # summary (not arbitrary tool output) so a killed process is treated as missing
 # infrastructure evidence rather than proof that the current HLS-C is defective.
@@ -532,6 +535,60 @@ def run_vitis(
                 remote.pull(project_dir)
             except (subprocess.TimeoutExpired, OSError):
                 pass  # best-effort artifact pull; phase logs are already local
+
+
+def run_impl(
+    project_dir: Path,
+    remote: RemoteVitis | None = None,
+    vitis_bin: str = "vitis_hls",
+) -> PhaseResult:
+    """Vivado synthesis + place & route via ``export_design -flow impl``.
+
+    This is the only step that turns csynth's *estimates* into placed-and-routed
+    resource counts and an achieved clock period. It is deliberately NOT reachable from
+    :func:`run_vitis` or :func:`verify_project`: P&R takes minutes to tens of minutes,
+    so letting it into the acceptance ladder would also put it inside the QoR
+    optimizer's per-candidate loop, where the cost is prohibitive. Sign-off only, on a
+    design that has already passed the ladder.
+    """
+
+    if remote is None:
+        resolved = find_vitis_executable(vitis_bin)
+        if resolved is None:
+            return PhaseResult(
+                "impl",
+                "fail",
+                summary=(
+                    f"Vitis HLS launcher {vitis_bin!r} not found "
+                    "(pass --vitis-bin, source the AMD settings script, or use --vitis-ssh)"
+                ),
+            )
+        vitis_bin = resolved
+    else:
+        try:
+            push = remote.push(project_dir)
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            push = PhaseResult(
+                "vitis_push", "fail", summary=f"project sync to {remote.host} failed: {exc}"
+            )
+        if push.status != "pass":
+            detail = push.summary or push.stderr.strip()[-400:]
+            return PhaseResult(
+                "impl",
+                "fail",
+                summary=f"remote vitis unavailable: project sync to {remote.host} failed: {detail}",
+            )
+
+    try:
+        return _run_vitis_phase(project_dir, "impl", remote, vitis_bin)
+    finally:
+        if remote is not None:
+            # export_design writes the impl report on the remote. Pull before any caller
+            # tries to parse it, or the parser reads a stale/absent local report.
+            try:
+                remote.pull(project_dir)
+            except (subprocess.TimeoutExpired, OSError):
+                pass  # best-effort; the phase result already carries the tool output
 
 
 _COSIM_FAILURE_MARKERS = (
