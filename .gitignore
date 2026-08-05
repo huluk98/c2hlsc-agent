@@ -20,3 +20,7 @@ vitis_hls_bin_path.txt
 /CHStone/
 /chstone/
 /rosetta/
+
+# Working output directory used by the benchmark drivers (--out-dir runs/...).
+# Curated results are committed under rtllm_v2_results/ and chstone_rosetta_results/.
+/runs/
