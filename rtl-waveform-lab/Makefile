@@ -15,7 +15,7 @@ WAVEJSON  := docs/expected_waveform.json
 WAVEHTML  := docs/expected_waveform.html
 WAVESVG   := docs/expected_waveform.svg
 
-.PHONY: all sim exhaustive lint synth mutations docs verify wave check-env serve clean
+.PHONY: all sim exhaustive lint synth mutations pdf-analyzer-test docs verify wave check-env serve clean
 
 all: sim docs
 
@@ -56,6 +56,10 @@ synth: | $(BUILD_DIR)
 mutations:
 	@./scripts/run_mutation_tests.sh
 
+pdf-analyzer-test:
+	@$(PYTHON) ./scripts/test_pdf_study_analyzer.py
+	@$(PYTHON) ./scripts/test_study_server.py
+
 wave: sim
 	@command -v $(GTKWAVE) >/dev/null 2>&1 || { echo "ERROR: GTKWave is not installed; install it, then rerun make wave." >&2; exit 1; }
 	$(GTKWAVE) $(BUILD_DIR)/wave.vcd docs/one_cycle_delayed_adder.gtkw
@@ -71,12 +75,11 @@ docs: sim
 		echo "WaveDrom CLI not found: WaveJSON validated; open $(WAVEHTML) in a browser to render it."; \
 	fi
 
-verify: check-env lint sim exhaustive synth mutations docs
+verify: check-env lint sim exhaustive synth mutations pdf-analyzer-test docs
 	@printf 'PASS: complete local RTL evidence gate succeeded.\n'
 
 serve: all
-	@printf 'RTL study page: http://127.0.0.1:4173/docs/study.html\n'
-	$(PYTHON) -m http.server 4173 --bind 127.0.0.1
+	$(PYTHON) ./scripts/study_server.py --port 4173 --directory .
 
 clean:
 	rm -f $(SIMULATOR) $(EXHAUSTIVE_SIMULATOR) $(BUILD_DIR)/wave.vcd $(BUILD_DIR)/cycle_trace.csv $(BUILD_DIR)/synth.log $(BUILD_DIR)/synth.json $(BUILD_DIR)/mutation-*.log $(WAVESVG)

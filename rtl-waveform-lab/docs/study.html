@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#f6f9fc">
   <meta name="description" content="A private RTL study workspace with full-PDF storage, a verified waveform lesson, and a self-grading quiz.">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data: blob:; style-src 'unsafe-inline'; script-src 'self' 'unsafe-inline'; frame-src 'self' blob:; object-src 'none'; base-uri 'self'; form-action 'self'">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src 'self'; img-src 'self' data: blob:; style-src 'unsafe-inline'; script-src 'self' 'unsafe-inline'; frame-src 'self' blob:; object-src 'none'; base-uri 'self'; form-action 'self'">
   <title>RTL Sprint Lab</title>
   <style>
     :root {
@@ -199,6 +199,17 @@
     .coach-locator .coach-sync-check { grid-column: auto; min-height: 42px; }
     .coach-sync-actions, .coach-output-actions { display: flex; flex-wrap: wrap; gap: 0.6rem; align-items: center; margin-top: 0.7rem; }
     .coach-sync-save-status, .coach-output-status { color: var(--muted); font-size: 0.76rem; }
+    .pdf-analysis { grid-column: 1 / -1; margin-top: 0.2rem; padding: 0.75rem; border: 1px solid rgba(99, 91, 255, 0.16); border-radius: 0.75rem; background: #fff; }
+    .pdf-analysis h5 { margin: 0; font-size: 0.86rem; }
+    .pdf-analysis > p { margin: 0.35rem 0 0.55rem; color: var(--muted); font-size: 0.75rem; }
+    .pdf-analysis-results, .pdf-starters { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.55rem; margin-top: 0.6rem; }
+    .pdf-analysis-card, .pdf-starter { min-width: 0; padding: 0.65rem; border: 1px solid var(--line); border-radius: 0.7rem; background: rgba(242, 247, 251, 0.66); }
+    .pdf-analysis-card h6, .pdf-starter h6 { margin: 0 0 0.3rem; color: var(--ink); font-size: 0.8rem; }
+    .pdf-analysis-card p, .pdf-starter p { margin: 0.26rem 0; color: var(--muted); font-size: 0.7rem; }
+    .pdf-analysis-card .analysis-snippet { padding-top: 0.35rem; border-top: 1px solid rgba(10, 37, 64, 0.08); }
+    .pdf-starter pre { max-height: 12rem; margin-top: 0.45rem; padding: 0.65rem; font-size: 0.67rem; }
+    .pdf-analysis-actions { display: flex; flex-wrap: wrap; gap: 0.55rem; align-items: center; margin-top: 0.55rem; }
+    .pdf-analysis-status { color: var(--muted); font-size: 0.74rem; }
     .coach-steps { margin: 0.65rem 0 0.8rem; padding-left: 1.25rem; font-size: 0.88rem; }
     .coach-resource-section { margin-top: 0.9rem; }
     .coach-resource-section h4 { margin: 0 0 0.55rem; font-size: 0.86rem; }
@@ -292,6 +303,7 @@
       .coach-sync-grid { grid-template-columns: 1fr; }
       .coach-locator { grid-template-columns: 1fr; }
       .coach-locator .coach-sync-check { grid-column: 1; }
+      .pdf-analysis-results, .pdf-starters { grid-template-columns: 1fr; }
       .coach-resource-list { grid-template-columns: 1fr; }
       .viewer-actions { justify-content: flex-start; margin-top: 0.8rem; }
       .viewer-frame, .viewer-frame iframe { min-height: 24rem; }
@@ -386,7 +398,7 @@
     <section id="library" aria-labelledby="library-title">
       <p class="eyebrow">Private reading shelf</p>
       <h2 id="library-title">Keep the full PDF beside the lesson</h2>
-      <p class="section-intro">Add complete PDFs from your computer, select one, and read it without leaving the study flow. Files stay in this browser profile on this exact local address; nothing is sent to a server. The corrected <a href="pdf_reading_map.md">PDF reading workflow</a> now tells you what to read, understand, produce, and pass for every stage.</p>
+      <p class="section-intro">Add complete PDFs from your computer, select one, and read it without leaving the study flow. Files stay in this browser profile on this exact local address. Analysis is off by default; when you explicitly opt in, one temporary copy goes only to the loopback study process and is deleted after text extraction. The corrected <a href="pdf_reading_map.md">PDF reading workflow</a> tells you what to read, understand, produce, and pass for every stage.</p>
       <div class="reading-route" id="reading-route" aria-label="Three-day PDF reading route">
         <article class="reading-step">
           <span class="route-label">Day 1 / Stages 1-4</span>
@@ -455,7 +467,7 @@
                 </select>
               </div>
             </div>
-            <p class="coach-summary" id="coach-summary">The coach will match known source filenames locally. It never sends shelf PDFs to Codex or another server.</p>
+            <p class="coach-summary" id="coach-summary">The coach treats filenames only as hints. Optional page detection runs only after consent on this computer; shelf PDFs are never sent to Codex or the internet.</p>
             <span class="sr-only" id="coach-announcement" role="status" aria-live="polite"></span>
             <form class="coach-sync" id="coach-sync-form">
               <div class="coach-sync-head">
@@ -483,6 +495,20 @@
                     <input id="coach-page-convention" type="text" autocomplete="off" placeholder="Example: viewer p. 76 = printed p. 51" required>
                   </label>
                   <label class="coach-sync-check"><input id="coach-identity-confirmed" type="checkbox"> I checked these identity fields against the opened PDF.</label>
+                  <section class="pdf-analysis" aria-labelledby="pdf-analysis-title">
+                    <h5 id="pdf-analysis-title">Detect relevant pages and code starters locally</h5>
+                    <p>This opt-in action sends a temporary copy only to the <code>127.0.0.1</code> study process. Poppler extracts text, returns two qualified page candidates, and deletes the temporary copy. Nothing runs automatically and nothing is uploaded to the internet.</p>
+                    <label class="coach-sync-check"><input id="pdf-analysis-consent" type="checkbox"> I want to analyze this selected PDF locally for the current day.</label>
+                    <div class="pdf-analysis-actions">
+                      <button class="button secondary" id="analyze-pdf-locally" type="button" disabled>Analyze selected PDF locally</button>
+                      <button class="button secondary" id="apply-analysis-locators" type="button" disabled>Use both as unconfirmed locators</button>
+                      <span class="pdf-analysis-status" id="pdf-analysis-status" role="status" aria-live="polite"></span>
+                    </div>
+                    <div class="pdf-analysis-results" id="pdf-analysis-results">
+                      <p class="empty-state">No local analysis run for this PDF and day.</p>
+                    </div>
+                    <div class="pdf-starters" id="pdf-code-starters"></div>
+                  </section>
                 </div>
                 <div class="coach-locators">
                   <div class="coach-locator">

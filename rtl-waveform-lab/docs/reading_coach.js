@@ -293,9 +293,9 @@
         confirmed: false
       },
       blocks: {
-        day1: { locators: [{ value: "", viewerPage: 0, confirmed: false }, { value: "", viewerPage: 0, confirmed: false }] },
-        day2: { locators: [{ value: "", viewerPage: 0, confirmed: false }, { value: "", viewerPage: 0, confirmed: false }] },
-        day3: { locators: [{ value: "", viewerPage: 0, confirmed: false }, { value: "", viewerPage: 0, confirmed: false }] }
+        day1: { locators: [{ value: "", viewerPage: 0, confirmed: false }, { value: "", viewerPage: 0, confirmed: false }], analysis: null },
+        day2: { locators: [{ value: "", viewerPage: 0, confirmed: false }, { value: "", viewerPage: 0, confirmed: false }], analysis: null },
+        day3: { locators: [{ value: "", viewerPage: 0, confirmed: false }, { value: "", viewerPage: 0, confirmed: false }], analysis: null }
       }
     };
   }
@@ -499,11 +499,11 @@
       sourceType,
       badge: `${syncPrefix} / Other source`,
       title: "Triage this PDF in two passes before reading it linearly",
-      summary: `${sync.message} The shelf does not parse arbitrary PDF contents. The two reading cards are manual triage steps, followed by two trusted block-level runs.`,
+      summary: `${sync.message} Optional local analysis can suggest exactly two text-matched pages after explicit consent; suggestions remain unconfirmed. The two reading cards are followed by two trusted block-level runs.`,
       steps: [
         "Complete both reading cards without assuming the filename describes the contents.",
         "Use both video/guided-run cards and produce their named artifacts.",
-        "Attach the PDF separately in Codex when you want verified exact-page guidance."
+        "Preview and confirm local candidates, or attach the PDF separately in Codex when you want a deeper source review."
       ],
       artifact: "Produce one provisional evidence-ledger row and a stage-specific reading assignment.",
       gate: "MANUAL until the source is attached and its relevant pages are inspected; never infer a pass from the filename alone.",

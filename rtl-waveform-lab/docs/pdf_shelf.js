@@ -44,6 +44,12 @@ const coachLocator1Confirmed = document.querySelector("#coach-locator-1-confirme
 const coachLocator2Confirmed = document.querySelector("#coach-locator-2-confirmed");
 const saveCoachSync = document.querySelector("#save-coach-sync");
 const coachSyncSaveStatus = document.querySelector("#coach-sync-save-status");
+const pdfAnalysisConsent = document.querySelector("#pdf-analysis-consent");
+const analyzePdfLocally = document.querySelector("#analyze-pdf-locally");
+const applyAnalysisLocators = document.querySelector("#apply-analysis-locators");
+const pdfAnalysisStatus = document.querySelector("#pdf-analysis-status");
+const pdfAnalysisResults = document.querySelector("#pdf-analysis-results");
+const pdfCodeStarters = document.querySelector("#pdf-code-starters");
 const coachArtifact = document.querySelector("#coach-artifact");
 const coachGate = document.querySelector("#coach-gate");
 const coachOutputHelp = document.querySelector("#coach-output-help");
@@ -58,6 +64,9 @@ let pdfDbPromise;
 let activePdfUrl = "";
 let activePdfRecord = null;
 let selectionGeneration = 0;
+let analysisGeneration = 0;
+let analysisAbortController = null;
+let activePdfAnalysis = null;
 
 function setPdfStatus(message, isError = false) {
   pdfStatus.textContent = message;
@@ -79,6 +88,11 @@ function setOutputStatus(message, isError = false) {
   coachOutputStatus.setAttribute("role", isError ? "alert" : "status");
 }
 
+function setPdfAnalysisStatus(message, isError = false) {
+  pdfAnalysisStatus.textContent = message;
+  pdfAnalysisStatus.setAttribute("role", isError ? "alert" : "status");
+}
+
 function getStoredCoachProfile(metadata) {
   const coach = window.RTL_READING_COACH;
   const fallback = coach?.createEmptyProfile?.() || {
@@ -86,9 +100,9 @@ function getStoredCoachProfile(metadata) {
     sourceOverride: "",
     identity: { titleAndAuthor: "", version: "", pageConvention: "", confirmed: false },
     blocks: {
-      day1: { locators: [{ value: "", viewerPage: 0, confirmed: false }, { value: "", viewerPage: 0, confirmed: false }] },
-      day2: { locators: [{ value: "", viewerPage: 0, confirmed: false }, { value: "", viewerPage: 0, confirmed: false }] },
-      day3: { locators: [{ value: "", viewerPage: 0, confirmed: false }, { value: "", viewerPage: 0, confirmed: false }] }
+      day1: { locators: [{ value: "", viewerPage: 0, confirmed: false }, { value: "", viewerPage: 0, confirmed: false }], analysis: null },
+      day2: { locators: [{ value: "", viewerPage: 0, confirmed: false }, { value: "", viewerPage: 0, confirmed: false }], analysis: null },
+      day3: { locators: [{ value: "", viewerPage: 0, confirmed: false }, { value: "", viewerPage: 0, confirmed: false }], analysis: null }
     }
   };
   return metadata?.coachProfile && typeof metadata.coachProfile === "object" ? metadata.coachProfile : fallback;
@@ -99,8 +113,11 @@ function profileForCoach(metadata) {
 }
 
 function resetSyncControls() {
+  invalidatePdfAnalysis();
   coachSyncFields.disabled = true;
   saveCoachSync.disabled = true;
+  pdfAnalysisConsent.checked = false;
+  analyzePdfLocally.disabled = true;
   coachSyncState.textContent = "No PDF selected";
   coachSyncState.classList.remove("ready");
   coachSyncMessage.textContent = "Select a PDF, then confirm its identity and two locators for the current day. Filename matching is only a suggestion.";
@@ -115,6 +132,7 @@ function resetSyncControls() {
   coachLocator2Page.value = "";
   coachLocator1Confirmed.checked = false;
   coachLocator2Confirmed.checked = false;
+  clearPdfAnalysisPanel();
   setSyncSaveStatus("");
 }
 
@@ -128,6 +146,7 @@ function renderSyncControls(metadata, assignment) {
   const locators = Array.isArray(blockProfile.locators) ? blockProfile.locators : [];
   coachSyncFields.disabled = false;
   saveCoachSync.disabled = false;
+  analyzePdfLocally.disabled = !pdfAnalysisConsent.checked;
   coachSyncState.textContent = assignment.sync.ready
     ? "Sync ready"
     : assignment.sync.identityConfirmed ? "Locators pending" : "Identity pending";
@@ -166,7 +185,8 @@ function copyProfileForEdit(profile) {
           ? Math.max(0, Number(locators[index]?.viewerPage))
           : 0,
         confirmed: Boolean(Array.isArray(locators) && locators[index]?.confirmed)
-      }))
+      })),
+      analysis: profile.blocks?.[block]?.analysis || null
     };
   }
   return copy;
@@ -205,12 +225,20 @@ function collectCoachProfile() {
   const nextIdentityKey = [sourceOverride, identity.titleAndAuthor, identity.version, identity.pageConvention].join("\n");
   const hadSavedIdentity = Boolean(previous.sourceOverride || previous.identity?.titleAndAuthor || previous.identity?.version);
   const identityChanged = hadSavedIdentity && previousIdentityKey !== nextIdentityKey;
-  if (identityChanged) {
+  const previousLocators = previous.blocks?.[coachStage.value]?.locators || [];
+  const previousLocatorKey = [0, 1].map((index) => [
+    previousLocators[index]?.value || "",
+    Number(previousLocators[index]?.viewerPage) || 0
+  ].join("\n")).join("\n---\n");
+  const nextLocatorKey = locatorValues.map((value, index) => [value, locatorPages[index] || 0].join("\n")).join("\n---\n");
+  const hadSavedLocators = previousLocators.some((locator) => locator?.value || Number(locator?.viewerPage) > 0);
+  const locatorChanged = hadSavedLocators && previousLocatorKey !== nextLocatorKey;
+  const changeRequiresReconfirmation = identityChanged || locatorChanged;
+  if (changeRequiresReconfirmation) {
     next.revision += 1;
-    for (const block of ["day1", "day2", "day3"]) {
-      next.blocks[block].locators.forEach((locator) => {
-        locator.confirmed = false;
-      });
+    const blocksToInvalidate = identityChanged ? ["day1", "day2", "day3"] : [coachStage.value];
+    for (const block of blocksToInvalidate) {
+      next.blocks[block].locators.forEach((locator) => { locator.confirmed = false; });
     }
   }
   next.sourceOverride = sourceOverride;
@@ -219,8 +247,9 @@ function collectCoachProfile() {
     locators: locatorValues.map((value, index) => ({
       value,
       viewerPage: Number.isSafeInteger(locatorPages[index]) && locatorPages[index] > 0 ? locatorPages[index] : 0,
-      confirmed: identityChanged ? false : locatorChecks[index]
-    }))
+      confirmed: changeRequiresReconfirmation ? false : locatorChecks[index]
+    })),
+    analysis: next.blocks[coachStage.value]?.analysis || null
   };
   return next;
 }
@@ -239,6 +268,170 @@ function appendCoachDetail(card, label, value, className = "") {
   heading.textContent = `${label}: `;
   row.append(heading, document.createTextNode(value));
   card.appendChild(row);
+}
+
+function invalidatePdfAnalysis() {
+  analysisGeneration += 1;
+  analysisAbortController?.abort();
+  analysisAbortController = null;
+}
+
+function clearPdfAnalysisPanel(message = "No local analysis run for this PDF and day.") {
+  activePdfAnalysis = null;
+  applyAnalysisLocators.disabled = true;
+  pdfAnalysisResults.replaceChildren();
+  const placeholder = document.createElement("p");
+  placeholder.className = "empty-state";
+  placeholder.textContent = message;
+  pdfAnalysisResults.appendChild(placeholder);
+  pdfCodeStarters.replaceChildren();
+  setPdfAnalysisStatus("");
+}
+
+function validateLocalAnalysis(candidate) {
+  const allowedStarterIds = new Set([
+    "xor_half_adder", "mux", "registered_stage", "fsm", "self_checking_tb", "hls_reference"
+  ]);
+  if (!candidate || candidate.schemaVersion !== 1 || candidate.algorithmVersion !== "rtl-study-v1") {
+    throw new Error("The local analyzer returned an unsupported result version.");
+  }
+  if (!Array.isArray(candidate.candidates) || candidate.candidates.length !== 2) {
+    throw new Error("The local analyzer did not return exactly two reading candidates.");
+  }
+  const pages = new Set();
+  candidate.candidates.forEach((item) => {
+    if (!item?.available || !Number.isSafeInteger(item.viewerPage) || item.viewerPage < 1 || pages.has(item.viewerPage)) {
+      throw new Error("The local analyzer returned an invalid or duplicate viewer page.");
+    }
+    pages.add(item.viewerPage);
+    for (const field of ["id", "title", "location", "confidence", "stage", "artifact", "gate", "snippet"]) {
+      if (typeof item[field] !== "string") throw new Error(`The local analyzer candidate is missing ${field}.`);
+    }
+    if (item.snippet.length > 520 || !Array.isArray(item.matchedTerms)) {
+      throw new Error("The local analyzer candidate evidence is malformed.");
+    }
+  });
+  if (!Array.isArray(candidate.starters) || candidate.starters.length > 2) {
+    throw new Error("The local analyzer returned too many code starters.");
+  }
+  candidate.starters.forEach((starter) => {
+    if (!allowedStarterIds.has(starter?.id) || typeof starter.code !== "string" || starter.code.length > 6000) {
+      throw new Error("The local analyzer returned an unsupported code starter.");
+    }
+    for (const field of ["title", "language", "detectedFrom", "caveat"]) {
+      if (typeof starter[field] !== "string") throw new Error(`The code starter is missing ${field}.`);
+    }
+  });
+  if (!/^[0-9a-f]{64}$/.test(candidate.pdfSha256 || "")) {
+    throw new Error("The local analyzer result is not bound to a PDF digest.");
+  }
+  return candidate;
+}
+
+function renderPdfAnalysis(analysis, restored = false) {
+  if (!analysis) {
+    clearPdfAnalysisPanel();
+    return;
+  }
+  let validated;
+  try {
+    validated = validateLocalAnalysis(analysis);
+  } catch (error) {
+    clearPdfAnalysisPanel("Saved local analysis is invalid; run it again.");
+    setPdfAnalysisStatus(error.message, true);
+    return;
+  }
+  activePdfAnalysis = validated;
+  pdfAnalysisResults.replaceChildren();
+  validated.candidates.forEach((candidate, index) => {
+    const card = document.createElement("article");
+    card.className = "pdf-analysis-card";
+    const title = document.createElement("h6");
+    title.textContent = `${index + 1}. ${candidate.title}`;
+    card.appendChild(title);
+    appendCoachDetail(card, "Candidate page", String(candidate.viewerPage));
+    appendCoachDetail(card, "Heading hint", candidate.location);
+    appendCoachDetail(card, "Confidence", `${candidate.confidence} (score ${candidate.score})`);
+    appendCoachDetail(card, "Matched concepts", candidate.matchedTerms.join(", "));
+    appendCoachDetail(card, "Stage", candidate.stage);
+    appendCoachDetail(card, "Produce", candidate.artifact);
+    appendCoachDetail(card, "Gate", candidate.gate);
+    const snippet = document.createElement("p");
+    snippet.className = "analysis-snippet";
+    snippet.textContent = `Extracted hint: ${candidate.snippet}`;
+    card.appendChild(snippet);
+    const preview = document.createElement("button");
+    preview.type = "button";
+    preview.className = "button secondary";
+    preview.textContent = `Preview PDF page ${candidate.viewerPage}`;
+    preview.addEventListener("click", () => jumpToPdfPage(candidate.viewerPage));
+    card.appendChild(preview);
+    pdfAnalysisResults.appendChild(card);
+  });
+  pdfCodeStarters.replaceChildren();
+  validated.starters.forEach((starter) => {
+    const card = document.createElement("article");
+    card.className = "pdf-starter";
+    const title = document.createElement("h6");
+    title.textContent = starter.title;
+    const note = document.createElement("p");
+    note.textContent = `${starter.language} - ${starter.caveat}`;
+    const code = document.createElement("pre");
+    code.textContent = starter.code;
+    const copy = document.createElement("button");
+    copy.type = "button";
+    copy.className = "button secondary";
+    copy.textContent = "Copy code starter";
+    copy.addEventListener("click", async () => {
+      try {
+        if (!navigator.clipboard?.writeText) throw new Error("Clipboard API unavailable");
+        await navigator.clipboard.writeText(starter.code);
+        setPdfAnalysisStatus(`${starter.title} copied. Verify it against your specification and gates.`);
+      } catch (error) {
+        setPdfAnalysisStatus("Automatic copy is unavailable. Select and copy the visible starter manually.", true);
+      }
+    });
+    card.append(title, note, code, copy);
+    pdfCodeStarters.appendChild(card);
+  });
+  applyAnalysisLocators.disabled = false;
+  setPdfAnalysisStatus(restored
+    ? "Restored saved text-only candidates for this PDF and day. Preview before applying."
+    : "Two text-only candidates found and saved locally. Preview both before applying.");
+}
+
+async function persistPdfAnalysis(recordId, block, analysis) {
+  const db = await openPdfDb();
+  const transaction = db.transaction(PDF_META_STORE, "readwrite");
+  const completed = transactionComplete(transaction);
+  const store = transaction.objectStore(PDF_META_STORE);
+  const record = await requestResult(store.get(recordId));
+  if (!record) {
+    await completed;
+    throw new DOMException("The selected PDF metadata no longer exists.", "NotFoundError");
+  }
+  const profile = copyProfileForEdit(getStoredCoachProfile(record));
+  profile.blocks[block].analysis = { ...analysis, analyzedAt: new Date().toISOString() };
+  const updatedRecord = { ...record, coachProfile: profile };
+  store.put(updatedRecord);
+  await completed;
+  return updatedRecord;
+}
+
+async function responseJson(response) {
+  if (!response.headers.get("Content-Type")?.includes("application/json")) return {};
+  try {
+    return await response.json();
+  } catch (error) {
+    return {};
+  }
+}
+
+function localAnalysisError(response, payload) {
+  if ([404, 501].includes(response.status)) {
+    return "The static server cannot analyze PDFs. Stop it, then restart this lab with make serve.";
+  }
+  return payload?.error?.message || `Local PDF analysis failed with HTTP ${response.status}.`;
 }
 
 function jumpToPdfPage(requestedPage) {
@@ -317,7 +510,7 @@ function renderReadingCoach(metadata) {
   if (!metadata) {
     coachBadge.textContent = "No PDF selected";
     coachTitle.textContent = "Select a PDF to get a reading assignment";
-    coachSummary.textContent = "The coach will match known source filenames locally. It never sends shelf PDFs to Codex or another server.";
+    coachSummary.textContent = "The coach treats filenames only as hints. Optional detection runs only after consent on this computer; PDFs are never sent to Codex or the internet.";
     coachSteps.replaceChildren();
     [
       "Add or select a PDF from your shelf.",
@@ -373,6 +566,7 @@ function renderReadingCoach(metadata) {
   renderCoachResources(coachReadings, assignment.readings);
   renderCoachResources(coachRuns, assignment.runs);
   renderSyncControls(metadata, assignment);
+  renderPdfAnalysis(getStoredCoachProfile(metadata).blocks?.[coachStage.value]?.analysis || null, true);
   coachArtifact.textContent = assignment.artifact;
   coachGate.textContent = assignment.gate;
   coachOutputHelp.textContent = assignment.sync.ready
@@ -546,6 +740,9 @@ function clearPdfViewer() {
 
 async function selectPdf(metadata) {
   const generation = ++selectionGeneration;
+  invalidatePdfAnalysis();
+  pdfAnalysisConsent.checked = false;
+  analyzePdfLocally.disabled = true;
   pdfList.setAttribute("aria-busy", "true");
   try {
     const stored = await getPdfBlob(metadata.id);
@@ -667,8 +864,86 @@ pdfInput.addEventListener("change", () => addPdfFiles(pdfInput.files));
 });
 pdfDropZone.addEventListener("drop", (event) => addPdfFiles(event.dataTransfer.files));
 coachStage.addEventListener("change", () => {
+  invalidatePdfAnalysis();
+  pdfAnalysisConsent.checked = false;
+  analyzePdfLocally.disabled = true;
   setSyncSaveStatus("");
   renderReadingCoach(activePdfRecord);
+});
+pdfAnalysisConsent.addEventListener("change", () => {
+  analyzePdfLocally.disabled = !activePdfRecord || !pdfAnalysisConsent.checked;
+});
+analyzePdfLocally.addEventListener("click", async () => {
+  if (!activePdfRecord || !pdfAnalysisConsent.checked) return;
+  invalidatePdfAnalysis();
+  analysisAbortController = new AbortController();
+  const controller = analysisAbortController;
+  const runGeneration = analysisGeneration;
+  const selectedGeneration = selectionGeneration;
+  const record = activePdfRecord;
+  const block = coachStage.value;
+  const priorAnalysis = getStoredCoachProfile(record).blocks?.[block]?.analysis || null;
+  analyzePdfLocally.disabled = true;
+  applyAnalysisLocators.disabled = true;
+  setPdfAnalysisStatus("Extracting and ranking this PDF on 127.0.0.1...");
+  try {
+    const stored = await getPdfBlob(record.id);
+    if (!stored?.blob) throw new Error("The selected PDF bytes are missing from browser storage.");
+    const sessionResponse = await fetch("/api/v1/session", {
+      cache: "no-store",
+      credentials: "omit",
+      referrerPolicy: "no-referrer",
+      signal: controller.signal
+    });
+    const sessionPayload = await responseJson(sessionResponse);
+    if (!sessionResponse.ok || typeof sessionPayload.token !== "string") {
+      throw new Error(localAnalysisError(sessionResponse, sessionPayload));
+    }
+    const analysisResponse = await fetch(`/api/v1/pdf-candidates/${block}`, {
+      method: "POST",
+      body: stored.blob,
+      cache: "no-store",
+      credentials: "omit",
+      referrerPolicy: "no-referrer",
+      headers: {
+        "Content-Type": "application/pdf",
+        "X-Study-Token": sessionPayload.token
+      },
+      signal: controller.signal
+    });
+    const payload = await responseJson(analysisResponse);
+    if (!analysisResponse.ok) throw new Error(localAnalysisError(analysisResponse, payload));
+    const validated = validateLocalAnalysis(payload);
+    if (runGeneration !== analysisGeneration || selectedGeneration !== selectionGeneration || activePdfRecord?.id !== record.id || coachStage.value !== block) return;
+    const updatedRecord = await persistPdfAnalysis(record.id, block, validated);
+    if (runGeneration !== analysisGeneration || selectedGeneration !== selectionGeneration || activePdfRecord?.id !== record.id || coachStage.value !== block) return;
+    activePdfRecord = updatedRecord;
+    await renderPdfList();
+    renderReadingCoach(activePdfRecord);
+    renderPdfAnalysis(validated, false);
+  } catch (error) {
+    if (error.name !== "AbortError" && runGeneration === analysisGeneration) {
+      if (priorAnalysis) renderPdfAnalysis(priorAnalysis, true);
+      else clearPdfAnalysisPanel("No qualified local candidates are available for this PDF and day.");
+      setPdfAnalysisStatus(error.message || "Local PDF analysis failed.", true);
+    }
+  } finally {
+    if (runGeneration === analysisGeneration) {
+      analysisAbortController = null;
+      analyzePdfLocally.disabled = !activePdfRecord || !pdfAnalysisConsent.checked;
+    }
+  }
+});
+applyAnalysisLocators.addEventListener("click", () => {
+  if (!activePdfAnalysis || activePdfAnalysis.candidates.length !== 2) return;
+  const [first, second] = activePdfAnalysis.candidates;
+  coachLocator1.value = first.location;
+  coachLocator1Page.value = String(first.viewerPage);
+  coachLocator1Confirmed.checked = false;
+  coachLocator2.value = second.location;
+  coachLocator2Page.value = String(second.viewerPage);
+  coachLocator2Confirmed.checked = false;
+  setSyncSaveStatus("Candidates filled as unconfirmed locators. Preview both pages, then save; check them only after the content matches.");
 });
 coachSyncForm.addEventListener("submit", async (event) => {
   event.preventDefault();

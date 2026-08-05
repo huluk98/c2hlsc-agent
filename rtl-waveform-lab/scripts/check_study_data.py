@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import ast
 import csv
 from html.parser import HTMLParser
 import json
@@ -15,6 +16,14 @@ import tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
+PYTHON_ASSETS = (
+    ROOT / "scripts/check_study_data.py",
+    ROOT / "scripts/pdf_study_analyzer.py",
+    ROOT / "scripts/study_server.py",
+    ROOT / "scripts/test_pdf_study_analyzer.py",
+    ROOT / "scripts/test_study_server.py",
+)
+
 TEXT_ASSETS = (
     ROOT / "README.md",
     ROOT / "Makefile",
@@ -25,7 +34,8 @@ TEXT_ASSETS = (
     ROOT / "docs/ordered_exercises.md",
     ROOT / "docs/fundamentals_field_guide.md",
     ROOT / "docs/generation_contract.md",
-    ROOT / "scripts/check_study_data.py",
+    ROOT / "scripts/check_environment.sh",
+    *PYTHON_ASSETS,
 )
 
 EXPECTED_ROWS = [
@@ -72,6 +82,12 @@ for text_path in TEXT_ASSETS:
                 "text asset contains a common mojibake marker "
                 f"U+{codepoint:04X}: {text_path.relative_to(ROOT)}"
             )
+
+for python_path in PYTHON_ASSETS:
+    try:
+        ast.parse(python_path.read_text(encoding="utf-8"), filename=str(python_path))
+    except SyntaxError as error:
+        fail(f"Python syntax error in {python_path.relative_to(ROOT)}: {error}")
 
 
 class StudyTableParser(HTMLParser):
@@ -152,6 +168,7 @@ except UnicodeEncodeError as error:
 ordered_reading_sections = (
     "## How to use this map",
     "## Source and page-number rules",
+    "## Opt-in local PDF detection",
     "## Route at a glance",
     "## Day 1 - Preflight and Stages 1-4",
     "## Day 2 - Stages 5-8",
@@ -174,6 +191,15 @@ if "../../papers/2507.04315v3.pdf" not in reading_map:
     fail("pdf_reading_map.md does not identify the supplied HLStrans PDF")
 if not (ROOT.parent / "papers/2507.04315v3.pdf").is_file():
     fail("the mapped HLStrans PDF is missing from the parent papers directory")
+for required_analysis_statement in (
+    "nothing is transmitted automatically",
+    "exactly two distinct, qualified page candidates",
+    "text-only keyword/concept heuristic",
+    "unconfirmed locators",
+    "no starter runs automatically",
+):
+    if required_analysis_statement not in reading_map:
+        fail(f"pdf_reading_map.md is missing local-analysis contract: {required_analysis_statement}")
 for marker in (
     'id="library"',
     'id="reading-route"',
@@ -184,8 +210,14 @@ for marker in (
     'id="pdf-viewer"',
     'id="coach-readings"',
     'id="coach-runs"',
+    'id="pdf-analysis-consent"',
+    'id="analyze-pdf-locally"',
+    'id="apply-analysis-locators"',
+    'id="pdf-analysis-results"',
+    'id="pdf-code-starters"',
     'src="reading_coach.js"',
     'src="pdf_shelf.js"',
+    "connect-src 'self'",
     "frame-src 'self' blob:",
 ):
     if marker not in html:
@@ -244,8 +276,13 @@ if result.returncode:
 
 reading_coach_script = ROOT / "docs/reading_coach.js"
 pdf_shelf_script = ROOT / "docs/pdf_shelf.js"
+pdf_analyzer_script = ROOT / "scripts/pdf_study_analyzer.py"
+study_server_script = ROOT / "scripts/study_server.py"
 reading_coach_source = reading_coach_script.read_text(encoding="utf-8")
 pdf_shelf_source = pdf_shelf_script.read_text(encoding="utf-8")
+pdf_analyzer_source = pdf_analyzer_script.read_text(encoding="utf-8")
+study_server_source = study_server_script.read_text(encoding="utf-8")
+makefile_source = (ROOT / "Makefile").read_text(encoding="utf-8")
 for local_resource in re.findall(r'url:\s*"([a-z0-9_]+\.md)"', reading_coach_source):
     if not (ROOT / "docs" / local_resource).is_file():
         fail(f"reading_coach.js links missing local resource: {local_resource}")
@@ -262,6 +299,48 @@ for script_path in (reading_coach_script, pdf_shelf_script):
     if result.returncode:
         sys.stderr.write(result.stderr)
         fail(f"{script_path.name} failed node --check")
+
+for make_marker in (
+    "pdf-analyzer-test:",
+    "./scripts/test_pdf_study_analyzer.py",
+    "./scripts/test_study_server.py",
+    "$(PYTHON) ./scripts/study_server.py --port 4173 --directory .",
+):
+    if make_marker not in makefile_source:
+        fail(f"Makefile is missing local PDF-analysis integration: {make_marker}")
+if re.search(r"^verify:.*\bpdf-analyzer-test\b", makefile_source, flags=re.MULTILINE) is None:
+    fail("Makefile verify target must include pdf-analyzer-test")
+if "python3 -m http.server" in makefile_source or "$(PYTHON) -m http.server" in makefile_source:
+    fail("Makefile serve must use study_server.py, not the static http.server")
+
+for server_marker in (
+    '"/api/v1/session"',
+    'prefix = "/api/v1/pdf-candidates/"',
+    'StudyServer(("127.0.0.1", args.port)',
+    "TemporaryDirectory(prefix=\"rtl-study-\")",
+    '"X-Study-Token"',
+    '"INSUFFICIENT_CANDIDATES"',
+    'result.pop("fileName", None)',
+    '"textOnly": True',
+    "if not self._trusted_host():",
+):
+    if server_marker not in study_server_source:
+        fail(f"study_server.py is missing loopback PDF-analysis contract: {server_marker}")
+
+for analyzer_marker in (
+    "MAX_PAGES = 650",
+    "MAX_EXTRACT_BYTES = 8 * 1024 * 1024",
+    "STARTERS: dict[str, dict[str, str]] =",
+    '"Page matches are keyword-ranked local suggestions, not semantic proof."',
+    '"Review each candidate in the PDF before confirming its locator or using a starter."',
+    "start_new_session=True",
+    '"requiredGroups"',
+    "page_two_evidence >= 4",
+    "selectors.DefaultSelector()",
+    "total > max_output_bytes",
+):
+    if analyzer_marker not in pdf_analyzer_source:
+        fail(f"pdf_study_analyzer.py is missing bounded deterministic behavior: {analyzer_marker}")
 
 coach_contract_check = r"""
 const coach = require(process.argv[1]);
@@ -345,7 +424,7 @@ for (const block of Object.keys(coach.BLOCK_LABELS)) {
   const unknown = coach.getReadingAssignment(sources.unmapped, block);
   const unknownText = unknown.readings.map((item) => `${item.title} ${item.detail}`).join(" ");
   assert(!/\bPDF pages?\s+\d/i.test(unknownText), `${block}/unmapped: invented exact page guidance`);
-  assert(/does not parse/.test(unknown.summary), `${block}/unmapped: parsing boundary is not explicit`);
+  assert(/explicit consent/.test(unknown.summary) && /unconfirmed/.test(unknown.summary), `${block}/unmapped: opt-in analysis boundary is not explicit`);
 }
 function visibleAssignmentText(assignment) {
   return [assignment.title, assignment.summary, ...assignment.steps, assignment.artifact, assignment.gate,
@@ -380,13 +459,71 @@ if result.returncode:
 
 for required_source_marker in (
     "async function updatePdfMetadata(metadata)",
-    "identityChanged ? false : locatorChecks[index]",
+    "const changeRequiresReconfirmation = identityChanged || locatorChanged",
+    "changeRequiresReconfirmation ? false : locatorChecks[index]",
     "Number.isSafeInteger(page)",
     "#page=${page}",
     "coachProfile",
 ):
     if required_source_marker not in pdf_shelf_source:
         fail(f"pdf_shelf.js is missing synchronization/jump behavior: {required_source_marker}")
+
+consent_binding = 'pdfAnalysisConsent.addEventListener("change"'
+analysis_binding = 'analyzePdfLocally.addEventListener("click"'
+apply_binding = 'applyAnalysisLocators.addEventListener("click"'
+sync_binding = 'coachSyncForm.addEventListener("submit"'
+consent_start = pdf_shelf_source.find(consent_binding)
+analysis_start = pdf_shelf_source.find(analysis_binding)
+analysis_end = pdf_shelf_source.find(apply_binding, analysis_start)
+apply_end = pdf_shelf_source.find(sync_binding, analysis_end)
+if min(consent_start, analysis_start, analysis_end, apply_end) < 0 or not consent_start < analysis_start < analysis_end < apply_end:
+    fail("pdf_shelf.js must bind consent, analysis click, locator application, and sync save in order")
+analysis_handler = pdf_shelf_source[analysis_start:analysis_end]
+for required_step in (
+    "if (!activePdfRecord || !pdfAnalysisConsent.checked) return;",
+    "const stored = await getPdfBlob(record.id)",
+    'fetch("/api/v1/session"',
+    "fetch(`/api/v1/pdf-candidates/${block}`",
+    '"Content-Type": "application/pdf"',
+    '"X-Study-Token": sessionPayload.token',
+    "validateLocalAnalysis(payload)",
+    "persistPdfAnalysis(record.id, block, validated)",
+    "selectedGeneration !== selectionGeneration",
+):
+    if required_step not in analysis_handler:
+        fail(f"pdf_shelf.js opt-in analysis click is missing step: {required_step}")
+for atomic_merge_marker in (
+    "async function persistPdfAnalysis(recordId, block, analysis)",
+    "const record = await requestResult(store.get(recordId))",
+    "const profile = copyProfileForEdit(getStoredCoachProfile(record))",
+):
+    if atomic_merge_marker not in pdf_shelf_source:
+        fail(f"pdf_shelf.js must merge analysis into fresh PDF metadata: {atomic_merge_marker}")
+for fetch_marker in ('fetch("/api/v1/session"', "fetch(`/api/v1/pdf-candidates/${block}`"):
+    if pdf_shelf_source.count(fetch_marker) != 1 or fetch_marker not in analysis_handler:
+        fail(f"pdf_shelf.js must fetch only after the explicit analysis click: {fetch_marker}")
+consent_handler = pdf_shelf_source[consent_start:analysis_start]
+if "analyzePdfLocally.disabled = !activePdfRecord || !pdfAnalysisConsent.checked" not in consent_handler:
+    fail("pdf_shelf.js consent change must gate the local-analysis button")
+apply_handler = pdf_shelf_source[analysis_end:apply_end]
+for required_step in (
+    "activePdfAnalysis.candidates.length !== 2",
+    "coachLocator1Confirmed.checked = false",
+    "coachLocator2Confirmed.checked = false",
+    "unconfirmed locators",
+):
+    if required_step not in apply_handler:
+        fail(f"pdf_shelf.js candidate application is missing preview/confirm boundary: {required_step}")
+for fixed_starter_marker in (
+    "code.textContent = starter.code",
+    "navigator.clipboard.writeText(starter.code)",
+    'preview.addEventListener("click", () => jumpToPdfPage(candidate.viewerPage))',
+):
+    if fixed_starter_marker not in pdf_shelf_source:
+        fail(f"pdf_shelf.js is missing copy/preview-only starter behavior: {fixed_starter_marker}")
+for forbidden_execution_marker in ("eval(", "new Function("):
+    if forbidden_execution_marker in pdf_shelf_source:
+        fail(f"pdf_shelf.js must never execute PDF-derived starter content: {forbidden_execution_marker}")
 
 controller_contract = {
     'coachSyncForm.addEventListener("submit"': (
@@ -411,4 +548,4 @@ for binding, required_steps in controller_contract.items():
         if step not in handler:
             fail(f"pdf_shelf.js controller binding {binding} is missing step: {step}")
 
-print("PASS: strict UTF-8 assets, WaveJSON, E0-E10 trace, study links, ASCII-safe PDF workflow, learner-confirmed PDF sync, one-click page locators, 2+2 reading/run worksheet contract, PDF shelf structure, quiz count, and JavaScript syntax agree.")
+print("PASS: strict UTF-8 assets, Python/JavaScript syntax, WaveJSON, E0-E10 trace, study links, ASCII-safe PDF workflow, opt-in loopback PDF analysis, exactly-two-or-fail candidates, learner-confirmed PDF sync, fixed copy-only starters, one-click page locators, 2+2 reading/run worksheet contract, PDF shelf structure, and quiz count agree.")
