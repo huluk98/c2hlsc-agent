@@ -12,7 +12,7 @@ Try answering from the waveform before opening the answer section.
 6. What do E5 and E6 demonstrate about throughput, even though the latency is one cycle?
 7. At E7, `sum` is still 510. Is 510 a new output result at E7, and how do you know?
 8. Why must `sum` be nine bits wide for T2? What incorrect value would the low eight bits alone represent for 510?
-9. What is the first edge after the second reset edge E9, and what observation there proves the old pending work was cleared?
+9. In the clocked RTL, do `out_valid <= pending_valid` and `pending_valid <= in_valid` execute as software-like “first, then” updates? Which values do their right-hand sides observe?
 10. The flush probe `1+2` is pending after E8. What happens when reset is asserted at E9, and does a valid result 3 ever appear?
 
 ## Answers
@@ -25,5 +25,5 @@ Try answering from the waveform before opening the answer section.
 6. They show one-result-per-cycle throughput: T1 and T2 appear on consecutive edges because they were accepted on consecutive edges.
 7. No. `out_valid=0` at E7, so the held 510 must be ignored regardless of how meaningful it looks.
 8. `255+255=510`, which exceeds the 8-bit unsigned maximum of 255. Nine bits can represent 510. Keeping only the low eight bits would wrap to 254 (`510 mod 256`).
-9. E10 is the first edge after E9. Its `out_valid=0` shows that no pending pre-reset transaction survived to become an output.
+9. No. Both nonblocking right-hand sides observe pre-edge values, and both left-hand-side updates become visible together after the edge. Thus `out_valid` receives the old `pending_valid` while `pending_valid` receives the sampled `in_valid`.
 10. Synchronous reset has priority at E9, clearing the pending probe. No valid result 3 appears; `sum` is reset to 0 and remains invalid afterward.

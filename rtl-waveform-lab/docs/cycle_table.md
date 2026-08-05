@@ -2,6 +2,8 @@
 
 The testbench changes inputs at falling edges, halfway between the rising edges shown here. “Pending” means captured inside the design and waiting to become an output. A dash in the output-transaction column means that `sum` is invalid and must be ignored.
 
+The pending columns describe the reference model used to explain this implementation; they are not required DUT ports or an architectural constraint. Likewise, the numeric `sum` shown during a non-reset invalid cycle is the reference implementation's held value, not a value that a black-box checker requires.
+
 | Edge | Simulation time | rst | in_valid | a | b | Input transaction accepted | Internal pending-valid state | out_valid after the edge | sum after the edge | Output transaction | Explanation |
 |---|---:|---:|---:|---:|---:|---|---:|---:|---:|---|---|
 | E0 | 5 ns | 1 | 0 | 0 | 0 | No | 0 | 0 | 0 | — | Reset edge: all valid state and `sum` are cleared. Ignore `sum` because valid is low. |

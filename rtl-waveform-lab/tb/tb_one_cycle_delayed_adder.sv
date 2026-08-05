@@ -70,34 +70,36 @@ module tb_one_cycle_delayed_adder;
 
             #1ps;
 
-            if ((out_valid !== expected_out_valid) ||
-                (sum !== expected_sum)) begin
+            if (out_valid !== expected_out_valid) begin
                 errors = errors + 1;
-                $display("ERROR at E%0d (%0d ns): rst=%0b in_valid=%0b a=%0d b=%0d | expected out_valid=%0b sum=%0d, got out_valid=%0b sum=%0d",
-                         edge_number, sampled_time_ns, sampled_rst,
-                         sampled_in_valid, sampled_a, sampled_b,
-                         expected_out_valid, expected_sum, out_valid, sum);
+                $display("ERROR at E%0d (%0d ns): expected out_valid=%0b, got %0b",
+                         edge_number, sampled_time_ns,
+                         expected_out_valid, out_valid);
             end
 
-            if ((dut.pending_valid !== expected_pending_valid) ||
-                (dut.pending_sum !== expected_pending_sum)) begin
+            // sum is an interface don't-care when out_valid=0, except that the
+            // contract explicitly requires reset to clear it to known zero.
+            if ((sampled_rst && (sum !== 9'd0)) ||
+                (!sampled_rst && expected_out_valid &&
+                 (sum !== expected_sum))) begin
                 errors = errors + 1;
-                $display("ERROR at E%0d (%0d ns): expected pending_valid=%0b pending_sum=%0d, got pending_valid=%0b pending_sum=%0d",
+                $display("ERROR at E%0d (%0d ns): expected meaningful sum=%0d, got %0d (rst=%0b out_valid=%0b)",
                          edge_number, sampled_time_ns,
-                         expected_pending_valid, expected_pending_sum,
-                         dut.pending_valid, dut.pending_sum);
+                         sampled_rst ? 9'd0 : expected_sum, sum,
+                         sampled_rst, out_valid);
             end
 
             $fwrite(trace_fd, "E%0d,%0d,%0b,%0b,%0d,%0d,%0b,%0b,%0d,%0b,%0d\n",
                     edge_number, sampled_time_ns, sampled_rst,
                     sampled_in_valid, sampled_a, sampled_b,
                     (!sampled_rst && sampled_in_valid),
-                    dut.pending_valid, dut.pending_sum, out_valid, sum);
+                    expected_pending_valid, expected_pending_sum,
+                    out_valid, sum);
 
             $display("E%0d @ %0d ns: rst=%0b in_valid=%0b a=%0d b=%0d | pending_valid=%0b out_valid=%0b sum=%0d%s",
                      edge_number, sampled_time_ns, sampled_rst,
                      sampled_in_valid, sampled_a, sampled_b,
-                     dut.pending_valid, out_valid, sum,
+                     expected_pending_valid, out_valid, sum,
                      out_valid ? "" : " (sum ignored)");
         end
     endtask

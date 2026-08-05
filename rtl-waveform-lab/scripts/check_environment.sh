@@ -23,8 +23,10 @@ check_optional() {
 check_required iverilog "SystemVerilog compilation"
 check_required vvp      "running the compiled simulation"
 check_required python3  "validating the WaveDrom JSON"
+check_required verilator "strict RTL lint in make verify"
+check_required yosys     "generic RTL synthesis in make verify"
+check_required node      "checking study-page JavaScript in make docs"
 check_optional gtkwave  "make wave cannot open the VCD without it"
-check_optional node     "useful for local WaveDrom JavaScript tooling"
 check_optional wavedrom-cli "make docs will use HTML instead"
 check_optional wavedrom     "make docs will use HTML instead"
 

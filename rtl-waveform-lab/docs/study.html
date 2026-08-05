@@ -3,158 +3,254 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="A three-day RTL fundamentals study sprint with a verified waveform lesson and self-grading quiz.">
+  <meta name="theme-color" content="#f6f9fc">
+  <meta name="description" content="A private RTL study workspace with full-PDF storage, a verified waveform lesson, and a self-grading quiz.">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data: blob:; style-src 'unsafe-inline'; script-src 'self' 'unsafe-inline'; frame-src 'self' blob:; object-src 'none'; base-uri 'self'; form-action 'self'">
   <title>RTL Sprint Lab</title>
   <style>
     :root {
       color-scheme: light;
-      --ink: #172033;
-      --muted: #58657a;
-      --paper: #f7f4ed;
-      --card: #fffdf8;
-      --line: #d9d5ca;
-      --navy: #19324d;
-      --blue: #2369a6;
-      --cyan: #45b6c7;
-      --gold: #e7a631;
-      --green: #247a57;
-      --red: #ad3d3d;
-      --shadow: 0 18px 50px rgba(23, 32, 51, 0.11);
+      --ink: #0a2540;
+      --muted: #526474;
+      --canvas: #f6f9fc;
+      --surface: rgba(255, 255, 255, 0.88);
+      --surface-solid: #ffffff;
+      --line: rgba(10, 37, 64, 0.11);
+      --purple: #635bff;
+      --blue: #0a72e8;
+      --cyan: #00a6c7;
+      --gold: #e98d20;
+      --green: #138a61;
+      --red: #c43d4f;
+      --shadow: 0 24px 70px rgba(50, 50, 93, 0.10), 0 5px 18px rgba(0, 0, 0, 0.04);
+      --shadow-soft: 0 12px 35px rgba(50, 50, 93, 0.08);
     }
 
     * { box-sizing: border-box; }
     html { scroll-behavior: smooth; }
     body {
+      position: relative;
+      min-height: 100vh;
       margin: 0;
       color: var(--ink);
+      background: var(--canvas);
+      font: 16px/1.62 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", sans-serif;
+      -webkit-font-smoothing: antialiased;
+      text-rendering: optimizeLegibility;
+    }
+    body::before {
+      position: fixed;
+      inset: 0;
+      z-index: -2;
+      content: "";
       background:
-        radial-gradient(circle at top right, rgba(69, 182, 199, 0.17), transparent 30rem),
-        linear-gradient(180deg, #eef3f4 0, var(--paper) 28rem);
-      font: 16px/1.6 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        radial-gradient(circle at 8% 5%, rgba(99, 91, 255, 0.18), transparent 25rem),
+        radial-gradient(circle at 92% 10%, rgba(0, 212, 255, 0.16), transparent 27rem),
+        radial-gradient(circle at 72% 48%, rgba(255, 184, 77, 0.10), transparent 24rem),
+        linear-gradient(180deg, #ffffff 0, var(--canvas) 30rem);
+    }
+    body::after {
+      position: absolute;
+      inset: 0 0 auto;
+      z-index: -1;
+      height: 31rem;
+      content: "";
+      opacity: 0.34;
+      background-image: linear-gradient(118deg, transparent 33%, rgba(99, 91, 255, 0.08) 33%, rgba(0, 166, 199, 0.08) 66%, transparent 66%);
+      clip-path: polygon(0 0, 100% 0, 100% 72%, 0 100%);
     }
 
-    a { color: var(--blue); }
-    button, input { font: inherit; }
+    ::selection { color: #fff; background: var(--purple); }
+    a { color: var(--blue); text-underline-offset: 0.18em; }
+    button, input { color: inherit; font: inherit; }
     code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    :focus-visible { outline: 3px solid rgba(99, 91, 255, 0.32); outline-offset: 3px; }
+    .skip-link { position: fixed; top: 0.7rem; left: 0.7rem; z-index: 100; padding: 0.65rem 0.9rem; border-radius: 999px; color: #fff; background: var(--ink); transform: translateY(-160%); }
+    .skip-link:focus { transform: translateY(0); }
 
-    .shell { width: min(1160px, calc(100% - 2rem)); margin: 0 auto; }
-    .masthead { padding: 3.5rem 0 2.25rem; }
+    .shell { width: min(1180px, calc(100% - 2.5rem)); margin: 0 auto; }
+    .masthead { position: relative; overflow: hidden; padding: 6.2rem 0 4rem; }
+    .masthead::after {
+      position: absolute;
+      top: 4.4rem;
+      right: 3%;
+      width: clamp(8rem, 18vw, 14rem);
+      aspect-ratio: 1;
+      border: 1px solid rgba(99, 91, 255, 0.20);
+      border-radius: 38% 62% 58% 42%;
+      content: "";
+      background: linear-gradient(145deg, rgba(99, 91, 255, 0.17), rgba(0, 212, 255, 0.06));
+      box-shadow: inset 0 0 50px rgba(255, 255, 255, 0.78), 0 30px 80px rgba(99, 91, 255, 0.12);
+      transform: rotate(14deg);
+    }
     .eyebrow {
-      margin: 0 0 0.5rem;
-      color: var(--blue);
-      font-size: 0.78rem;
-      font-weight: 800;
-      letter-spacing: 0.16em;
+      margin: 0 0 0.65rem;
+      color: var(--purple);
+      font-size: 0.74rem;
+      font-weight: 750;
+      letter-spacing: 0.18em;
       text-transform: uppercase;
     }
-    h1, h2, h3 { line-height: 1.15; }
-    h1 { max-width: 780px; margin: 0; color: var(--navy); font-size: clamp(2.5rem, 7vw, 5.5rem); letter-spacing: -0.055em; }
-    h2 { margin: 0 0 1rem; color: var(--navy); font-size: clamp(1.7rem, 4vw, 2.65rem); letter-spacing: -0.035em; }
-    h3 { margin: 0 0 0.55rem; color: var(--navy); font-size: 1.15rem; }
-    .lede { max-width: 760px; margin: 1.25rem 0 1.5rem; color: var(--muted); font-size: 1.16rem; }
+    h1, h2, h3 { line-height: 1.08; }
+    h1 {
+      position: relative;
+      z-index: 1;
+      max-width: 820px;
+      margin: 0;
+      color: var(--ink);
+      font-size: clamp(3.1rem, 8vw, 6.8rem);
+      font-weight: 750;
+      letter-spacing: -0.065em;
+      background: linear-gradient(120deg, var(--ink) 12%, var(--purple) 58%, var(--cyan));
+      -webkit-background-clip: text;
+      background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+    h2 { margin: 0 0 1rem; color: var(--ink); font-size: clamp(2rem, 4.3vw, 3.25rem); font-weight: 700; letter-spacing: -0.045em; }
+    h3 { margin: 0 0 0.65rem; color: var(--ink); font-size: 1.15rem; letter-spacing: -0.018em; }
+    .lede { position: relative; z-index: 1; max-width: 740px; margin: 1.4rem 0 1.7rem; color: var(--muted); font-size: clamp(1.08rem, 2vw, 1.28rem); }
 
     .status-row { display: flex; flex-wrap: wrap; gap: 0.7rem; }
-    .pill { display: inline-flex; align-items: center; gap: 0.5rem; padding: 0.5rem 0.75rem; border: 1px solid rgba(25, 50, 77, 0.15); border-radius: 999px; background: rgba(255, 255, 255, 0.7); font-size: 0.88rem; font-weight: 700; }
-    .dot { width: 0.66rem; height: 0.66rem; border-radius: 50%; background: var(--green); box-shadow: 0 0 0 4px rgba(36, 122, 87, 0.12); }
+    .pill { display: inline-flex; align-items: center; gap: 0.5rem; padding: 0.55rem 0.82rem; border: 1px solid rgba(10, 37, 64, 0.10); border-radius: 999px; background: rgba(255, 255, 255, 0.68); box-shadow: 0 5px 20px rgba(50, 50, 93, 0.05); font-size: 0.84rem; font-weight: 650; backdrop-filter: blur(16px); }
+    .dot { width: 0.62rem; height: 0.62rem; border-radius: 50%; background: var(--green); box-shadow: 0 0 0 4px rgba(19, 138, 97, 0.12); }
 
     .nav {
       position: sticky;
       top: 0;
-      z-index: 10;
-      border-block: 1px solid rgba(25, 50, 77, 0.12);
-      background: rgba(247, 244, 237, 0.9);
-      backdrop-filter: blur(14px);
+      z-index: 20;
+      border-block: 1px solid rgba(10, 37, 64, 0.08);
+      background: rgba(246, 249, 252, 0.82);
+      backdrop-filter: saturate(160%) blur(18px);
     }
-    .nav-inner { display: flex; gap: 0.35rem; overflow-x: auto; padding: 0.7rem 0; }
-    .nav a { flex: 0 0 auto; padding: 0.5rem 0.75rem; border-radius: 0.55rem; color: var(--navy); font-size: 0.9rem; font-weight: 750; text-decoration: none; }
-    .nav a:hover, .nav a:focus-visible { background: #fff; outline: none; }
+    .nav-inner { display: flex; gap: 0.25rem; overflow-x: auto; padding: 0.68rem 0; scrollbar-width: none; }
+    .nav a { display: flex; flex: 0 0 auto; min-height: 44px; padding: 0.48rem 0.75rem; border-radius: 999px; align-items: center; color: var(--ink); font-size: 0.86rem; font-weight: 650; text-decoration: none; }
+    .nav a:hover { background: rgba(255, 255, 255, 0.92); box-shadow: 0 4px 14px rgba(50, 50, 93, 0.06); }
 
-    main { padding: 2.5rem 0 5rem; }
-    section { scroll-margin-top: 5rem; margin-bottom: 4.5rem; }
-    .section-intro { max-width: 760px; margin-top: -0.35rem; color: var(--muted); }
+    main { padding: 3.3rem 0 6rem; }
+    section { scroll-margin-top: 5.4rem; margin-bottom: 6rem; }
+    .section-intro { max-width: 780px; margin-top: -0.35rem; color: var(--muted); font-size: 1.02rem; }
 
-    .concept-chain { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 0.55rem; margin-top: 1.5rem; }
-    .concept-chain div { position: relative; min-height: 6.5rem; padding: 1rem 0.8rem; border: 1px solid var(--line); border-radius: 0.8rem; background: var(--card); box-shadow: 0 8px 24px rgba(23, 32, 51, 0.06); }
-    .concept-chain div:not(:last-child)::after { content: "\2192"; position: absolute; right: -0.55rem; top: 40%; z-index: 2; color: var(--blue); font-weight: 900; }
-    .step-number { display: block; margin-bottom: 0.35rem; color: var(--blue); font-size: 0.72rem; font-weight: 900; letter-spacing: 0.12em; }
+    .concept-chain { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 0.85rem; margin-top: 1.7rem; }
+    .concept-chain div { position: relative; min-height: 7rem; padding: 1.15rem; border: 1px solid var(--line); border-radius: 1.2rem; background: var(--surface); box-shadow: var(--shadow-soft); backdrop-filter: blur(18px); transition: transform 180ms ease, box-shadow 180ms ease; }
+    .concept-chain div:hover { box-shadow: var(--shadow); transform: translateY(-2px); }
+    .step-number { display: block; margin-bottom: 0.5rem; color: var(--purple); font-size: 0.7rem; font-weight: 800; letter-spacing: 0.15em; }
 
     .day-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1rem; margin-top: 1.5rem; }
-    .day-card { position: relative; overflow: hidden; padding: 1.35rem; border: 1px solid var(--line); border-radius: 1rem; background: var(--card); box-shadow: var(--shadow); }
-    .day-card::before { content: ""; position: absolute; inset: 0 0 auto; height: 0.35rem; background: var(--accent, var(--blue)); }
-    .day-label { color: var(--accent, var(--blue)); font-size: 0.78rem; font-weight: 900; letter-spacing: 0.12em; text-transform: uppercase; }
+    .day-card { position: relative; overflow: hidden; padding: 1.5rem; border: 1px solid var(--line); border-radius: 1.35rem; background: var(--surface-solid); box-shadow: var(--shadow); }
+    .day-card::before { position: absolute; inset: 0 0 auto; height: 0.3rem; content: ""; background: linear-gradient(90deg, var(--accent, var(--purple)), color-mix(in srgb, var(--accent, var(--purple)) 35%, white)); }
+    .day-label { color: var(--accent, var(--purple)); font-size: 0.74rem; font-weight: 800; letter-spacing: 0.14em; text-transform: uppercase; }
     .day-card ul { margin: 0.85rem 0 1rem; padding-left: 1.15rem; }
     .task { display: flex; gap: 0.65rem; align-items: flex-start; margin-top: 0.65rem; padding-top: 0.65rem; border-top: 1px solid var(--line); }
-    .task input { width: 1.1rem; height: 1.1rem; margin-top: 0.25rem; accent-color: var(--green); }
+    .task input { width: 1.08rem; height: 1.08rem; margin-top: 0.25rem; accent-color: var(--purple); }
     .task label { cursor: pointer; }
 
     .lesson-grid { display: grid; grid-template-columns: minmax(0, 1.45fr) minmax(17rem, 0.55fr); gap: 1rem; align-items: start; }
-    .panel { padding: 1.35rem; border: 1px solid var(--line); border-radius: 1rem; background: var(--card); box-shadow: var(--shadow); }
-    .rule { margin: 0 0 1rem; padding: 0.85rem 1rem; border-left: 4px solid var(--gold); background: #fff7df; }
+    .panel { padding: 1.5rem; border: 1px solid var(--line); border-radius: 1.35rem; background: var(--surface-solid); box-shadow: var(--shadow); }
+    .rule { margin: 0 0 1rem; padding: 0.9rem 1rem; border-left: 3px solid var(--gold); border-radius: 0.7rem; background: #fff8e9; }
     .signal-list { display: grid; gap: 0.7rem; margin: 0; }
     .signal-list div { padding-bottom: 0.7rem; border-bottom: 1px solid var(--line); }
-    .signal-list dt { color: var(--blue); font-family: ui-monospace, monospace; font-weight: 800; }
+    .signal-list dt { color: var(--purple); font-family: ui-monospace, monospace; font-weight: 750; }
     .signal-list dd { margin: 0.15rem 0 0; color: var(--muted); }
 
-    .table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 0.8rem; }
+    .table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 0.9rem; }
+    .table-hint { margin: 0 0 0.45rem; color: var(--muted); font-size: 0.8rem; }
     table { width: 100%; min-width: 740px; border-collapse: collapse; background: #fff; font-size: 0.9rem; }
     th, td { padding: 0.65rem 0.7rem; border-bottom: 1px solid #e9e6de; text-align: left; white-space: nowrap; }
-    th { position: sticky; top: 0; background: var(--navy); color: #fff; font-size: 0.75rem; letter-spacing: 0.06em; text-transform: uppercase; }
+    th { position: sticky; top: 0; background: var(--ink); color: #fff; font-size: 0.72rem; letter-spacing: 0.07em; text-transform: uppercase; }
     tr:last-child td { border-bottom: 0; }
     .valid { color: var(--green); font-weight: 800; }
     .invalid { color: var(--muted); }
-    .reset-row { background: #fff4e2; }
+    .reset-row { background: #fff7e8; }
 
-    pre { overflow-x: auto; margin: 1rem 0 0; padding: 1rem; border-radius: 0.8rem; background: #132436; color: #eff9fb; font-size: 0.85rem; line-height: 1.55; }
+    pre { overflow-x: auto; margin: 1rem 0 0; padding: 1.15rem; border-radius: 1rem; background: #0a2540; color: #eaf6ff; box-shadow: inset 0 1px rgba(255, 255, 255, 0.08); font-size: 0.85rem; line-height: 1.6; }
     .resources { display: grid; gap: 0.6rem; }
-    .resources a { display: block; padding: 0.75rem 0.85rem; border: 1px solid var(--line); border-radius: 0.7rem; background: #fff; color: var(--navy); font-weight: 750; text-decoration: none; }
-    .resources a:hover, .resources a:focus-visible { border-color: var(--blue); outline: none; }
+    .resources a { display: flex; min-height: 44px; padding: 0.78rem 0.9rem; border: 1px solid var(--line); border-radius: 0.8rem; align-items: center; background: #fff; color: var(--ink); font-weight: 650; text-decoration: none; transition: border-color 160ms ease, transform 160ms ease; }
+    .resources a:hover { border-color: rgba(99, 91, 255, 0.5); transform: translateX(2px); }
+
+    .library-shell { display: grid; grid-template-columns: minmax(16rem, 0.72fr) minmax(0, 1.28fr); gap: 1rem; margin-top: 1.5rem; }
+    .library-card { min-width: 0; padding: 1.25rem; border: 1px solid var(--line); border-radius: 1.35rem; background: var(--surface-solid); box-shadow: var(--shadow); }
+    .drop-zone { display: grid; place-items: center; min-height: 10.5rem; padding: 1.3rem; border: 1.5px dashed rgba(99, 91, 255, 0.38); border-radius: 1rem; background: linear-gradient(145deg, rgba(99, 91, 255, 0.06), rgba(0, 166, 199, 0.045)); text-align: center; transition: border-color 160ms ease, background 160ms ease, transform 160ms ease; }
+    .drop-zone.dragover { border-color: var(--purple); background: rgba(99, 91, 255, 0.11); transform: scale(1.005); }
+    .drop-zone strong { display: block; margin-bottom: 0.35rem; font-size: 1.05rem; }
+    .drop-zone p { margin: 0.2rem 0 0.9rem; color: var(--muted); font-size: 0.9rem; }
+    .privacy-note { margin: 0.85rem 0 0; padding: 0.78rem 0.9rem; border-radius: 0.8rem; color: #40566b; background: #f2f7fb; font-size: 0.84rem; }
+    .pdf-status { min-height: 1.5rem; margin: 0.8rem 0 0; color: var(--muted); font-size: 0.88rem; }
+    .pdf-list-head, .pdf-viewer-head { display: flex; justify-content: space-between; gap: 0.8rem; align-items: flex-start; margin-bottom: 0.85rem; }
+    .pdf-count { padding: 0.22rem 0.55rem; border-radius: 999px; color: var(--purple); background: rgba(99, 91, 255, 0.09); font-size: 0.76rem; font-weight: 750; }
+    .pdf-list { display: grid; gap: 0.55rem; max-height: 26rem; margin-top: 1rem; overflow-y: auto; }
+    .pdf-item { width: 100%; padding: 0.82rem 0.9rem; border: 1px solid var(--line); border-radius: 0.85rem; color: var(--ink); background: #fff; text-align: left; cursor: pointer; transition: border-color 160ms ease, background 160ms ease, transform 160ms ease; }
+    .pdf-item:hover { border-color: rgba(99, 91, 255, 0.42); transform: translateY(-1px); }
+    .pdf-item.selected { border-color: var(--purple); background: rgba(99, 91, 255, 0.055); box-shadow: 0 0 0 3px rgba(99, 91, 255, 0.08); }
+    .pdf-item strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .pdf-item span { color: var(--muted); font-size: 0.78rem; }
+    .empty-state { padding: 1.25rem; border: 1px dashed var(--line); border-radius: 0.85rem; color: var(--muted); text-align: center; }
+    .pdf-title { margin: 0; overflow-wrap: anywhere; font-size: 1rem; }
+    .pdf-meta { margin: 0.18rem 0 0; color: var(--muted); font-size: 0.8rem; }
+    .viewer-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 0.5rem; }
+    .viewer-frame { position: relative; display: grid; min-height: 38rem; overflow: hidden; border: 1px solid var(--line); border-radius: 1rem; background: #edf2f7; }
+    .viewer-frame iframe { width: 100%; height: 100%; min-height: 38rem; border: 0; background: #fff; }
+    .viewer-placeholder { place-self: center; max-width: 27rem; padding: 2rem; color: var(--muted); text-align: center; }
 
     .quiz-head { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 1rem; align-items: end; }
-    .score-card { min-width: 10rem; padding: 0.7rem 0.9rem; border-radius: 0.8rem; background: var(--navy); color: #fff; text-align: center; }
+    .score-card { min-width: 10rem; padding: 0.8rem 1rem; border-radius: 1rem; color: #fff; background: linear-gradient(135deg, var(--ink), #284b75); box-shadow: var(--shadow-soft); text-align: center; }
     .score-card strong { display: block; font-size: 1.55rem; }
-    .question { margin: 1rem 0; padding: 1.2rem; border: 1px solid var(--line); border-radius: 0.9rem; background: var(--card); }
-    .question.correct { border-color: rgba(36, 122, 87, 0.55); box-shadow: inset 4px 0 var(--green); }
-    .question.incorrect { border-color: rgba(173, 61, 61, 0.55); box-shadow: inset 4px 0 var(--red); }
+    .question { margin: 1rem 0; padding: 1.25rem; border: 1px solid var(--line); border-radius: 1.05rem; background: var(--surface-solid); box-shadow: var(--shadow-soft); }
+    .question.correct { border-color: rgba(19, 138, 97, 0.5); box-shadow: inset 4px 0 var(--green); }
+    .question.incorrect { border-color: rgba(196, 61, 79, 0.5); box-shadow: inset 4px 0 var(--red); }
     fieldset { min-width: 0; margin: 0; padding: 0; border: 0; }
     legend { margin-bottom: 0.75rem; font-weight: 800; }
-    .option { display: flex; gap: 0.65rem; align-items: flex-start; margin: 0.5rem 0; padding: 0.65rem 0.75rem; border-radius: 0.55rem; background: #f4f3ee; cursor: pointer; }
-    .option:hover { background: #eceff0; }
-    .option input { margin-top: 0.25rem; accent-color: var(--blue); }
+    .option { display: flex; min-height: 44px; gap: 0.65rem; align-items: flex-start; margin: 0.5rem 0; padding: 0.68rem 0.78rem; border: 1px solid transparent; border-radius: 0.7rem; background: #f5f8fb; cursor: pointer; }
+    .option:hover { border-color: rgba(99, 91, 255, 0.16); background: #f0f3fb; }
+    .option:focus-within { outline: 3px solid rgba(99, 91, 255, 0.32); outline-offset: 2px; }
+    .option input { margin-top: 0.25rem; accent-color: var(--purple); }
     .feedback { min-height: 1.5rem; margin: 0.65rem 0 0; color: var(--muted); font-size: 0.9rem; }
     .question.correct .feedback { color: var(--green); }
     .question.incorrect .feedback { color: var(--red); }
     .actions { display: flex; flex-wrap: wrap; gap: 0.7rem; margin-top: 1.2rem; }
-    .button { padding: 0.75rem 1rem; border: 0; border-radius: 0.7rem; background: var(--blue); color: #fff; font-weight: 800; cursor: pointer; }
-    .button:hover, .button:focus-visible { background: var(--navy); outline: 3px solid rgba(69, 182, 199, 0.35); }
-    .button.secondary { border: 1px solid var(--line); background: #fff; color: var(--navy); }
+    .button { display: inline-flex; min-height: 44px; padding: 0.68rem 1rem; border: 0; border-radius: 999px; align-items: center; justify-content: center; color: #fff; background: linear-gradient(135deg, var(--purple), #7a73ff); box-shadow: 0 8px 20px rgba(99, 91, 255, 0.22); font-size: 0.88rem; font-weight: 750; text-decoration: none; cursor: pointer; transition: transform 160ms ease, box-shadow 160ms ease; }
+    .button:hover { box-shadow: 0 11px 25px rgba(99, 91, 255, 0.28); transform: translateY(-1px); }
+    .button.secondary { border: 1px solid var(--line); color: var(--ink); background: #fff; box-shadow: none; }
+    .button.danger { border: 1px solid rgba(196, 61, 79, 0.22); color: var(--red); background: #fff; box-shadow: none; }
+    .button:disabled, .button[aria-disabled="true"] { opacity: 0.45; box-shadow: none; cursor: not-allowed; pointer-events: none; transform: none; }
 
-    .finish { padding: 1.5rem; border-radius: 1rem; background: var(--navy); color: #f6fbfd; }
+    .finish { position: relative; overflow: hidden; padding: 2rem; border-radius: 1.5rem; color: #f6fbfd; background: linear-gradient(135deg, #0a2540 0%, #263b72 62%, #635bff 140%); box-shadow: var(--shadow); }
+    .finish::after { position: absolute; right: -5rem; bottom: -7rem; width: 18rem; aspect-ratio: 1; border: 1px solid rgba(255, 255, 255, 0.16); border-radius: 45%; content: ""; transform: rotate(24deg); }
     .finish h2 { color: #fff; }
     .finish ul { columns: 2; padding-left: 1.15rem; }
-    footer { padding: 1.5rem 0 3rem; color: var(--muted); font-size: 0.9rem; }
+    footer { padding: 1.5rem 0 3.5rem; color: var(--muted); font-size: 0.88rem; }
 
     @media (max-width: 880px) {
       .concept-chain { grid-template-columns: repeat(2, 1fr); }
-      .concept-chain div:not(:last-child)::after { display: none; }
-      .day-grid, .lesson-grid { grid-template-columns: 1fr; }
+      .day-grid, .lesson-grid, .library-shell { grid-template-columns: 1fr; }
+      .masthead::after { opacity: 0.48; }
+      .viewer-frame, .viewer-frame iframe { min-height: 30rem; }
     }
     @media (max-width: 560px) {
-      .shell { width: min(100% - 1.1rem, 1160px); }
-      .masthead { padding-top: 2.2rem; }
+      .shell { width: min(100% - 1.2rem, 1180px); }
+      .masthead { padding: 4.2rem 0 2.8rem; }
+      .masthead::after { display: none; }
       .concept-chain { grid-template-columns: 1fr; }
       .finish ul { columns: 1; }
+      .pdf-viewer-head { display: block; }
+      .viewer-actions { justify-content: flex-start; margin-top: 0.8rem; }
+      .viewer-frame, .viewer-frame iframe { min-height: 24rem; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      html { scroll-behavior: auto; }
+      *, *::before, *::after { scroll-behavior: auto !important; transition-duration: 0.01ms !important; }
     }
   </style>
 </head>
 <body>
+  <a class="skip-link" href="#main-content">Skip to study content</a>
   <header class="masthead shell">
     <p class="eyebrow">Three-day hardware foundations</p>
     <h1>RTL Sprint Lab</h1>
-    <p class="lede">Your single study desk for moving from Boolean logic to clocked RTL, waveforms, synthesis, and the C-to-HLS-C research pipeline.</p>
+    <p class="lede">A three-day core path from Boolean behavior to clocked RTL, independent verification, generic synthesis, and the evidence required for C-to-HLS-C work.</p>
     <div class="status-row" aria-label="Lab status">
-      <span class="pill"><span class="dot" aria-hidden="true"></span> Simulation verified: 11/11 edges</span>
+      <span class="pill"><span class="dot" aria-hidden="true"></span> Directed trace verified: 11/11 edges</span>
       <span class="pill">One-cycle delayed adder</span>
-      <span class="pill">Quiz ready: 10 questions</span>
+      <span class="pill">Full local gate: make verify</span>
     </div>
   </header>
 
@@ -162,13 +258,14 @@
     <div class="nav-inner shell">
       <a href="#map">Concept map</a>
       <a href="#plan">Three-day plan</a>
+      <a href="#library">PDF shelf</a>
       <a href="#lesson">Waveform lesson</a>
       <a href="#quiz">Quiz</a>
       <a href="#finish">Finish line</a>
     </div>
   </nav>
 
-  <main class="shell">
+  <main class="shell" id="main-content" tabindex="-1">
     <section id="map">
       <p class="eyebrow">The hardware ladder</p>
       <h2>Keep this mental model in view</h2>
@@ -187,52 +284,102 @@
     <section id="plan">
       <p class="eyebrow">18–24 focused hours</p>
       <h2>Your three-day route</h2>
-      <p class="section-intro">Page numbers refer to the printed pages inside <em>Digital Design and Computer Architecture</em>. Your progress checks are saved in this browser.</p>
+      <p class="section-intro">Use the local, manual, and external gates in the <a href="ordered_exercises.md">ordered exercise sheet</a>, with the supplied <a href="pdf_reading_map.md">PDF reading map</a>. Reading supports the work; the required output and its named gate establish each skill.</p>
       <div class="day-grid">
         <article class="day-card" style="--accent:#2369a6">
           <span class="day-label">Day 1</span>
           <h3>Logic becomes hardware</h3>
           <ul>
-            <li>Chapter 1 §§1.1–1.5, pp. 3–21</li>
-            <li>Chapter 2 §§2.1–2.9, pp. 51–90</li>
-            <li>Truth tables, algebra, muxes, adders, delays</li>
+            <li>Preflight: binary, hex, algebra, tools</li>
+            <li>Truth tables, Boolean equations, gates</li>
+            <li>Widths, signedness, combinational RTL, latches</li>
           </ul>
-          <div class="task"><input class="progress" id="d1-read" type="checkbox"><label for="d1-read">Read the selected sections</label></div>
-          <div class="task"><input class="progress" id="d1-build" type="checkbox"><label for="d1-build">Implement AND, mux, and half-adder</label></div>
+          <div class="task"><input class="progress" id="d1-read" type="checkbox"><label for="d1-read">Complete exercise stages 1–4</label></div>
+          <div class="task"><input class="progress" id="d1-build" type="checkbox"><label for="d1-build">Pass exhaustive truth-table and lint gates</label></div>
         </article>
-        <article class="day-card" style="--accent:#e09422">
+        <article class="day-card" style="--accent:#8b5a00">
           <span class="day-label">Day 2</span>
           <h3>State moves on clock edges</h3>
           <ul>
-            <li>Chapter 3, pp. 103–146</li>
-            <li>Registers, resets, FSMs, setup/hold</li>
-            <li>Complete the waveform lesson below</li>
+            <li>Registers and nonblocking old/new state</li>
+            <li>Reset, FSMs, valid, ready, stalls</li>
+            <li>Predict, then verify, the waveform below</li>
           </ul>
-          <div class="task"><input class="progress" id="d2-read" type="checkbox"><label for="d2-read">Read the selected sections</label></div>
-          <div class="task"><input class="progress" id="d2-quiz" type="checkbox"><label for="d2-quiz">Score at least 8/10 on the quiz</label></div>
+          <div class="task"><input class="progress" id="d2-read" type="checkbox"><label for="d2-read">Complete exercise stages 5–8</label></div>
+          <div class="task"><input class="progress" id="d2-quiz" type="checkbox" disabled><label for="d2-quiz">Machine-set after scoring at least 8/10</label></div>
         </article>
         <article class="day-card" style="--accent:#247a57">
           <span class="day-label">Day 3</span>
           <h3>RTL reaches synthesis and HLS</h3>
           <ul>
-            <li>Chapter 4 §§4.1–4.2, 4.4–4.6, 4.8</li>
-            <li>Chapter 5 §§5.2 and 5.4</li>
-            <li>HLSC paper pp. 1–2 and workflow figures</li>
+            <li>Black-box oracle and mutation sensitivity</li>
+            <li>Lint, synthesis, and evidence limits</li>
+            <li>Defined C → HLS-C → RTL validation ladder</li>
           </ul>
-          <div class="task"><input class="progress" id="d3-read" type="checkbox"><label for="d3-read">Read RTL and HLS selections</label></div>
-          <div class="task"><input class="progress" id="d3-explain" type="checkbox"><label for="d3-explain">Explain C → HLS-C → RTL → gates</label></div>
+          <div class="task"><input class="progress" id="d3-read" type="checkbox"><label for="d3-read">Run <code>make verify</code> and inspect evidence</label></div>
+          <div class="task"><input class="progress" id="d3-explain" type="checkbox"><label for="d3-explain">Fill the generation contract for a capstone</label></div>
         </article>
+      </div>
+    </section>
+
+    <section id="library" aria-labelledby="library-title">
+      <p class="eyebrow">Private reading shelf</p>
+      <h2 id="library-title">Keep the full PDF beside the lesson</h2>
+      <p class="section-intro">Add complete PDFs from your computer, select one, and read it without leaving the study flow. Files stay in this browser profile on this exact local address; nothing is sent to a server. Use the <a href="pdf_reading_map.md">PDF reading map</a> to connect each source to an exercise.</p>
+      <div class="library-shell">
+        <div class="library-card">
+          <div class="pdf-list-head">
+            <div>
+              <h3>Your PDFs</h3>
+              <p class="pdf-meta">Stored on this device</p>
+            </div>
+            <span class="pdf-count" id="pdf-count">0 files</span>
+          </div>
+          <div class="drop-zone" id="pdf-drop-zone">
+            <div>
+              <strong>Add full PDF files</strong>
+              <p>Choose one or several PDFs, or drop them here.</p>
+              <button class="button" id="choose-pdf" type="button">Choose PDFs</button>
+              <input id="pdf-input" type="file" accept=".pdf,application/pdf" multiple hidden>
+            </div>
+          </div>
+          <p class="privacy-note"><strong>Private by design:</strong> PDFs are stored in IndexedDB for <code>127.0.0.1:4173</code>. Keep your originals—private browsing, clearing site data, storage pressure, or using a different hostname/port can remove or hide this shelf.</p>
+          <p class="pdf-status" id="pdf-status" role="status" aria-live="polite" aria-atomic="true">Ready for your first PDF.</p>
+          <div class="pdf-list" id="pdf-list" aria-label="Saved PDF files" aria-busy="false">
+            <p class="empty-state">No PDFs added yet.</p>
+          </div>
+        </div>
+
+        <div class="library-card">
+          <div class="pdf-viewer-head">
+            <div>
+              <h3 class="pdf-title" id="pdf-title">Select a PDF to read</h3>
+              <p class="pdf-meta" id="pdf-meta">The full document will appear below.</p>
+            </div>
+            <div class="viewer-actions">
+              <a class="button secondary" id="open-pdf" href="#" target="_blank" rel="noopener noreferrer" aria-disabled="true" tabindex="-1">Open</a>
+              <a class="button secondary" id="download-pdf" href="#" aria-disabled="true" tabindex="-1">Download copy</a>
+              <button class="button danger" id="remove-pdf" type="button" disabled>Remove</button>
+            </div>
+          </div>
+          <div class="viewer-frame">
+            <p class="viewer-placeholder" id="pdf-placeholder">Your selected PDF will open here. The browser’s native viewer provides page navigation, zoom, search, print, and download controls.</p>
+            <iframe id="pdf-viewer" title="PDF reader" hidden></iframe>
+          </div>
+        </div>
       </div>
     </section>
 
     <section id="lesson">
       <p class="eyebrow">Verified lab</p>
       <h2>Read a one-cycle pipeline</h2>
-      <p class="section-intro">The simulator and independent scoreboard agree on every edge below. Read the inputs immediately before each rising edge and registered outputs immediately after it.</p>
+      <p class="section-intro">The directed simulator and black-box reference model agree on every edge below. This trace teaches one valid-only pipeline; the exhaustive and mutation gates establish broader evidence for this exact module contract.</p>
       <div class="lesson-grid">
         <article class="panel">
           <p class="rule"><strong>Validity rule:</strong> <code>sum</code> is meaningful only when <code>out_valid=1</code>. A held numeric value during an invalid cycle is not a transaction.</p>
-          <div class="table-wrap">
+          <p class="rule"><strong>Nonblocking rule:</strong> all right-hand sides read pre-edge values; all <code>&lt;=</code> updates become visible together after the edge. The lines do not execute as software-like “first, then” state changes.</p>
+          <p class="table-hint">Scroll horizontally to inspect every signal column.</p>
+          <div class="table-wrap" tabindex="0" role="region" aria-label="Pipeline edge table">
             <table>
               <thead><tr><th>Edge</th><th>Time</th><th>rst</th><th>in_valid</th><th>Input</th><th>out_valid</th><th>Output meaning</th></tr></thead>
               <tbody>
@@ -253,10 +400,17 @@
           <pre><code>always_ff @(posedge clk) begin
   if (rst) begin
     pending_valid &lt;= 1'b0;
+    pending_sum   &lt;= 9'd0;
     out_valid     &lt;= 1'b0;
+    sum           &lt;= 9'd0;
   end else begin
-    out_valid     &lt;= pending_valid; // previous input leaves
-    pending_valid &lt;= in_valid;      // current input enters
+    out_valid &lt;= pending_valid;
+    if (pending_valid)
+      sum &lt;= pending_sum;
+
+    pending_valid &lt;= in_valid;
+    if (in_valid)
+      pending_sum &lt;= {1'b0, a} + {1'b0, b};
   end
 end</code></pre>
         </article>
@@ -268,14 +422,19 @@ end</code></pre>
             <div><dt>rst</dt><dd>Active-high synchronous reset; effective only on a rising edge.</dd></div>
             <div><dt>in_valid</dt><dd>Says whether <code>a</code> and <code>b</code> are a real input transaction.</dd></div>
             <div><dt>out_valid</dt><dd>Says whether <code>sum</code> is a real output transaction.</dd></div>
+            <div><dt>interface limit</dt><dd>No <code>ready</code> exists: this toy always accepts valid input and cannot backpressure or stall.</dd></div>
             <div><dt>latency</dt><dd>One complete cycle from accepted input to valid output.</dd></div>
             <div><dt>throughput</dt><dd>One result per cycle when inputs arrive consecutively.</dd></div>
           </dl>
           <h3 style="margin-top:1.4rem">Lab resources</h3>
           <div class="resources">
+            <a href="generation_contract.md">Precise code-generation input contract</a>
+            <a href="ordered_exercises.md">Ordered exercises and mastery gates</a>
+            <a href="fundamentals_field_guide.md">Fundamentals field guide and scope</a>
+            <a href="pdf_reading_map.md">PDF-to-exercise reading map</a>
             <a href="waveform_walkthrough.md">Full waveform walkthrough</a>
             <a href="cycle_table.md">Detailed cycle table</a>
-            <a href="expected_waveform.html">WaveDrom waveform view</a>
+            <a href="expected_waveform.json">Checked WaveDrom data (offline-safe)</a>
             <a href="../rtl/one_cycle_delayed_adder.sv">Synthesizable RTL source</a>
             <a href="../tb/tb_one_cycle_delayed_adder.sv">Self-checking testbench</a>
           </div>
@@ -288,7 +447,7 @@ end</code></pre>
         <div>
           <p class="eyebrow">Knowledge check</p>
           <h2>Waveform-reading quiz</h2>
-          <p class="section-intro">Choose one answer per question. Aim for 8/10 before moving to Day 3.</p>
+          <p class="section-intro">Choose one answer per question. Aim for 8/10 before moving to Day 3. This checkpoint assesses waveform and clocked-update concepts only.</p>
         </div>
         <div class="score-card" aria-live="polite"><span>Current score</span><strong id="score">Not graded</strong></div>
       </div>
@@ -303,23 +462,25 @@ end</code></pre>
 
     <section class="finish" id="finish">
       <p class="eyebrow" style="color:#8de0e9">Your finish line</p>
-      <h2>You are ready for the HLS paper when you can…</h2>
+      <h2>Your core-literacy checkpoint</h2>
       <ul>
         <li>Turn a truth table into a Boolean equation and RTL.</li>
         <li>Distinguish combinational logic from registered state.</li>
         <li>Predict reset, latency, bubbles, and valid outputs.</li>
         <li>Explain blocking versus nonblocking assignments.</li>
         <li>Describe simulation, synthesis, and a testbench.</li>
-        <li>Explain C → HLS-C → RTL → gates.</li>
-        <li>Describe compile → CSim → synthesis → CoSim.</li>
+        <li>Fill a precise functional, temporal, oracle, and QoR contract.</li>
+        <li>Describe compile → CSim → synthesis/report → CoSim.</li>
         <li>Name the limits: timing closure, CDC, and QoR remain advanced.</li>
       </ul>
+      <p>Confirm these with the ordered artifacts and <code>make verify</code>; the quiz alone is not a generalized RTL or HLS credential.</p>
     </section>
   </main>
 
-  <footer class="shell">RTL Sprint Lab · Local, self-contained study page · Progress stays on this device.</footer>
+  <footer class="shell">RTL Sprint Lab · Calm, private technical study workspace · Progress and added PDFs stay on this device.</footer>
 
   <script>
+    const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
     const quiz = [
       { q: "At which rising edges is synchronous reset active?", options: ["E0 only", "E0, E1, and E9", "E1, E2, and E10", "E9 and E10"], answer: 1, why: "rst is high at E0, E1, and E9, so state clears on those rising edges." },
       { q: "When is an ordinary input transaction accepted?", options: ["Whenever a or b changes", "When rst=1", "When rst=0 and in_valid=1 at a rising edge", "Whenever out_valid=1"], answer: 2, why: "The interface samples meaningful input only when reset is inactive and in_valid is asserted at the clock edge." },
@@ -329,7 +490,7 @@ end</code></pre>
       { q: "What do the valid outputs at E5 and E6 demonstrate?", options: ["Two-cycle latency", "One-result-per-cycle throughput", "An asynchronous reset", "A combinational feedback loop"], answer: 1, why: "T1 and T2 were accepted on consecutive edges and emerge on consecutive edges." },
       { q: "At E7, sum still shows 510 while out_valid=0. How should 510 be interpreted?", options: ["A new valid result", "An overflow error", "Held bus data that must be ignored", "An unknown X value"], answer: 2, why: "Data and validity form one interface contract. Without out_valid, the held number has no transactional meaning." },
       { q: "Why is sum nine bits wide?", options: ["The clock is nine bits", "To represent 255+255=510 without truncation", "SystemVerilog requires odd widths", "To store the valid bit"], answer: 1, why: "Eight unsigned bits stop at 255; nine bits represent values through 511." },
-      { q: "What proves the pending 1+2 probe was flushed by reset at E9?", options: ["sum becomes X", "out_valid stays 0 at E10", "in_valid is 1 at E10", "The clock stops"], answer: 1, why: "No valid result appears on E10, so the pending pre-reset transaction did not survive." },
+      { q: "In one always_ff edge, what values do nonblocking right-hand sides observe?", options: ["Values updated by the preceding source line", "Pre-edge values; left-hand updates appear together afterward", "Only zero", "Post-synthesis gate delays"], answer: 1, why: "Nonblocking assignments sample their right-hand sides from the old state and schedule left-hand-side updates for the nonblocking update region." },
       { q: "Does a valid result 3 ever appear for the probe accepted at E8?", options: ["Yes, at E9", "Yes, at E10", "No; synchronous reset clears it at E9", "No; 1+2 cannot be synthesized"], answer: 2, why: "Reset has priority at E9 and clears pending state before the probe can emerge." }
     ];
 
@@ -352,6 +513,10 @@ end</code></pre>
         input.type = "radio";
         input.name = `q${index}`;
         input.value = optionIndex;
+        input.checked = localStorage.getItem(`rtl-answer-q${index}`) === String(optionIndex);
+        input.addEventListener("change", () => {
+          localStorage.setItem(`rtl-answer-q${index}`, input.value);
+        });
         const text = document.createElement("span");
         text.textContent = option;
         label.append(input, text);
@@ -381,7 +546,7 @@ end</code></pre>
         wrapper.classList.toggle("incorrect", !isCorrect);
         wrapper.querySelector(".feedback").textContent = selected
           ? `${isCorrect ? "Correct." : "Not quite."} ${item.why}`
-          : `Choose an answer. ${item.why}`;
+          : "Choose an answer before grading this question.";
         if (isCorrect) correct += 1;
       });
       score.textContent = `${correct}/10`;
@@ -390,8 +555,12 @@ end</code></pre>
         const completion = document.querySelector("#d2-quiz");
         completion.checked = true;
         localStorage.setItem("rtl-progress-d2-quiz", "true");
+      } else {
+        const completion = document.querySelector("#d2-quiz");
+        completion.checked = false;
+        localStorage.setItem("rtl-progress-d2-quiz", "false");
       }
-      score.scrollIntoView({ behavior: "smooth", block: "center" });
+      score.scrollIntoView({ behavior: reduceMotion.matches ? "auto" : "smooth", block: "center" });
     });
 
     document.querySelector("#reset-quiz").addEventListener("click", () => {
@@ -402,10 +571,15 @@ end</code></pre>
       });
       score.textContent = "Not graded";
       localStorage.removeItem("rtl-quiz-score");
+      quiz.forEach((_, index) => localStorage.removeItem(`rtl-answer-q${index}`));
+      const completion = document.querySelector("#d2-quiz");
+      completion.checked = false;
+      localStorage.setItem("rtl-progress-d2-quiz", "false");
     });
 
     const savedScore = localStorage.getItem("rtl-quiz-score");
     if (savedScore !== null) score.textContent = `${savedScore}/10 saved`;
   </script>
+  <script src="pdf_shelf.js" defer></script>
 </body>
 </html>

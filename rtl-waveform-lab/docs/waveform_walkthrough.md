@@ -18,6 +18,8 @@ A rising edge is the instant `clk` changes from 0 to 1. The design changes its r
 
 Ignore the stretches between edges on a first reading. For each rising edge, read `rst`, `in_valid`, `a`, and `b` immediately before the edge; then read registered outputs just after the edge. The testbench drives inputs on falling edges, giving them half a clock cycle to become stable, and checks outputs 1 ps after each rising edge so nonblocking RTL assignments have settled.
 
+In one `always_ff` activation, every right-hand side reads the state that existed just before the edge. All nonblocking (`<=`) updates become visible together after the edge. The apparent top-to-bottom order does not make one update visible to the next statement like sequential software.
+
 ## 5. Decide whether an input was accepted
 
 A transaction is one meaningful unit of data sent through an interface. Here, a transaction is the pair `(a,b)`. It is accepted at a rising edge only when `rst=0` and `in_valid=1`. A valid signal says whether nearby data has meaning. When `in_valid=0`, the numbers on `a` and `b` are ignored.
@@ -50,11 +52,17 @@ An 8-bit unsigned number ranges from 0 to 255. The largest addition is `255+255=
 
 The design saves switching by changing `sum` only for a valid result (or reset). At E4 it still shows 8, and at E7/E8 it still shows 510. Those old values are not new results because `out_valid=0`; they must be ignored.
 
-## 13. `X` is not zero
+Holding the old value is this implementation's behavior, not a general interface requirement. An equivalent implementation may drive a different value during an invalid non-reset cycle. The black-box checker compares `sum` only when `out_valid=1`, while reset is separately required to clear it to zero.
+
+## 13. Know the interface limit
+
+This is a valid-only, always-accepting input. When reset is inactive, every edge with `in_valid=1` is accepted because there is no `ready` signal. It cannot express a stall or backpressure and is not a complete ready/valid protocol.
+
+## 14. `X` is not zero
 
 In a four-state RTL simulation, `X` means unknown: the simulator cannot determine whether a bit is 0 or 1. Zero is a definite known value. An `X` may reveal uninitialized state, competing drivers, or incomplete assignments. This DUT's reset establishes known zero state, while the WaveDrom transaction rows use an invalid marker only as a visual reminder that no transaction exists; that marker is not a DUT bus value.
 
-## 14. RTL timing is not final FPGA timing
+## 15. RTL timing is not final FPGA timing
 
 This waveform is a functional RTL simulation. Registered values update according to ideal event scheduling; it does not model routing delay, clock skew, register setup/hold margins, or the exact delays of a placed-and-routed FPGA. Timing analysis and implementation-level simulation address those physical effects later.
 

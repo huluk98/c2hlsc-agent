@@ -21,13 +21,15 @@ module one_cycle_delayed_adder (
             out_valid     <= 1'b0;
             sum           <= 9'd0;
         end else begin
-            // First, move last cycle's pending transaction to the output.
+            // Every right-hand side below reads pre-edge state. All <= updates
+            // become visible together after the edge; this is not a software
+            // sequence. The previous transaction moves to the output...
             out_valid <= pending_valid;
             if (pending_valid) begin
                 sum <= pending_sum;
             end
 
-            // Then, sample this cycle's input for use on the next edge.
+            // ...while the current transaction enters the pending stage.
             pending_valid <= in_valid;
             if (in_valid) begin
                 pending_sum <= {1'b0, a} + {1'b0, b};
