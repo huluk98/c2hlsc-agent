@@ -63,9 +63,14 @@ from .llm import LLMClient, extract_code_blocks
 from .rtllm_bench import (
     DEFAULT_COMPILE_TIMEOUT,
     DEFAULT_SIM_TIMEOUT,
+    DIAG_WALL_CLOCK_S,
     RtllmDesign,
     SimResult,
+    diagnose_timeout,
     evaluate_rtl,
+    oracle_behaviour_diff,
+    run_self_trace,
+    trace_digest,
 )
 
 # Evidence is tail-sliced for the same reason as llm.py's _EVIDENCE_LIMIT: the failure
@@ -76,6 +81,27 @@ EVIDENCE_LIMIT = 4000
 PLANNER_ROLE = "rtl_planner"
 GENERATOR_ROLE = "rtl_generator"
 REPAIR_ROLE = "rtl_repair_agent"
+
+#: What the failure_analyst is allowed to put in front of the repair agent, weakest first.
+#: The ladder is the ablation: each rung adds exactly one channel, so the difference between
+#: two runs is attributable to that channel and nothing else.
+#:
+#: ``none``    blind retry. No tool output, no failure family, no stage.
+#: ``logs``    the compile/sim tail from the earliest failing stage (the default).
+#: ``self``    ``logs`` plus a trace of the candidate's OWN signals, obtained by running an
+#:             instrumented, NON-SCORED copy of it. Strict: nothing the golden RTL or the
+#:             testbench source knows can enter this path, so it stays publishable.
+#: ``oracle``  ``logs`` plus where the candidate's stdout first diverges from the reference
+#:             RTL's. UPPER BOUND ONLY -- see ORACLE_DERIVED_POLICIES.
+EVIDENCE_POLICIES = ("none", "logs", "self", "oracle")
+
+#: Policies that show the model something derived from the answer key. A run using one of
+#: these is NOT comparable to a published RTLLM number or to the strict track, and every
+#: artifact it produces is stamped: :attr:`SampleResult.oracle_derived_evidence`, the
+#: ``oracle_derived_evidence`` key in every result row and report, a line in report.md's
+#: Configuration block, and a warning from the driver. Widening this set without widening
+#: those stamps is how an upper bound gets quoted as a headline.
+ORACLE_DERIVED_POLICIES = frozenset({"oracle"})
 
 _RETRY_BASE_DELAY = 2.0  # 2s, 4s, 8s ... between failed client.complete calls
 _RETRYABLE = (RuntimeError, OSError, subprocess.TimeoutExpired)
@@ -217,6 +243,147 @@ _DEFAULT_INTENT = (
     "the most likely mechanism."
 )
 
+
+# Per-family repair procedure. ``REPAIR_INTENTS`` says WHAT went wrong in one line; this says
+# HOW to attack it. A generic "fix the bug" instruction wastes the repair round on the wrong
+# layer -- a port mismatch is not repaired by re-deriving the arithmetic, and a hang is not
+# repaired by adjusting a constant. Kept to a handful of lines each: this text competes with
+# the tool output for the model's attention, and the tool output is the evidence.
+FAMILY_REPAIR_INSTRUCTIONS: dict[str, str] = {
+    "missing_module": (
+        "How to repair this family (INTERFACE CONTRACT VIOLATED -- do not touch the logic "
+        "until the interface is right):\n"
+        "1. The harness instantiates one module by name and found none. Declare it.\n"
+        "2. Copy the module name and every port identifier CHARACTER FOR CHARACTER from the "
+        "description below. Do not pluralise, abbreviate, or re-case them.\n"
+        "3. Keep helper submodules in the same file, below the top module."
+    ),
+    "port_mismatch": (
+        "How to repair this family (INTERFACE CONTRACT VIOLATED -- do not touch the logic "
+        "until the interface is right):\n"
+        "1. The harness connected a port this module does not declare, or declares with the "
+        "wrong direction or width. The harness is fixed; the module is what changes.\n"
+        "2. Re-derive the ENTIRE port list from the description: every identifier, its "
+        "direction, and its exact bit range. A port the description names must exist even if "
+        "your implementation does not need it.\n"
+        "3. Do not rename a port to match your logic -- rename your logic."
+    ),
+    "compile_error": (
+        "How to repair this family:\n"
+        "1. Read the FIRST error the compiler reports; later ones are usually its "
+        "consequences.\n"
+        "2. Fix exactly what it names at the line it names. Do not rewrite unrelated code.\n"
+        "3. Keep to the Verilog-2001 subset iverilog accepts: no `logic`, `always_ff`, "
+        "`typedef`, `enum`, `break`, `++`, or array assignment patterns.\n"
+        "4. Every output assigned inside an `always` block must be declared `reg`."
+    ),
+    "simulator_unsupported": (
+        "How to repair this family:\n"
+        "1. iverilog said 'sorry: ...' -- the construct is legal Verilog it does not "
+        "implement, so no amount of syntax fixing helps.\n"
+        "2. Rewrite that one construct in plain Verilog-2001 (loops instead of array "
+        "assignment patterns, `disable` instead of `break`, explicit widths instead of "
+        "assignment patterns) and change nothing else."
+    ),
+    "functional_mismatch": (
+        "How to repair this family (BEHAVIOUR, not interface -- keep the port list exactly as "
+        "it is):\n"
+        "1. From the evidence, name the first input pattern whose output is wrong.\n"
+        "2. Hand-compute what the description requires for that pattern and compare it with "
+        "what the design produced. State the mechanism in one line before editing.\n"
+        "3. The usual mechanisms, in order of frequency: wrong bit width or truncation, "
+        "signed vs unsigned, an off-by-one-cycle registered output, a reset value, or a "
+        "boundary case (zero, maximum, overflow) the logic never handles."
+    ),
+    "timeout": (
+        "How to repair this family (LIVENESS -- the design never finished, so no output was "
+        "ever compared):\n"
+        "1. Look for a combinational loop: an `always @(*)` block (or `assign`) whose output "
+        "feeds back into its own sensitivity list. Simulation time cannot advance through "
+        "one.\n"
+        "2. Look for a missing clock edge: a state register updated in a block with no "
+        "`posedge`/`negedge`, or a state machine with a state that has no exit transition.\n"
+        "3. Look for a terminating condition that is never reached: a counter that never "
+        "hits its terminal value, or a done/valid/ready output that is never asserted "
+        "because its guard is unreachable.\n"
+        "4. Check reset: a register left at X propagates X through every comparison, so no "
+        "condition guarded by it can ever be true."
+    ),
+    "illegal_system_task": (
+        "How to repair this family:\n"
+        "1. Delete every $display/$write/$monitor/$strobe/$fdisplay/$finish/$stop/$dump* "
+        "from the design file. There is no acceptable use of them in a design.\n"
+        "2. Drive the outputs with real logic instead -- whatever those tasks were reporting "
+        "is what the outputs are supposed to carry.\n"
+        "3. $signed/$unsigned/$clog2 are fine and do not need removing."
+    ),
+    "runaway_output": (
+        "How to repair this family:\n"
+        "1. The run was killed for flooding its output, which means a loop is executing "
+        "without ever advancing simulation time.\n"
+        "2. Find the `forever`/`while`/`always` block with no delay and no edge control, and "
+        "give it a real termination or a real clock edge."
+    ),
+    "no_output": (
+        "How to repair this family:\n"
+        "1. The run produced nothing at all, so the design most likely never drove its "
+        "outputs off their initial X.\n"
+        "2. Check that every output is assigned on every path and reset to a defined value."
+    ),
+}
+
+#: Headers that open the interface section of an RTLLM description. Their indented bodies are
+#: what gets restated verbatim to a model that broke the interface contract.
+_INTERFACE_HEADER_RE = re.compile(
+    r"^\s*(?:module name|input ports?|output ports?|inout ports?|parameters?)\s*:", re.IGNORECASE
+)
+
+#: Cap on the restated interface block, so it cannot crowd out the tool output.
+_INTERFACE_RESTATEMENT_LIMIT = 1500
+
+
+def interface_restatement(design: RtllmDesign) -> str:
+    """Re-quote the module name and port list *from the description* for an interface failure.
+
+    Purely description-derived -- the same text the model already received, pulled to the
+    front because a model that got the interface wrong read past it. Nothing is read from
+    the testbench or the reference, so this is admissible under every evidence policy
+    (including ``none``, though ``none`` shows no instructions at all).
+    """
+
+    kept: list[str] = []
+    capturing = False
+    for line in (design.description or "").splitlines():
+        if _INTERFACE_HEADER_RE.match(line):
+            capturing = True
+            kept.append(line.rstrip())
+            continue
+        if not capturing:
+            continue
+        if not line.strip() or line[:1] not in " \t":
+            capturing = False  # a blank line or an unindented line ends the block
+            continue
+        kept.append(line.rstrip())
+
+    header = f"The interface the harness requires (restated from the description):\nModule name: {design.name}"
+    if not kept:
+        return header
+    return header + "\n" + "\n".join(kept)[:_INTERFACE_RESTATEMENT_LIMIT]
+
+
+#: Families whose failure IS the interface, so the port list is restated in full.
+_INTERFACE_FAMILIES = frozenset({"missing_module", "port_mismatch"})
+
+
+def repair_instructions(design: RtllmDesign, family: "str | None") -> str:
+    """The family-specific repair procedure, plus the interface restatement when it applies."""
+
+    block = FAMILY_REPAIR_INSTRUCTIONS.get(family or "")
+    if family in _INTERFACE_FAMILIES:
+        restated = interface_restatement(design)
+        return f"{block}\n\n{restated}" if block else restated
+    return block or ""
+
 # Families whose failure lives in the benchmark harness, not in the candidate RTL. Repairing
 # against them burns LLM calls on a design that cannot pass however good the RTL is, so the
 # repair loop stops instead (the failure is still reported, unchanged).
@@ -241,11 +408,28 @@ class RtllmAgentConfig:
     max_repair_rounds: int = 2
     samples: int = 1
     plan: bool = True  # run the rtl_planner contract agent before generation
-    evidence_policy: str = "logs"  # "logs" | "none" (never the golden RTL/testbench source)
+    evidence_policy: str = "logs"  # one of EVIDENCE_POLICIES
     sim_timeout: int = DEFAULT_SIM_TIMEOUT
     compile_timeout: int = DEFAULT_COMPILE_TIMEOUT
     apply_shims: bool = True
     llm_retries: int = 2
+
+    def __post_init__(self) -> None:
+        # Validated, not normalised-away: a typo like "sef" must not silently degrade to
+        # "logs" and be reported as a self-derived measurement.
+        policy = (self.evidence_policy or "logs").lower()
+        if policy not in EVIDENCE_POLICIES:
+            raise ValueError(
+                "evidence_policy must be one of %s, got %r"
+                % (", ".join(EVIDENCE_POLICIES), self.evidence_policy)
+            )
+        self.evidence_policy = policy
+
+    @property
+    def oracle_derived_evidence(self) -> bool:
+        """True when this configuration shows the model something derived from the answer key."""
+
+        return self.evidence_policy in ORACLE_DERIVED_POLICIES
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -253,6 +437,7 @@ class RtllmAgentConfig:
             "samples": self.samples,
             "plan": self.plan,
             "evidence_policy": self.evidence_policy,
+            "oracle_derived_evidence": self.oracle_derived_evidence,
             "sim_timeout": self.sim_timeout,
             "compile_timeout": self.compile_timeout,
             "apply_shims": self.apply_shims,
@@ -269,6 +454,11 @@ class AttemptRecord:
     sim: SimResult
     rtl: str
     llm_error: str | None = None
+    #: Which evidence channels fed the prompt that produced THIS round's RTL. Empty for a
+    #: generation round (nothing had failed yet). Recorded so a report can state what the
+    #: model was actually shown instead of inferring it from the configured policy, which
+    #: only says what was *permitted*.
+    evidence_sources: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -277,6 +467,7 @@ class AttemptRecord:
             "sim": self.sim.to_dict(),
             "rtl": self.rtl,
             "llm_error": self.llm_error,
+            "evidence_sources": list(self.evidence_sources),
         }
 
 
@@ -294,6 +485,10 @@ class SampleResult:
     final_rtl: str = ""
     evidence_policy: str = "logs"
     plan_error: str | None = None
+    #: True when this sample's repair prompts could contain oracle-derived evidence. Stamped
+    #: from the policy, not from whether a diff happened to fire, so a design that passed at
+    #: round 0 in an oracle-track sweep still carries the mark of the track it belongs to.
+    oracle_derived_evidence: bool = False
 
     @property
     def syntax_pass_round(self) -> int | None:

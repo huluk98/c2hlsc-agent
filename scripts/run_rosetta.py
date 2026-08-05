@@ -321,18 +321,470 @@ def _render_markdown(rows: list[AppResult], summary: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
+# --------------------------------------------------------------------------- #
+# Agent rung: src/sw kernel -> HLS-C -> host software equivalence
+# --------------------------------------------------------------------------- #
+
+
+#: Every Rosetta Makefile declares the kernel it builds.
+_KERNEL_NAME_RE = re.compile(r"^\s*KERNEL_NAME\s*=\s*(\S+)", re.M)
+#: The generated equivalence testbench prints this on success.
+_EQUIV_PASS_RE = re.compile(r"all\s+\d+\s+tests passed", re.I)
+
+
+@dataclass
+class AgentResult:
+    """One app's agent-rung row.
+
+    Field names overlap :class:`AppResult` deliberately (``app``/``ok``/``built``/``ran``/
+    ``failure_family``/``duration_s``/``evidence``) so the driver logs and streams both
+    modes through one code path, while the agent-only columns (``rung``, ``top``,
+    ``walls``) mirror the CHStone harness's schema.
+    """
+
+    app: str
+    mode: str = "agent"
+    top: str = ""
+    generator: str = "deterministic"   # deterministic | llm
+    rung: str = "discovered"
+    ok: bool = False
+    built: bool = False               # generated HLS-C + golden testbench compiled
+    ran: bool = False                 # the equivalence testbench executed
+    oracle: str = "original_sw_kernel"
+    xilinx_available: bool = False
+    rungs_not_attempted: tuple[str, ...] = XILINX_RUNGS
+    failure_family: str | None = None
+    walls: list[str] = field(default_factory=list)
+    diagnostics: list[str] = field(default_factory=list)
+    measured: str = ""
+    expected: str = ""
+    evidence: str = ""
+    duration_s: float = 0.0
+    project_dir: str | None = None
+    xilinx_followup_cmd: str | None = None
+    notes: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, object]:
+        payload = dict(self.__dict__)
+        payload["rungs_not_attempted"] = list(self.rungs_not_attempted)
+        return payload
+
+
+def strip_comments(source: str) -> str:
+    """Drop block and line comments (the same normalization the analyzer skips)."""
+
+    source = re.sub(r"/\*.*?\*/", "", source, flags=re.S)
+    return re.sub(r"//.*", "", source)
+
+
+def _definition_re(top: str) -> re.Pattern[str]:
+    """``c2hlsc_agent.analyze._extract_function``'s own top-function regex, verbatim.
+
+    Kept identical on purpose: it is what the measurements below are measured *against*,
+    so it must not drift from the converter it is reporting on.
+    """
+
+    return re.compile(
+        rf"(?P<ret>[A-Za-z_][\w\s\*\d]*?)\s+{re.escape(top)}\s*\((?P<params>[^;{{}}]*)\)\s*\{{",
+        flags=re.S,
+    )
+
+
+def discover_sw_top(app: RosettaApp) -> str | None:
+    """The software kernel's top function, taken from the app's own Makefile.
+
+    Every Rosetta Makefile declares ``KERNEL_NAME`` and the software entry point is
+    ``<KERNEL_NAME>_sw``, which the ``src/sw`` header also declares. Reading the Makefile
+    keeps this harness honest about which function the suite itself calls the kernel --
+    the same reason the CHStone harness reads ``hls.tcl`` for the top file instead of
+    guessing ``<dir>/<dir>.c``. Falls back to any ``*_sw`` definition in the kernel source.
+    """
+
+    makefile = app.directory / "Makefile"
+    kernel_path = app.directory / app.sw_kernel
+    if not makefile.exists() or not kernel_path.exists():
+        return None
+    source = strip_comments(kernel_path.read_text(encoding="utf-8", errors="replace"))
+    candidates: list[str] = []
+    declared = _KERNEL_NAME_RE.search(makefile.read_text(encoding="utf-8", errors="replace"))
+    if declared:
+        candidates.append(f"{declared.group(1)}_sw")
+    candidates += [name for name in re.findall(r"\b(\w+_sw)\s*\(", source) if name not in candidates]
+    for name in candidates:
+        if _definition_re(name).search(source):
+            return name
+    return None
+
+
+def declared_return_type(source: str, top: str) -> str | None:
+    """The top's return type read from *comment-stripped* source -- the ground truth.
+
+    ``c2hlsc_agent.analyze`` runs its extraction regex on the raw text, so a ``//`` comment
+    sitting directly above the definition is absorbed into the captured return type.
+    Re-running the identical regex on stripped text is what that misparse is measured
+    against. Nothing here changes the converter; it only names what the converter produced.
+    """
+
+    match = _definition_re(top).search(strip_comments(source))
+    if not match:
+        return None
+    return re.sub(r"\s+", " ", match.group("ret")).strip()
+
+
+def generated_return_type(project: Path, top: str) -> str | None:
+    """The return type the converter actually emitted into ``src/hls_top.hpp``."""
+
+    header = project / "src" / "hls_top.hpp"
+    if not header.exists():
+        return None
+    match = re.search(
+        rf"^(?P<ret>[^#\n]*?)\s*\b{re.escape(top)}\s*\(",
+        header.read_text(encoding="utf-8", errors="replace"),
+        re.M,
+    )
+    if not match:
+        return None
+    return re.sub(r"\s+", " ", match.group("ret")).strip()
+
+
+def _quote(log_text: str, pattern: re.Pattern[str]) -> str:
+    """First log line matching ``pattern``, so a family is always backed by real evidence."""
+
+    for line in log_text.splitlines():
+        if pattern.search(line):
+            return line.strip()
+    return ""
+
+
+_MULTIDIM_RE = re.compile(r"cannot convert .+ to .+\(\*\)\[")
+_STRUCT_STIMULUS_RE = re.compile(r"no matching function for call to .(?P<t>\w+)::(?P=t)\(")
+_HEADER_TYPE_RE = re.compile(r"hls_top\.hpp:\d+:\d+: error: .*(was not declared in this scope|declared void)")
+_ANY_ERROR_RE = re.compile(r"\berror:")
+
+
+def detect_walls(log_text: str, project: Path, top: str, kernel_source: str) -> list[tuple[str, str]]:
+    """Every distinct wall the run hit, in the order they block the build.
+
+    Reporting all of them (not only the first) is the point: three of the five apps stop on
+    more than one independent limitation, and a report that named only the first would
+    suggest fixing it is enough.
+    """
+
+    walls: list[tuple[str, str]] = []
+    emitted = generated_return_type(project, top)
+    declared = declared_return_type(kernel_source, top)
+    if emitted is not None and declared is not None and emitted != declared:
+        walls.append((
+            "top_signature_misparsed",
+            f"converter emitted return type {emitted!r} for a top declared {declared!r}"
+            + (f"; {_quote(log_text, re.compile(r'does not name a type'))}"
+               if _quote(log_text, re.compile(r"does not name a type")) else ""),
+        ))
+    for family, pattern in (
+        ("multidim_array_arg_unsupported", _MULTIDIM_RE),
+        ("struct_arg_stimulus_unsupported", _STRUCT_STIMULUS_RE),
+        ("generated_header_missing_app_types", _HEADER_TYPE_RE),
+    ):
+        quoted = _quote(log_text, pattern)
+        if quoted:
+            walls.append((family, quoted))
+    if not walls and _ANY_ERROR_RE.search(log_text):
+        walls.append(("generated_hlsc_does_not_compile", _quote(log_text, _ANY_ERROR_RE)))
+    return walls
+
+
+def classify_agent(report: dict, log_text: str, project: Path, top: str, kernel_source: str
+                   ) -> tuple[str, str | None, list[tuple[str, str]]]:
+    """Map the host-equivalence log (authoritative) onto (rung, failure family, walls).
+
+    The log wins over ``conversion_report.json``'s phase field, matching the CHStone
+    harness: the report records the phase as the converter saw it and can be stale after a
+    repair iteration.
+    """
+
+    if _EQUIV_PASS_RE.search(log_text):
+        return "host_equivalence", None, []
+    phases = report.get("phases") or {}
+    software = str(phases.get("software_equivalence", {}).get("status", "")
+                   if isinstance(phases.get("software_equivalence"), dict)
+                   else phases.get("software_equivalence", "")).lower()
+    if software == "pass" and "error:" not in log_text.lower():
+        return "host_equivalence", None, []
+
+    walls = detect_walls(log_text, project, top, kernel_source)
+    # The equivalence log is written only once `make test` actually ran. Without it the run
+    # never left static analysis, so it must not be scored as "generated and then failed" --
+    # under --strict-diagnostics the project files exist but nothing was ever compiled.
+    if not (project / "software_equivalence.log").exists():
+        diagnostics = report.get("diagnostics") or []
+        blocked = any(str(d.get("severity", "")).lower() == "error"
+                      for d in diagnostics if isinstance(d, dict))
+        if not (project / "src" / "hls_top.cpp").exists():
+            return "discovered", "conversion_produced_no_project", walls
+        return "analyzed", "static_source_rejected" if blocked else "host_equivalence_not_run", walls
+    if not walls:
+        # It compiled and ran, but the two implementations disagreed.
+        return "generated", "host_behavior_mismatch", []
+    return "generated", walls[0][0], walls
+
+
+def render_agent_config(app: RosettaApp) -> str:
+    """The ``--config`` the conversion runs under.
+
+    ``-I src/sw -I src/host`` is what lets the copied ``input.c`` resolve its own quoted
+    includes (``"sgd_sw.h"`` and, through it, ``"../host/typedefs.h"``) from the project
+    directory, so the harness never has to stage or rewrite Rosetta's sources. ``-DSW``
+    selects the plain-C++ typedefs over the ``ap_int``/``ap_fixed`` ones, which is the
+    whole reason the software kernel is buildable off a Xilinx machine.
+    """
+
+    flags = [
+        "-DSW",
+        "-w",
+        f"-I{app.directory / 'src' / 'sw'}",
+        f"-I{app.directory / 'src' / 'host'}",
+    ]
+    imagelib = app.directory / "imageLib"
+    if imagelib.exists():
+        flags.append(f"-I{imagelib}")
+    for header in PORTABILITY_INCLUDES:
+        flags += ["-include", header]
+    lines = [
+        "# Generated by scripts/run_rosetta.py for the Rosetta agent rung.",
+        "compiler_flags:",
+        *[f"  - {json.dumps(flag)}" for flag in flags],
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def run_agent(app: RosettaApp, out_dir: Path, args: argparse.Namespace) -> AgentResult:
+    """Convert the app's src/sw kernel to HLS-C and run host software equivalence (rung 1)."""
+
+    started = time.time()
+    result = AgentResult(app=app.name, generator="llm" if args.use_llm else "deterministic")
+    # Absolute: the conversion subprocess runs from the repo root, so a relative --out-dir
+    # would otherwise land the project somewhere other than where the caller asked.
+    work = (out_dir / "apps" / app.name).resolve()
+    shutil.rmtree(work, ignore_errors=True)
+    work.mkdir(parents=True, exist_ok=True)
+
+    kernel = (app.directory / app.sw_kernel).resolve()
+    if not kernel.exists():
+        result.failure_family = "missing_source"
+        result.evidence = f"sw kernel not found: {kernel}"
+        result.duration_s = round(time.time() - started, 2)
+        return result
+    top = discover_sw_top(app)
+    if not top:
+        result.failure_family = "sw_top_not_found"
+        result.evidence = (f"no <KERNEL_NAME>_sw definition found in {app.sw_kernel}; "
+                           "the Makefile's KERNEL_NAME did not resolve to a kernel entry point")
+        result.duration_s = round(time.time() - started, 2)
+        return result
+    result.top = top
+    kernel_source = kernel.read_text(encoding="utf-8", errors="replace")
+
+    config_path = work / "config.yaml"
+    config_path.write_text(render_agent_config(app), encoding="utf-8")
+    project = work / "project"
+    result.project_dir = str(project)
+
+    cmd = [
+        sys.executable, "-m", "c2hlsc_agent.cli", "convert",
+        "--input", str(kernel),
+        "--top", top,
+        "--out", str(project),
+        "--config", str(config_path),
+        "--no-run-vitis",
+    ]
+    if args.keep_going:
+        cmd.append("--keep-going")
+    if args.use_llm:
+        cmd.append("--use-llm")
+        for flag, value in (("--llm-backend", args.llm_backend),
+                            ("--llm-model", args.llm_model),
+                            ("--llm-cli-cmd", args.llm_cli_cmd)):
+            if value:
+                cmd += [flag, value]
+    else:
+        cmd.append("--no-llm")
+    # --auto-repair is independent of --use-llm: hlsc_repair_agent applies deterministic
+    # mechanical repairs (missing includes, helper-source inclusion, restrict compatibility)
+    # with no model at all, and escalates to an LLM patch only when one is configured.
+    if args.auto_repair:
+        cmd += ["--auto-repair", "--max-iterations", str(args.max_iterations)]
+
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=args.timeout,
+                              cwd=str(Path(__file__).resolve().parent.parent))
+        combined = (proc.stdout or "") + (proc.stderr or "")
+    except subprocess.TimeoutExpired:
+        result.failure_family = "conversion_timeout"
+        result.evidence = f"convert timed out after {args.timeout}s"
+        result.duration_s = round(time.time() - started, 2)
+        return result
+    except OSError as exc:
+        result.failure_family = "conversion_error"
+        result.evidence = str(exc)
+        result.duration_s = round(time.time() - started, 2)
+        return result
+
+    equivalence_log = project / "software_equivalence.log"
+    log_text = (equivalence_log.read_text(encoding="utf-8", errors="replace")
+                if equivalence_log.exists() else combined)
+    report: dict = {}
+    report_path = project / "conversion_report.json"
+    if report_path.exists():
+        try:
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            report = {}
+
+    rung, family, walls = classify_agent(report, log_text, project, top, kernel_source)
+    result.rung = rung
+    result.ok = rung == "host_equivalence"
+    result.failure_family = None if result.ok else family
+    result.walls = [name for name, _quoted in walls]
+    result.built = rung == "host_equivalence" or (rung == "generated" and not walls)
+    result.ran = result.built
+    result.diagnostics = [
+        f"[{d.get('severity')}] {d.get('code')}: {d.get('message')}"
+        for d in (report.get("diagnostics") or []) if isinstance(d, dict)
+    ]
+    result.notes += [f"{name}: {quoted}" for name, quoted in walls]
+    if result.ok:
+        match = _EQUIV_PASS_RE.search(log_text)
+        result.measured = match.group(0) if match else "host equivalence passed"
+        # A pass here is host equivalence only, and only over the stimulus the generated
+        # testbench could build; it is not a synthesized, cosimulated design.
+        result.notes.append(
+            "host software equivalence only (rung 1 of 4); no HLS synthesis was attempted")
+    result.evidence = log_text[-EVIDENCE_LIMIT:]
+    result.xilinx_followup_cmd = (
+        f"python3 -m c2hlsc_agent.cli convert --input {kernel} --top {top} "
+        f"--out {project} --config {config_path} --vitis-ssh USER@VITIS_HOST --keep-going"
+    )
+    result.duration_s = round(time.time() - started, 2)
+    return result
+
+
+def agent_row_from_dict(payload: dict) -> AgentResult | None:
+    """Rebuild an agent row recorded by an earlier run (the ``--resume`` counterpart)."""
+
+    if not isinstance(payload, dict):
+        return None
+    names = {f.name for f in dataclasses.fields(AgentResult)}
+    kwargs = {key: value for key, value in payload.items() if key in names}
+    kwargs["rungs_not_attempted"] = tuple(kwargs.get("rungs_not_attempted") or ())
+    try:
+        return AgentResult(**kwargs)
+    except TypeError:
+        return None
+
+
+def _summarise_agent(rows: list[AgentResult], apps: int, elapsed: float, resumed: int = 0) -> dict:
+    reached: dict[str, int] = {}
+    families: dict[str, int] = {}
+    walls: dict[str, int] = {}
+    for row in rows:
+        reached[row.rung] = reached.get(row.rung, 0) + 1
+        if row.failure_family:
+            families[row.failure_family] = families.get(row.failure_family, 0) + 1
+        for wall in row.walls:
+            walls[wall] = walls.get(wall, 0) + 1
+    generators = sorted({row.generator for row in rows}) or ["deterministic"]
+    return {
+        "mode": "agent",
+        "generator": "+".join(generators),
+        "apps": apps,
+        "completed": len(rows),
+        "resumed": resumed,
+        "passed": sum(1 for r in rows if r.ok),
+        "rung_reached": reached,
+        "failure_families": families,
+        "walls": walls,
+        "xilinx_available": False,
+        "rungs_not_attempted": list(XILINX_RUNGS),
+        "ladder_note": (
+            "Only host software equivalence (rung 1 of 4) can run without Xilinx tooling. "
+            "HLS synthesis, SDAccel and SDSoC were NOT attempted and no claim is made about "
+            "them. 'passed' means the generated HLS-C matched the original src/sw kernel on "
+            "the generated stimulus -- not that anything was synthesized."
+        ),
+        "elapsed_s": round(elapsed, 1),
+    }
+
+
+def _render_agent_markdown(rows: list[AgentResult], summary: dict) -> str:
+    lines = ["# Rosetta agent-rung run — c2hlsc-agent", ""]
+    lines.append(f"Mode: `agent` · generator: `{summary['generator']}` · apps: {summary['apps']} · "
+                 f"passed: **{summary['passed']}/{summary['completed']}** · {summary['elapsed_s']}s")
+    lines += ["", "> **Ladder coverage.** " + summary["ladder_note"], ""]
+    lines += ["| app | top | rung reached | ok | failure family | seconds |",
+              "| --- | --- | --- | :-: | --- | --: |"]
+    for row in sorted(rows, key=lambda r: r.app):
+        lines.append(f"| `{row.app}` | `{row.top or '-'}` | {row.rung} | "
+                     f"{'PASS' if row.ok else 'FAIL'} | {row.failure_family or '-'} | {row.duration_s} |")
+    if summary["failure_families"]:
+        lines += ["", "## Failure families (first blocking wall per app)", "",
+                  "| family | n |", "| --- | :-: |"]
+        for family, count in sorted(summary["failure_families"].items(), key=lambda kv: -kv[1]):
+            lines.append(f"| `{family}` | {count} |")
+    if summary["walls"]:
+        lines += ["", "## Every wall the compiler reported", "",
+                  "Apps commonly stop on more than one independent limitation, so fixing only the "
+                  "first would not move them. Read these counts as a floor: an error in "
+                  "`src/hls_top.hpp` aborts that translation unit, which can mask further walls "
+                  "in the same app.", "", "| wall | n |", "| --- | :-: |"]
+        for wall, count in sorted(summary["walls"].items(), key=lambda kv: -kv[1]):
+            lines.append(f"| `{wall}` | {count} |")
+    quoted = [(row.app, note) for row in sorted(rows, key=lambda r: r.app) for note in row.notes
+              if ": " in note and not note.startswith("host software equivalence")]
+    if quoted:
+        lines += ["", "## Diagnostics, quoted", ""]
+        for app, note in quoted:
+            lines.append(f"- `{app}` — {note}")
+    return "\n".join(lines) + "\n"
+
+
+# --------------------------------------------------------------------------- #
+# Driver
+# --------------------------------------------------------------------------- #
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="run_rosetta.py",
-        description="Build and run Rosetta's software path and judge it against shipped golden "
-                    "outputs. No Xilinx tooling is used and none of the HLS rungs are faked.",
+        description="Run Rosetta's software path, or drive its src/sw kernels through the "
+                    "c2hlsc conversion agent and check host equivalence. No Xilinx tooling is "
+                    "used and none of the HLS rungs are faked.",
     )
     parser.add_argument("--benchmark", required=True, type=Path, help="Path to a Rosetta checkout")
     parser.add_argument("--out-dir", required=True, type=Path)
     parser.add_argument("--apps", nargs="+", default=[], metavar="NAME")
     parser.add_argument("--workers", type=int, default=1)
-    parser.add_argument("--sw-baseline", action="store_true",
-                        help="Build and run the software path (currently the only mode)")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--sw-baseline", action="store_true",
+                      help="Build and run the software path and judge it against the shipped "
+                           "golden output (the calibration rung; the default)")
+    mode.add_argument("--agent", action="store_true",
+                      help="Convert each app's src/sw kernel to HLS-C and run host software "
+                           "equivalence (ladder rung 1). Implied by --use-llm/--auto-repair.")
+    parser.add_argument("--keep-going", action="store_true", default=True,
+                        help="Emit the project even when static diagnostics contain errors "
+                             "(default: on; Rosetta trips the analyzer's variable-length-array "
+                             "check on named compile-time constants such as K_CONST)")
+    parser.add_argument("--strict-diagnostics", dest="keep_going", action="store_false",
+                        help="Stop at static analysis instead of pushing past those diagnostics")
+    parser.add_argument("--use-llm", action="store_true",
+                        help="use the repo's LLM HLS-C generator instead of the deterministic one")
+    parser.add_argument("--llm-backend")
+    parser.add_argument("--llm-model")
+    parser.add_argument("--llm-cli-cmd")
+    parser.add_argument("--auto-repair", action="store_true",
+                        help="run hlsc_repair_agent between verification attempts (works without "
+                             "--use-llm: the mechanical repairs need no model)")
+    parser.add_argument("--max-iterations", type=int, default=2)
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--verbose", action="store_true")
@@ -348,11 +800,17 @@ def main(argv: list[str] | None = None) -> int:
     if not apps:
         raise SystemExit(f"no Rosetta apps found under {root}")
 
+    # Agent-only flags imply the agent rung, so they can never be silently ignored;
+    # everything else keeps the software baseline as the default mode.
+    agent_mode = bool(args.agent or ((args.use_llm or args.auto_repair) and not args.sw_baseline))
+    mode = "agent" if agent_mode else "sw"
+
     out_dir: Path = args.out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
     results_path = out_dir / "results.jsonl"
+    rebuild_row = agent_row_from_dict if agent_mode else row_from_dict
     done: set[str] = set()
-    prior: dict[str, AppResult] = {}
+    prior: dict[str, AppResult | AgentResult] = {}
     if args.resume and results_path.exists():
         wanted = {a.name for a in apps}
         for line in results_path.read_text(encoding="utf-8").splitlines():
@@ -362,7 +820,7 @@ def main(argv: list[str] | None = None) -> int:
             except (json.JSONDecodeError, KeyError, TypeError):
                 continue
             done.add(name)
-            row = row_from_dict(payload)
+            row = rebuild_row(payload)
             # Rows for apps outside this selection stay in the file but out of the report;
             # the last row for an app wins if it was recorded more than once.
             if row is not None and name in wanted:
@@ -372,18 +830,25 @@ def main(argv: list[str] | None = None) -> int:
         # to it: a mixed file makes a later --resume skip everything.
         os.replace(results_path, results_path.with_name(results_path.name + ".prev"))
     todo = [a for a in apps if a.name not in done]
-    log(f"Rosetta [sw]: {len(apps)} apps, {len(todo)} to run, {args.workers} worker(s)")
+    log(f"Rosetta [{mode}]: {len(apps)} apps, {len(todo)} to run, {args.workers} worker(s)")
+    if agent_mode:
+        log(f"generator: {'llm' if args.use_llm else 'deterministic'}"
+            f"{', repair on' if args.auto_repair else ', no repair'}")
     if args.resume:
         log(f"resume: {len(apps) - len(todo)} apps already done, {len(todo)} to run")
     log("note: no Xilinx tooling is used; HLS synthesis / SDAccel / SDSoC are NOT attempted")
     started = time.time()
 
-    def run_one(app: RosettaApp) -> AppResult:
-        row = run_sw(app, out_dir, args.timeout)
+    def run_one(app: RosettaApp) -> AppResult | AgentResult:
+        row = run_agent(app, out_dir, args) if agent_mode else run_sw(app, out_dir, args.timeout)
         verdict = "-" if row.ok is None else ("PASS" if row.ok else "FAIL")
-        log(f"[{app.name:<18}] built={'Y' if row.built else 'N'} ran={'Y' if row.ran else 'N'} "
-            f"oracle={row.oracle:<22} {verdict:<5} {row.measured or ''} "
-            f"{row.failure_family or ''} {row.duration_s}s")
+        if agent_mode:
+            log(f"[{app.name:<18}] rung={row.rung:<17} {verdict:<5} "
+                f"{row.failure_family or '':<36} {row.duration_s}s")
+        else:
+            log(f"[{app.name:<18}] built={'Y' if row.built else 'N'} ran={'Y' if row.ran else 'N'} "
+                f"oracle={row.oracle:<22} {verdict:<5} {row.measured or ''} "
+                f"{row.failure_family or ''} {row.duration_s}s")
         if args.verbose and row.evidence and row.ok is not True:
             tail = [ln for ln in row.evidence.strip().splitlines() if ln.strip()][-2:]
             for line in tail:
@@ -397,15 +862,27 @@ def main(argv: list[str] | None = None) -> int:
 
     # The report covers the whole suite, not just what this invocation ran.
     rows = sorted([*prior.values(), *fresh], key=lambda r: r.app)
-    summary = _summarise(rows, len(apps), time.time() - started, resumed=len(prior))
+    elapsed = time.time() - started
+    if agent_mode:
+        summary = _summarise_agent(rows, len(apps), elapsed, resumed=len(prior))
+        markdown = _render_agent_markdown(rows, summary)
+    else:
+        summary = _summarise(rows, len(apps), elapsed, resumed=len(prior))
+        markdown = _render_markdown(rows, summary)
     (out_dir / "report.json").write_text(
         json.dumps({**summary, "results": [r.to_dict() for r in rows]}, indent=2, sort_keys=True),
         encoding="utf-8")
-    (out_dir / "report.md").write_text(_render_markdown(rows, summary), encoding="utf-8")
-    log(f"\nsw: built {summary['built']}/{summary['completed']}, ran {summary['ran']}, "
-        f"passed {summary['passed']}/{summary['judged']} judged")
-    if summary["no_trustworthy_oracle"]:
-        log("no trustworthy oracle (excluded): " + ", ".join(summary["no_trustworthy_oracle"]))
+    (out_dir / "report.md").write_text(markdown, encoding="utf-8")
+    if agent_mode:
+        log(f"\nagent: {summary['passed']}/{summary['completed']} reached host equivalence; "
+            f"rungs {summary['rung_reached']}")
+        if summary["walls"]:
+            log("walls: " + ", ".join(f"{k}={v}" for k, v in sorted(summary["walls"].items())))
+    else:
+        log(f"\nsw: built {summary['built']}/{summary['completed']}, ran {summary['ran']}, "
+            f"passed {summary['passed']}/{summary['judged']} judged")
+        if summary["no_trustworthy_oracle"]:
+            log("no trustworthy oracle (excluded): " + ", ".join(summary["no_trustworthy_oracle"]))
     log(f"report: {out_dir / 'report.md'}")
     return 0
 
