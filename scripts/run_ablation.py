@@ -1189,11 +1189,11 @@ def render_markdown(report: "dict[str, Any]") -> str:
         )
         lines.append("")
     lines.append(
-        "Full catalogues, for audit: unpassable = "
+        "Full catalogues, for audit -- `rtllm_bench.KNOWN_ORACLE_ISSUES` (unpassable) = "
         + ", ".join(f"`{n}`" for n in subset["unpassable_oracle_catalogue"])
-        + "; vacuous = "
+        + "; `rtllm_bench.VACUOUS_ORACLE_DESIGNS` (vacuous) = "
         + ", ".join(f"`{n}`" for n in subset["vacuous_oracle_catalogue"])
-        + "."
+        + ". A design in either list cannot demonstrate anything about any arm."
     )
     lines.append("")
 

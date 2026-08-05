@@ -51,6 +51,59 @@ def strip_comments(source: str) -> str:
     return source
 
 
+def blank_comments(source: str) -> str:
+    """Overwrite comments with spaces, keeping every other offset where it was.
+
+    :func:`strip_comments` *deletes* comment text, so every index after a comment
+    shifts. The top-function search needs offsets that still line up with the raw
+    source, because ``definition`` and ``body`` are sliced out of it and must keep
+    their comments. Blanking instead of deleting gives the signature regex a
+    comment-free view without moving the code out from under it -- otherwise a
+    ``// top-level function`` line directly above a definition is absorbed into the
+    match and becomes part of the return type.
+
+    String literals are respected, so ``"http://x"`` does not start a comment.
+    """
+
+    out = list(source)
+    index = 0
+    length = len(source)
+    quote: str | None = None
+    while index < length:
+        char = source[index]
+        if quote is not None:
+            if char == "\\":
+                index += 2
+                continue
+            if char == quote:
+                quote = None
+            index += 1
+            continue
+        if char in {'"', "'"}:
+            quote = char
+            index += 1
+            continue
+        if char == "/" and index + 1 < length:
+            following = source[index + 1]
+            if following == "/":
+                end = source.find("\n", index)
+                end = length if end == -1 else end
+                for position in range(index, end):
+                    out[position] = " "
+                index = end
+                continue
+            if following == "*":
+                end = source.find("*/", index + 2)
+                end = length if end == -1 else end + 2
+                for position in range(index, end):
+                    if out[position] != "\n":  # keep line numbers intact
+                        out[position] = " "
+                index = end
+                continue
+        index += 1
+    return "".join(out)
+
+
 def _find_matching_brace(source: str, open_index: int) -> int:
     depth = 0
     in_string: str | None = None
@@ -143,11 +196,14 @@ def _extract_function(source: str, top: str, source_path: Path, config: AgentCon
         rf"(?P<ret>[A-Za-z_][\w\s\*\d]*?)\s+{re.escape(top)}\s*\((?P<params>[^;{{}}]*)\)\s*\{{",
         flags=re.S,
     )
-    match = pattern.search(source)
+    # Search a comment-blanked view: same offsets, no comment text. Slicing still
+    # happens on the raw source, so the extracted definition/body keep their comments.
+    searchable = blank_comments(source)
+    match = pattern.search(searchable)
     if not match:
         raise ValueError(f"top function {top!r} not found")
-    open_brace = source.find("{", match.start())
-    close_brace = _find_matching_brace(source, open_brace)
+    open_brace = searchable.find("{", match.start())
+    close_brace = _find_matching_brace(searchable, open_brace)
     params = match.group("params")
     args = [_parse_arg(part, config.arguments.get(_guess_arg_name(part))) for part in _split_params(params)]
     return_type = re.sub(r"\s+", " ", match.group("ret")).strip()

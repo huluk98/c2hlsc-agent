@@ -12,8 +12,9 @@ lower on the abstraction ladder:
 - ``verifier``          -- :func:`c2hlsc_agent.rtllm_bench.evaluate_rtl`: ``iverilog`` then
   ``vvp``, with the benchmark's own testbench as the oracle. The verifier is the gate; the
   model only ever *proposes* RTL.
-- ``failure_analyst``   -- :func:`build_evidence`: compact, tail-sliced evidence from the
-  EARLIEST failing stage only, plus the failure family and a one-line repair intent.
+- ``failure_analyst``   -- :func:`failure_analyst`: compact, tail-sliced evidence from the
+  EARLIEST failing stage only, plus the failure family, a one-line repair intent, a
+  family-specific repair procedure, and whatever extra channel the evidence policy permits.
 - ``rtl_repair_agent``  -- minimal patch of the current candidate given only that evidence.
 
 Benchmark-integrity rules (these are the whole point of the harness; breaking one
@@ -29,10 +30,30 @@ invalidates every number it prints):
    says, so :class:`c2hlsc_agent.llm.ClaudeCLIClient` runs its subprocess tool-less and in
    an empty scratch directory. If you add a backend that can call tools, sandbox it the
    same way or stop calling the numbers clean.
-2. ``evidence_policy="none"`` reduces repair to a blind retry -- no tool output, no failure
-   family, no stage -- so a user can measure what the feedback loop is actually worth.
-   ``"logs"`` (the default) passes the compile/sim tail. The policy is recorded in every
-   :class:`SampleResult` so a report cannot misrepresent the setting.
+2. The evidence policy is the ablation dial, and it is recorded in every
+   :class:`SampleResult` so a report cannot misrepresent the setting. Exactly what each rung
+   puts in front of the model:
+
+   ``none``   the string :data:`BLIND_RETRY_EVIDENCE` and nothing else: no tool output, no
+              failure family, no stage, no repair procedure. Blind retry.
+   ``logs``   stage + family + one-line intent + the family-specific repair procedure +
+              the tail of the earliest failing tool log. Plus, when the design HUNG, a
+              self-derived timeout diagnosis -- because a watchdog kill leaves an empty log
+              and "it hung" is not evidence.
+   ``self``   everything in ``logs``, plus a trace of the candidate's OWN ports and
+              registers taken from an instrumented, NON-SCORED copy of it. Strictly
+              self-derived: the trace is filtered to the instrumentation's own lines, so the
+              testbench's stdout cannot ride along, and the copy never reaches the verifier.
+              Still publishable as a strict number.
+   ``oracle`` everything in ``logs``, plus the first line at which the candidate's stdout
+              diverges from the reference RTL's on the same testbench (line number, expected,
+              got). Behaviour only -- the reference SOURCE is never shown -- but this is an
+              UPPER BOUND, not comparable to a published RTLLM number, and every artifact it
+              touches is stamped ``oracle_derived_evidence``.
+
+   Rules 1 and 2 interact: ``none``/``logs``/``self`` never let anything derived from the
+   golden RTL or the testbench source reach a prompt. ``oracle`` deliberately does, which is
+   the entire reason it is a separate, separately-reported track.
 3. :func:`extract_verilog` never renames the model's module. If the required module name is
    absent, the candidate goes to the verifier unchanged and is scored as
    ``missing_module`` -- that is a real benchmark failure, not something to paper over.
@@ -516,6 +537,8 @@ class SampleResult:
             "contract": self.contract,
             "plan_error": self.plan_error,
             "evidence_policy": self.evidence_policy,
+            "oracle_derived_evidence": self.oracle_derived_evidence,
+            "evidence_sources": sorted({s for r in self.rounds for s in r.evidence_sources}),
             "llm_error": self.llm_error,
             "final_rtl": self.final_rtl,
         }
@@ -539,6 +562,7 @@ class DesignResult:
             "syntax_success": self.syntax_success,
             "func_success": self.func_success,
             "evidence_policy": self.samples[0].evidence_policy if self.samples else None,
+            "oracle_derived_evidence": any(s.oracle_derived_evidence for s in self.samples),
             "samples": [s.to_dict() for s in self.samples],
         }
 
@@ -784,7 +808,21 @@ def generate_rtl(
     return extract_verilog(response, design.name)
 
 
-def build_evidence(sim: SimResult, config: RtllmAgentConfig) -> str:
+BLIND_RETRY_EVIDENCE = (
+    "Verification result: FAILED.\n"
+    "Tool output: withheld (evidence_policy=none -- this is a blind retry).\n"
+    "Repair intent: you get no diagnostics; re-derive the design from the description "
+    "and produce a materially different implementation."
+)
+
+
+def build_evidence(
+    sim: SimResult,
+    config: RtllmAgentConfig,
+    *,
+    design: RtllmDesign | None = None,
+    extra: str = "",
+) -> str:
     """failure_analyst: compact evidence from the EARLIEST failing stage only.
 
     Compile output when the candidate did not compile, otherwise simulation output; never
@@ -792,17 +830,17 @@ def build_evidence(sim: SimResult, config: RtllmAgentConfig) -> str:
     :data:`EVIDENCE_LIMIT` because the signature sits at the end of a tool log, after the
     banner and the file list.
 
+    ``design`` enables the family-specific repair procedure (and, for an interface failure,
+    the port list restated from the description). ``extra`` carries whatever the policy's
+    extra channel produced -- a self-derived trace, a timeout diagnosis, an oracle diff --
+    already formatted, and appended last so the tool output stays adjacent to the family.
+
     Under ``evidence_policy="none"`` this returns a fixed notice with no tool output, no
-    failure family, and no stage -- the blind-retry ablation.
+    failure family, no stage, and no instructions -- the blind-retry ablation.
     """
 
-    if (config.evidence_policy or "logs").lower() == "none":
-        return (
-            "Verification result: FAILED.\n"
-            "Tool output: withheld (evidence_policy=none -- this is a blind retry).\n"
-            "Repair intent: you get no diagnostics; re-derive the design from the description "
-            "and produce a materially different implementation."
-        )
+    if config.evidence_policy == "none":
+        return BLIND_RETRY_EVIDENCE
 
     if not sim.syntax_pass:
         stage = "compile (iverilog)"
@@ -817,13 +855,149 @@ def build_evidence(sim: SimResult, config: RtllmAgentConfig) -> str:
     intent = REPAIR_INTENTS.get(sim.failure_family or "", _DEFAULT_INTENT)
     # Tail slice: the failure signature is at the END of the log.
     excerpt = (raw or "").strip()[-EVIDENCE_LIMIT:] or "(no captured tool output)"
-    return (
+    sections = [
         f"Earliest failing stage: {stage}\n"
         f"Failure family: {family}\n"
-        f"Repair intent: {intent}\n\n"
-        f"Tool output (tail, at most {EVIDENCE_LIMIT} chars):\n"
-        f"```\n{excerpt}\n```"
+        f"Repair intent: {intent}"
+    ]
+    if design is not None:
+        instructions = repair_instructions(design, sim.failure_family)
+        if instructions:
+            sections.append(instructions)
+    sections.append(
+        f"Tool output (tail, at most {EVIDENCE_LIMIT} chars):\n```\n{excerpt}\n```"
     )
+    if extra and extra.strip():
+        sections.append(extra.strip())
+    return "\n\n".join(sections)
+
+
+def _self_trace_block(design: RtllmDesign, rtl: str, config: RtllmAgentConfig, workdir: Path) -> str:
+    """The ``self`` policy's extra channel: the candidate's own signals over time."""
+
+    trace = run_self_trace(
+        design,
+        rtl,
+        Path(workdir),
+        compile_timeout=config.compile_timeout,
+        sim_timeout=config.sim_timeout,
+        apply_shims=config.apply_shims,
+    )
+    head = (
+        "Self-derived behaviour trace. A COPY of your module -- your scored file is untouched "
+        "-- was instrumented to print its OWN ports and registers and run on the same "
+        "stimulus. Every value below is your design's; nothing here comes from a reference "
+        "implementation or from the testbench's own output."
+    )
+    if not trace.ran or not trace.trace.strip():
+        return f"{head}\n- unavailable: {trace.note or 'the instrumented copy produced no trace'}"
+    digest = trace_digest(trace.trace, limit=EVIDENCE_LIMIT)
+    lines = [
+        head,
+        "- traced signals: %s" % (", ".join(trace.signals) or "(none found)"),
+    ]
+    if trace.timed_out:
+        lines.append("- the trace run was cut short by the watchdog; it is a prefix, not the whole run")
+    if trace.note:
+        lines.append("- note: %s" % trace.note)
+    lines.append("")
+    lines.append("Trace (first transitions, then a sampled tail):")
+    lines.append("```")
+    lines.append(digest)
+    lines.append("```")
+    return "\n".join(lines)
+
+
+def _timeout_block(design: RtllmDesign, rtl: str, config: RtllmAgentConfig, workdir: Path) -> str:
+    """Self-derived liveness diagnosis for a design the watchdog killed.
+
+    A watchdog kill leaves ``sim_log`` EMPTY, so without this the repair agent is handed
+    "(no captured tool output)" and told the design hung -- which is why a hung design used
+    to burn every repair round without ever learning where it stopped. Produced under every
+    policy except ``none``: it is derived from the candidate alone and costs one short run.
+    """
+
+    diagnosis = diagnose_timeout(
+        design,
+        rtl,
+        Path(workdir),
+        compile_timeout=config.compile_timeout,
+        sim_timeout=min(config.sim_timeout, DIAG_WALL_CLOCK_S),
+        apply_shims=config.apply_shims,
+    )
+    return diagnosis.report()
+
+
+def _oracle_block(design: RtllmDesign, sim: SimResult, config: RtllmAgentConfig, workdir: Path) -> str:
+    """The ``oracle`` policy's extra channel: behaviour only, never the reference source."""
+
+    diff = oracle_behaviour_diff(
+        design,
+        sim.sim_log,
+        Path(workdir),
+        compile_timeout=config.compile_timeout,
+        sim_timeout=config.sim_timeout,
+        apply_shims=config.apply_shims,
+    )
+    return diff.report()
+
+
+def failure_analyst(
+    design: RtllmDesign,
+    rtl: str,
+    sim: SimResult,
+    config: RtllmAgentConfig,
+    workdir: Path,
+    *,
+    log: Callable[[str], None] | None = None,
+) -> tuple[str, tuple[str, ...]]:
+    """Assemble everything this policy permits, and say which channels contributed.
+
+    Returns ``(evidence_text, sources)``. The channels, and exactly when each fires:
+
+    ``logs``               every policy but ``none``.
+    ``timeout_diagnosis``  every policy but ``none``, when the family is ``timeout``. Self-
+                           derived, so it needs no extra permission -- and it is the only
+                           evidence that exists for a hang, whose sim log is empty.
+    ``self_trace``         ``self`` only, when the candidate compiled and did not hang (a
+                           hang gets the bounded diagnosis instead, which is the same channel
+                           run under a time bound).
+    ``oracle_diff``        ``oracle`` only, when the candidate compiled -- a candidate with no
+                           behaviour has nothing to diff, and the compile log already says
+                           everything there is to say.
+
+    Sub-runs are best-effort: an exception in one costs the round its extra evidence, never
+    the sweep. The scored candidate is never re-verified here and no verdict is produced.
+    """
+
+    if config.evidence_policy == "none":
+        return BLIND_RETRY_EVIDENCE, ("none",)
+
+    sources = ["logs"]
+    extras: list[str] = []
+    workdir = Path(workdir)
+    family = sim.failure_family or ""
+
+    def _collect(name: str, builder: Callable[[], str]) -> None:
+        try:
+            block = builder()
+        except Exception as exc:  # pragma: no cover - evidence must never kill a sweep
+            _log(log, f"{design.name}: {name} evidence unavailable ({exc!r})")
+            return
+        if block and block.strip():
+            extras.append(block.strip())
+            sources.append(name)
+
+    if family == "timeout":
+        _collect("timeout_diagnosis", lambda: _timeout_block(design, rtl, config, workdir / "timeout_diag"))
+    elif config.evidence_policy == "self" and sim.syntax_pass:
+        _collect("self_trace", lambda: _self_trace_block(design, rtl, config, workdir / "self_trace"))
+
+    if config.evidence_policy == "oracle" and sim.syntax_pass:
+        _collect("oracle_diff", lambda: _oracle_block(design, sim, config, workdir / "oracle_diff"))
+
+    text = build_evidence(sim, config, design=design, extra="\n\n".join(extras))
+    return text, tuple(sources)
 
 
 def repair_rtl(
@@ -833,13 +1007,21 @@ def repair_rtl(
     sim: SimResult,
     config: RtllmAgentConfig,
     *,
+    evidence: str | None = None,
     log: Callable[[str], None] | None = None,
 ) -> str:
-    """rtl_repair_agent: minimal patch of the current candidate from compact evidence only."""
+    """rtl_repair_agent: minimal patch of the current candidate from compact evidence only.
 
+    ``evidence`` is what :func:`failure_analyst` assembled for this round. When it is omitted
+    the log-only evidence is rebuilt from ``sim`` alone, which keeps the function usable
+    without a workdir (and keeps the ``none``/``logs`` behaviour identical to before).
+    """
+
+    if evidence is None:
+        evidence = build_evidence(sim, config, design=design)
     user = (
         f"{_description_block(design)}\n"
-        f"{build_evidence(sim, config)}\n\n"
+        f"{evidence}\n\n"
         f"Current `{design.name}.v` to repair:\n"
         "```verilog\n"
         f"{(rtl or '').rstrip()}\n"
@@ -880,6 +1062,19 @@ def _attempt_dir(workdir: Path, sample: int, round_index: int) -> Path:
     """One clean directory per attempt, so a stale binary can never fake a syntax pass."""
 
     path = Path(workdir) / f"sample{sample:02d}" / f"round{round_index}"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _evidence_dir(workdir: Path, sample: int, round_index: int) -> Path:
+    """Sandbox for the failure_analyst's sub-runs, kept OUT of the scored attempt dirs.
+
+    An instrumented copy and a reference build must never share a directory with a scored
+    candidate: they write the same filenames (``<design>.v``, ``sim``), so one stale binary
+    in a shared directory is a fabricated syntax pass.
+    """
+
+    path = Path(workdir) / f"sample{sample:02d}" / f"round{round_index}_evidence"
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -956,8 +1151,16 @@ def _run_sample(
             _log(log, f"{design.name}[{sample}]: {sim.failure_family} is a harness defect; not repairing")
             break
         round_index += 1
+        evidence, sources = failure_analyst(
+            design,
+            rtl,
+            sim,
+            config,
+            _evidence_dir(workdir, sample, round_index),
+            log=log,
+        )
         try:
-            rtl = repair_rtl(client, design, rtl, sim, config, log=log)
+            rtl = repair_rtl(client, design, rtl, sim, config, evidence=evidence, log=log)
         except LlmCallError as exc:
             rounds.append(
                 AttemptRecord(
@@ -966,11 +1169,20 @@ def _run_sample(
                     sim=_llm_error_sim(design),
                     rtl=rtl,
                     llm_error=str(exc),
+                    evidence_sources=sources,
                 )
             )
             break
         sim = _verify(design, rtl, config, workdir, sample, round_index)
-        rounds.append(AttemptRecord(round=round_index, role=REPAIR_ROLE, sim=sim, rtl=rtl))
+        rounds.append(
+            AttemptRecord(
+                round=round_index,
+                role=REPAIR_ROLE,
+                sim=sim,
+                rtl=rtl,
+                evidence_sources=sources,
+            )
+        )
         _log(log, f"{design.name}[{sample}] round {round_index}: syntax={sim.syntax_pass} func={sim.func_pass}")
 
     return _finish_sample(design, sample, rounds, contract, rtl, config, plan_error)
@@ -996,7 +1208,8 @@ def _finish_sample(
         rounds=rounds,
         contract=contract,
         final_rtl=final_rtl,
-        evidence_policy=(config.evidence_policy or "logs"),
+        evidence_policy=config.evidence_policy,
+        oracle_derived_evidence=config.oracle_derived_evidence,
         plan_error=plan_error,
     )
 

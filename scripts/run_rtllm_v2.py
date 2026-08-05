@@ -959,8 +959,27 @@ def build_report(
         {row["design"] for row in table} - {row["design"] for row in sound}
     )
     payload_external = external_section(rows, external) if external is not None else None
+    # Stamped from the configuration OR from any row that carries the mark, so a resumed or
+    # merged results file cannot launder an upper-bound row into a strict report.
+    oracle_derived = bool((agent_config or {}).get("oracle_derived_evidence")) or any(
+        row.get("oracle_derived_evidence") for row in rows
+    )
     report = {
         "mode": mode,
+        "oracle_derived_evidence": oracle_derived,
+        "oracle_derived_evidence_note": (
+            (
+                "The repair agent was shown where this candidate's output first diverged from "
+                "the benchmark's own reference RTL. This is the UPPER-BOUND track: it is not "
+                "comparable to the strict self-derived track, nor to any published RTLLM number."
+            )
+            if oracle_derived
+            else (
+                "No oracle-derived evidence was used: every prompt was built from the "
+                "description, the model's own contract, its own RTL, and tool output from its "
+                "own runs."
+            )
+        ),
         "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "benchmark": benchmark,
         "out_dir": out_dir,
@@ -1145,7 +1164,13 @@ def render_markdown(report: "dict[str, Any]") -> str:
     if mode == "external":
         # The scoring knobs that are meaningless for a file that was never regenerated: no
         # planner ran, no repair round existed, no evidence was shown to anything.
-        for key in ("plan", "max_repair_rounds", "evidence_policy", "llm_retries"):
+        for key in (
+            "plan",
+            "max_repair_rounds",
+            "evidence_policy",
+            "oracle_derived_evidence",
+            "llm_retries",
+        ):
             config.pop(key, None)
         gate = external.get("gate_impact") or {}
         config.update(
@@ -1172,6 +1197,27 @@ def render_markdown(report: "dict[str, Any]") -> str:
         lines.append("| --- | --- |")
         for key in sorted(config):
             lines.append(f"| {key} | `{config[key]}` |")
+        lines.append("")
+        # In the Configuration block, in words, not just as a table cell: a reader who skims
+        # a table of nine settings will not notice one boolean, and this one decides whether
+        # the numbers below may be quoted at all.
+        if report.get("oracle_derived_evidence"):
+            lines.append(
+                "> **ORACLE-DERIVED EVIDENCE (`oracle_derived_evidence: true`). This is the "
+                "UPPER-BOUND track.** The repair agent was shown, for each failing candidate, "
+                "where its simulator output first diverged from the output of the benchmark's "
+                "own reference RTL (line number, expected line, produced line). The reference "
+                "RTL source itself was never shown. These numbers measure what the loop can do "
+                "*with* an answer key, so they are **not comparable to the strict self-derived "
+                "track and not comparable to published RTLLM results**, and must never be "
+                "quoted as a headline agent score."
+            )
+        else:
+            lines.append(
+                "> No oracle-derived evidence: every prompt was built from the natural-language "
+                "description, the model's own contract, its own RTL, and tool output from its "
+                "own runs. The golden RTL and the testbench source appear in no prompt."
+            )
         lines.append("")
 
     lines.append("## Headline")
@@ -1431,9 +1477,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-plan", action="store_true", help="Skip the rtl_planner contract agent")
     parser.add_argument(
         "--evidence-policy",
-        choices=["logs", "none"],
+        choices=list(rtllm_agent.EVIDENCE_POLICIES),
         default="logs",
-        help="What the repair agent sees: compile/sim logs (default) or nothing. The golden RTL and testbench source are never shown.",
+        help=(
+            "What the repair agent sees. 'none': nothing (blind retry). 'logs' (default): the "
+            "compile/sim tail. 'self': logs plus a trace of the candidate's OWN signals from an "
+            "instrumented, non-scored copy of it. 'oracle': logs plus where its output first "
+            "diverges from the reference's -- ORACLE-DERIVED, an upper bound, not comparable to "
+            "published RTLLM numbers. The golden RTL source and the testbench source are never "
+            "shown under any policy"
+        ),
     )
     parser.add_argument(
         "--reference",
@@ -1597,6 +1650,19 @@ def main(argv: "list[str] | None" = None) -> int:
         )
     if args.label is not None and args.external_rtl is None:
         raise SystemExit("--label names the model behind --external-rtl and needs it.")
+    if args.evidence_policy in rtllm_agent.ORACLE_DERIVED_POLICIES:
+        # Loud, on stderr, before anything runs. A number from this track that gets copied
+        # into a comparison against published RTLLM results is simply wrong, and the only
+        # defence against that is saying so everywhere the number appears.
+        print(
+            f"WARNING: --evidence-policy {args.evidence_policy} shows the repair agent evidence "
+            "derived from the benchmark's own reference RTL (where its output first diverges "
+            "from yours). This is the UPPER-BOUND track: the results are NOT comparable to the "
+            "strict self-derived track or to published RTLLM numbers, and every row and report "
+            "is stamped oracle_derived_evidence=true.",
+            file=sys.stderr,
+            flush=True,
+        )
 
     root = resolve_benchmark(args)
     designs = select_designs(root, args)

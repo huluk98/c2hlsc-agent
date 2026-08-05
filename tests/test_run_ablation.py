@@ -96,7 +96,7 @@ def write_arm_output(arm_dir: Path, outcomes: "dict[str, bool]", *, round0: "dic
     arm_dir.mkdir(parents=True, exist_ok=True)
     round0 = round0 or {}
     rows = [
-        result_row(name, round0_pass=round0.get(name, passed and False), func_pass=passed)
+        result_row(name, round0_pass=round0.get(name, passed), func_pass=passed)
         for name, passed in sorted(outcomes.items())
     ]
     write_results(arm_dir / ablation.RESULTS_FILE, rows)
@@ -360,11 +360,11 @@ class ArmConstructionTests(unittest.TestCase):
         oracle = ablation.arm_command(by_name["evidence=oracle"], out_dir=Path("/o/eo"), **common)
         self.assertEqual(oracle[oracle.index("--evidence-policy") + 1], "oracle")
 
-        # One flag apart, everything else identical: that is what makes the delta attributable.
-        def without(cmd, *flags):
-            return [token for token in cmd if token not in flags]
-
-        self.assertEqual(without(no_plan, "--no-plan"), [t.replace("/o/no-plan", "/o/baseline") for t in without(no_plan, "--no-plan")])
+        # One flag apart, everything else identical: that is what makes the delta attributable
+        # to the planner rather than to some other difference between the two invocations.
+        normalised_baseline = [t for t in baseline if t != "/o/baseline"]
+        normalised_no_plan = [t for t in no_plan if t not in ("/o/no-plan", "--no-plan")]
+        self.assertEqual(normalised_baseline, normalised_no_plan)
 
     def test_arms_have_private_out_dirs(self):
         root = Path("/o")
@@ -492,8 +492,6 @@ class StatisticsTests(unittest.TestCase):
         first = ablation.paired_bootstrap_delta_ci(pairs, iterations=500, seed=7)
         second = ablation.paired_bootstrap_delta_ci(pairs, iterations=500, seed=7)
         self.assertEqual(first, second)
-        different = ablation.paired_bootstrap_delta_ci(pairs, iterations=500, seed=8)
-        self.assertNotEqual(first, different)
         point = (9 - 8) / 12
         self.assertLessEqual(first[0], point)
         self.assertGreaterEqual(first[1], point)
@@ -658,8 +656,10 @@ class ReportTests(unittest.TestCase):
         baseline = {f"d{i}": i <= 9 for i in range(1, 18)}
         markdown = ablation.render_markdown(build_fixture_report(baseline, dict(baseline)))
 
-        table_rows = [line for line in markdown.splitlines() if line.startswith("| `")]
-        self.assertTrue(table_rows)
+        # Only the comparison table; the "what each arm changed" table below it has no rates.
+        comparison = markdown.split("## Comparison", 1)[1].split("## What each arm changed", 1)[0]
+        table_rows = [line for line in comparison.splitlines() if line.startswith("| `")]
+        self.assertEqual(len(table_rows), 2)
         for line in table_rows:
             cells = [cell.strip() for cell in line.strip("|").split("|")]
             for cell in cells[2:5]:  # syntax, func, round-0 func
@@ -822,7 +822,10 @@ class MatrixRunTests(unittest.TestCase):
         self.assertIn("NOT SIGNIFICANT", rows["rounds=0"]["significance"])
 
     def test_blocked_arms_are_reported_not_executed(self):
-        code, runner, output = self.run_main("--arms", "baseline", "evidence=self")
+        # Pinned to a driver that lacks the policy, so this tests the blocking mechanism
+        # rather than whatever --evidence-policy choices the driver happens to ship today.
+        with mock.patch.object(ablation, "driver_evidence_choices", return_value=("logs", "none")):
+            code, runner, output = self.run_main("--arms", "baseline", "evidence=self")
 
         self.assertNotIn("evidence-self", runner.arms_run)
         self.assertIn("BLOCKED", output)

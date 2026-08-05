@@ -17,12 +17,25 @@ from unittest import mock
 from c2hlsc_agent import rtllm_agent
 from c2hlsc_agent.rtllm_agent import (
     EVIDENCE_LIMIT,
+    EVIDENCE_POLICIES,
+    FAMILY_REPAIR_INSTRUCTIONS,
+    ORACLE_DERIVED_POLICIES,
     RtllmAgentConfig,
     build_evidence,
     extract_verilog,
+    failure_analyst,
+    interface_restatement,
+    repair_instructions,
     run_design,
 )
-from c2hlsc_agent.rtllm_bench import RtllmDesign, SimResult
+from c2hlsc_agent.rtllm_bench import (
+    FAILURE_FAMILIES,
+    BehaviourDiff,
+    RtllmDesign,
+    SimResult,
+    TimeoutDiagnosis,
+    TraceResult,
+)
 
 
 DESCRIPTION = """Please act as a professional verilog designer.
@@ -149,6 +162,88 @@ class FakeVerifier:
 
 def _fenced(body: str, lang: str = "verilog") -> str:
     return f"```{lang}\n{body}\n```"
+
+
+# Markers planted in the fake evidence channels. Each one is unique to ONE channel, so a
+# prompt assertion says exactly which channel fed it.
+SELF_TRACE_MARKER = "SELF_TRACE_MARKER_9F2A"
+TIMEOUT_DIAG_MARKER = "TIMEOUT_DIAG_MARKER_7C41"
+ORACLE_DIFF_MARKER = "ORACLE_DIFF_MARKER_1B8E"
+
+
+def _fake_trace(*, ran: bool = True) -> TraceResult:
+    return TraceResult(
+        design="adder_8bit",
+        ran=ran,
+        signals=("a", "b", "cin", "sum", "cout"),
+        trace=f"RTLLM_TRACE time=0 a=00000001 {SELF_TRACE_MARKER}=1",
+        timed_out=False,
+        compiled=True,
+        note="",
+    )
+
+
+def _fake_diagnosis(*, ran: bool = True) -> TimeoutDiagnosis:
+    return TimeoutDiagnosis(
+        design="adder_8bit",
+        ran=ran,
+        last_time=4200,
+        time_advanced=True,
+        transitions=97,
+        stuck=(TIMEOUT_DIAG_MARKER,),
+        oscillating=("clk",),
+        digest="RTLLM_TRACE time=4200 done=0",
+        timed_out=False,
+        note="",
+        final_values={"done": "0"},
+    )
+
+
+def _fake_diff() -> BehaviourDiff:
+    return BehaviourDiff(
+        design="adder_8bit",
+        ran=True,
+        diverged=True,
+        line=3,
+        expected=f"{ORACLE_DIFF_MARKER} sum=8'h06",
+        got="sum=8'h05",
+        reference_lines=4,
+        candidate_lines=9,
+        note="",
+    )
+
+
+class EvidenceSpies:
+    """Stand-ins for the three failure_analyst sub-runs, recording what they were handed.
+
+    Patched in as module attributes of ``rtllm_agent`` so the loop's real call sites are
+    exercised; only the simulator work is faked.
+    """
+
+    def __init__(self) -> None:
+        self.trace_calls: list[str] = []
+        self.diagnosis_calls: list[str] = []
+        self.diff_calls: list[str] = []
+
+    def run_self_trace(self, design, rtl_text, workdir, **kwargs):
+        self.trace_calls.append(rtl_text)
+        return _fake_trace()
+
+    def diagnose_timeout(self, design, rtl_text, workdir, **kwargs):
+        self.diagnosis_calls.append(rtl_text)
+        return _fake_diagnosis()
+
+    def oracle_behaviour_diff(self, design, candidate_sim_log, workdir, **kwargs):
+        self.diff_calls.append(candidate_sim_log)
+        return _fake_diff()
+
+    def patch(self):
+        return mock.patch.multiple(
+            rtllm_agent,
+            run_self_trace=self.run_self_trace,
+            diagnose_timeout=self.diagnose_timeout,
+            oracle_behaviour_diff=self.oracle_behaviour_diff,
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -661,6 +756,398 @@ class RunDesignTests(unittest.TestCase):
         result, _design = self._run(None, verifier, config)
         self.assertIn("no LLM client", result.samples[0].rounds[0].llm_error or "")
         self.assertEqual(verifier.calls, [])
+
+
+# --------------------------------------------------------------------------- #
+# evidence policy: configuration
+# --------------------------------------------------------------------------- #
+
+
+class EvidencePolicyConfigTests(unittest.TestCase):
+    def test_the_ladder_is_the_documented_one(self):
+        self.assertEqual(EVIDENCE_POLICIES, ("none", "logs", "self", "oracle"))
+
+    def test_only_oracle_is_marked_oracle_derived(self):
+        self.assertEqual(ORACLE_DERIVED_POLICIES, frozenset({"oracle"}))
+        for policy in ("none", "logs", "self"):
+            self.assertFalse(RtllmAgentConfig(evidence_policy=policy).oracle_derived_evidence)
+        self.assertTrue(RtllmAgentConfig(evidence_policy="oracle").oracle_derived_evidence)
+
+    def test_a_typo_is_rejected_rather_than_degraded_to_logs(self):
+        # Silently falling back would report a run as "logs" that the user asked to be
+        # "self", which is a mislabeled measurement, not a harmless default.
+        with self.assertRaises(ValueError) as caught:
+            RtllmAgentConfig(evidence_policy="sef")
+        self.assertIn("evidence_policy", str(caught.exception))
+
+    def test_case_is_normalised(self):
+        self.assertEqual(RtllmAgentConfig(evidence_policy="ORACLE").evidence_policy, "oracle")
+
+    def test_the_policy_and_its_track_are_both_in_to_dict(self):
+        payload = RtllmAgentConfig(evidence_policy="oracle").to_dict()
+        self.assertEqual(payload["evidence_policy"], "oracle")
+        self.assertIs(payload["oracle_derived_evidence"], True)
+        self.assertIs(RtllmAgentConfig().to_dict()["oracle_derived_evidence"], False)
+
+
+# --------------------------------------------------------------------------- #
+# family-specific repair instructions
+# --------------------------------------------------------------------------- #
+
+
+class RepairInstructionTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.design = _make_design(self.tmp / "bench")
+
+    def tearDown(self):
+        import shutil
+
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_every_repairable_family_has_its_own_instructions(self):
+        # missing_golden_data is a harness defect the loop refuses to repair, so it needs no
+        # procedure; everything else the verifier can emit must have one.
+        for family in FAILURE_FAMILIES:
+            if family == "missing_golden_data":
+                continue
+            with self.subTest(family=family):
+                self.assertIn(family, FAMILY_REPAIR_INSTRUCTIONS)
+                self.assertTrue(repair_instructions(self.design, family).strip())
+
+    def test_the_instructions_actually_differ_by_family(self):
+        texts = {
+            family: repair_instructions(self.design, family)
+            for family in ("compile_error", "functional_mismatch", "timeout", "port_mismatch")
+        }
+        self.assertEqual(len(set(texts.values())), len(texts))
+
+    def test_the_timeout_procedure_is_about_liveness(self):
+        text = repair_instructions(self.design, "timeout").lower()
+        for topic in ("combinational loop", "clock edge", "terminating condition"):
+            self.assertIn(topic, text)
+
+    def test_the_functional_procedure_forbids_touching_the_interface(self):
+        text = repair_instructions(self.design, "functional_mismatch")
+        self.assertIn("keep the port list exactly as it is", text.lower())
+
+    def test_interface_families_restate_the_module_name_and_port_list(self):
+        for family in ("missing_module", "port_mismatch"):
+            with self.subTest(family=family):
+                text = repair_instructions(self.design, family)
+                self.assertIn("INTERFACE CONTRACT VIOLATED", text)
+                self.assertIn("Module name: adder_8bit", text)
+                self.assertIn("a[7:0]: 8-bit input operand A.", text)
+                self.assertIn("cout: Carry-out output.", text)
+
+    def test_the_restatement_comes_from_the_description_not_the_reference(self):
+        restated = interface_restatement(self.design)
+        self.assertIn("Input ports:", restated)
+        self.assertIn("Output ports:", restated)
+        # It stops at the blank line before the trailing prose, and never reads the golden RTL.
+        self.assertNotIn("Give me the complete code", restated)
+        self.assertNotIn(GOLDEN_REF_MARKER, restated)
+        self.assertNotIn(GOLDEN_TB_MARKER, restated)
+
+    def test_a_description_without_an_interface_section_still_names_the_module(self):
+        bare = RtllmDesign(
+            name="widget",
+            category="Misc",
+            directory=self.design.directory,
+            description="Build something nice.",
+            testbench=self.design.testbench,
+            reference_files=(),
+        )
+        self.assertIn("Module name: widget", interface_restatement(bare))
+
+    def test_an_unknown_family_yields_no_instructions(self):
+        self.assertEqual(repair_instructions(self.design, None), "")
+        self.assertEqual(repair_instructions(self.design, "not_a_family"), "")
+
+    def test_instructions_reach_the_evidence_text(self):
+        sim = _sim(syntax=False, family="port_mismatch", compile_log="is not a port of adder_8bit")
+        text = build_evidence(sim, RtllmAgentConfig(), design=self.design)
+        self.assertIn("INTERFACE CONTRACT VIOLATED", text)
+        self.assertIn("is not a port of adder_8bit", text)
+        # ... and nothing at all under the blind-retry policy.
+        blind = build_evidence(sim, RtllmAgentConfig(evidence_policy="none"), design=self.design)
+        self.assertNotIn("INTERFACE CONTRACT VIOLATED", blind)
+        self.assertNotIn("port_mismatch", blind)
+
+
+# --------------------------------------------------------------------------- #
+# failure_analyst: which channel fires under which policy
+# --------------------------------------------------------------------------- #
+
+
+class FailureAnalystTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.design = _make_design(self.tmp / "bench")
+        self.spies = EvidenceSpies()
+
+    def tearDown(self):
+        import shutil
+
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _analyse(self, policy, sim, rtl=DESIGN_RTL):
+        config = RtllmAgentConfig(plan=False, evidence_policy=policy)
+        with self.spies.patch():
+            return failure_analyst(self.design, rtl, sim, config, self.tmp / "ev")
+
+    def test_none_returns_the_blind_notice_and_runs_no_sub_run(self):
+        text, sources = self._analyse("none", _sim(sim_log="Failed: sum wrong"))
+        self.assertEqual(sources, ("none",))
+        self.assertIn("blind retry", text)
+        self.assertNotIn("functional_mismatch", text)
+        self.assertNotIn("Failed: sum wrong", text)
+        self.assertEqual(self.spies.trace_calls, [])
+        self.assertEqual(self.spies.diff_calls, [])
+        self.assertEqual(self.spies.diagnosis_calls, [])
+
+    def test_logs_passes_the_tool_output_and_nothing_else(self):
+        text, sources = self._analyse("logs", _sim(sim_log="Failed: sum wrong"))
+        self.assertEqual(sources, ("logs",))
+        self.assertIn("Failed: sum wrong", text)
+        self.assertNotIn(SELF_TRACE_MARKER, text)
+        self.assertNotIn(ORACLE_DIFF_MARKER, text)
+        self.assertEqual(self.spies.trace_calls, [])
+        self.assertEqual(self.spies.diff_calls, [])
+
+    def test_self_adds_a_trace_of_the_candidates_own_signals(self):
+        text, sources = self._analyse("self", _sim(sim_log="Failed: sum wrong"))
+        self.assertEqual(sources, ("logs", "self_trace"))
+        self.assertIn("Failed: sum wrong", text)  # logs are still there
+        self.assertIn(SELF_TRACE_MARKER, text)
+        self.assertIn("your scored file is untouched", text)
+        self.assertNotIn(ORACLE_DIFF_MARKER, text)
+        self.assertEqual(self.spies.trace_calls, [DESIGN_RTL])
+        self.assertEqual(self.spies.diff_calls, [])
+
+    def test_self_skips_the_trace_when_the_candidate_did_not_compile(self):
+        # Nothing to trace: the instrumented copy would fail to compile too.
+        text, sources = self._analyse(
+            "self", _sim(syntax=False, family="compile_error", compile_log="syntax error")
+        )
+        self.assertEqual(sources, ("logs",))
+        self.assertNotIn(SELF_TRACE_MARKER, text)
+        self.assertEqual(self.spies.trace_calls, [])
+
+    def test_oracle_adds_the_behavioural_diff(self):
+        text, sources = self._analyse("oracle", _sim(sim_log="Failed: sum wrong"))
+        self.assertEqual(sources, ("logs", "oracle_diff"))
+        self.assertIn(ORACLE_DIFF_MARKER, text)
+        self.assertIn("ORACLE-DERIVED EVIDENCE", text)
+        self.assertNotIn(SELF_TRACE_MARKER, text)  # one extra channel, not both
+        self.assertEqual(self.spies.diff_calls, ["Failed: sum wrong"])
+        self.assertEqual(self.spies.trace_calls, [])
+
+    def test_oracle_skips_the_diff_when_the_candidate_did_not_compile(self):
+        _text, sources = self._analyse(
+            "oracle", _sim(syntax=False, family="compile_error", compile_log="syntax error")
+        )
+        self.assertEqual(sources, ("logs",))
+        self.assertEqual(self.spies.diff_calls, [])
+
+    def test_a_timeout_is_diagnosed_even_under_the_logs_policy(self):
+        # The bug this closes: a watchdog kill leaves an EMPTY sim log, so `logs` alone hands
+        # the repair agent "(no captured tool output)" and it repairs blind for every round.
+        timeout = _sim(family="timeout", timed_out=True, sim_log="")
+        text, sources = self._analyse("logs", timeout)
+        self.assertEqual(sources, ("logs", "timeout_diagnosis"))
+        self.assertIn(TIMEOUT_DIAG_MARKER, text)
+        self.assertIn("Timeout diagnosis", text)
+        self.assertEqual(self.spies.diagnosis_calls, [DESIGN_RTL])
+
+    def test_a_timeout_is_not_diagnosed_under_none(self):
+        _text, sources = self._analyse("none", _sim(family="timeout", timed_out=True, sim_log=""))
+        self.assertEqual(sources, ("none",))
+        self.assertEqual(self.spies.diagnosis_calls, [])
+
+    def test_a_timeout_under_self_uses_the_bounded_diagnosis_not_the_unbounded_trace(self):
+        _text, sources = self._analyse("self", _sim(family="timeout", timed_out=True, sim_log=""))
+        self.assertEqual(sources, ("logs", "timeout_diagnosis"))
+        self.assertEqual(self.spies.trace_calls, [])
+        self.assertEqual(len(self.spies.diagnosis_calls), 1)
+
+    def test_a_timeout_under_oracle_gets_both_channels(self):
+        _text, sources = self._analyse("oracle", _sim(family="timeout", timed_out=True, sim_log=""))
+        self.assertEqual(sources, ("logs", "timeout_diagnosis", "oracle_diff"))
+
+    def test_a_failing_sub_run_costs_the_evidence_not_the_sweep(self):
+        def explode(*args, **kwargs):
+            raise RuntimeError("iverilog vanished")
+
+        config = RtllmAgentConfig(plan=False, evidence_policy="self")
+        messages: list[str] = []
+        with mock.patch.object(rtllm_agent, "run_self_trace", explode):
+            text, sources = failure_analyst(
+                self.design,
+                DESIGN_RTL,
+                _sim(sim_log="Failed: sum wrong"),
+                config,
+                self.tmp / "ev2",
+                log=messages.append,
+            )
+        self.assertEqual(sources, ("logs",))
+        self.assertIn("Failed: sum wrong", text)
+        self.assertTrue(any("self_trace evidence unavailable" in m for m in messages))
+
+    def test_sub_runs_never_share_a_directory_with_a_scored_attempt(self):
+        seen: list[Path] = []
+
+        def record(design, rtl_text, workdir, **kwargs):
+            seen.append(Path(workdir))
+            return _fake_trace()
+
+        config = RtllmAgentConfig(plan=False, evidence_policy="self")
+        with mock.patch.object(rtllm_agent, "run_self_trace", record):
+            failure_analyst(self.design, DESIGN_RTL, _sim(), config, self.tmp / "round1_evidence")
+        self.assertEqual(len(seen), 1)
+        self.assertNotIn("round1", seen[0].name)
+        self.assertIn("self_trace", seen[0].name)
+
+
+# --------------------------------------------------------------------------- #
+# the loop under each policy: what actually reaches the model
+# --------------------------------------------------------------------------- #
+
+
+class EvidencePolicyLoopTests(unittest.TestCase):
+    """End-to-end through ``run_design``, asserting on the prompts the model received."""
+
+    def _run(self, policy, verifier, *, rounds: int = 1, spies=None):
+        spies = spies or EvidenceSpies()
+        client = FakeLLM([_fenced(DESIGN_RTL)], repeat=True)
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            design = _make_design(tmp / "bench")
+            config = RtllmAgentConfig(plan=False, max_repair_rounds=rounds, evidence_policy=policy)
+            with mock.patch.object(rtllm_agent, "evaluate_rtl", verifier), spies.patch():
+                result = run_design(design, client, config, tmp / "work")
+        return result, client, spies
+
+    def test_the_golden_rtl_and_testbench_source_reach_no_prompt_under_any_strict_policy(self):
+        for policy in ("none", "logs", "self"):
+            with self.subTest(policy=policy):
+                verifier = FakeVerifier([_sim(sim_log="Failed at vector 3")], repeat=True)
+                _result, client, _spies = self._run(policy, verifier, rounds=2)
+                prompts = client.prompts
+                self.assertNotIn(GOLDEN_TB_MARKER, prompts)
+                self.assertNotIn(GOLDEN_REF_MARKER, prompts)
+                self.assertNotIn("verified_adder_8bit", prompts)
+                self.assertNotIn("testbench.v", prompts)
+                # ... and no oracle-derived channel fired.
+                self.assertNotIn(ORACLE_DIFF_MARKER, prompts)
+                self.assertNotIn("ORACLE-DERIVED", prompts)
+
+    def test_oracle_derived_evidence_appears_only_under_the_oracle_policy(self):
+        for policy in EVIDENCE_POLICIES:
+            with self.subTest(policy=policy):
+                verifier = FakeVerifier([_sim(sim_log="Failed at vector 3")], repeat=True)
+                _result, client, _spies = self._run(policy, verifier)
+                present = ORACLE_DIFF_MARKER in client.prompts
+                self.assertEqual(present, policy == "oracle")
+
+    def test_the_self_trace_appears_only_under_the_self_policy(self):
+        for policy in EVIDENCE_POLICIES:
+            with self.subTest(policy=policy):
+                verifier = FakeVerifier([_sim(sim_log="Failed at vector 3")], repeat=True)
+                _result, client, _spies = self._run(policy, verifier)
+                self.assertEqual(SELF_TRACE_MARKER in client.prompts, policy == "self")
+
+    def test_even_under_oracle_the_reference_source_is_never_quoted(self):
+        # The oracle track hands over BEHAVIOUR. The answer key stays on disk.
+        verifier = FakeVerifier([_sim(sim_log="Failed at vector 3")], repeat=True)
+        _result, client, _spies = self._run("oracle", verifier, rounds=2)
+        prompts = client.prompts
+        self.assertIn(ORACLE_DIFF_MARKER, prompts)
+        self.assertNotIn(GOLDEN_REF_MARKER, prompts)
+        self.assertNotIn(GOLDEN_TB_MARKER, prompts)
+        self.assertNotIn("verified_adder_8bit", prompts)
+
+    def test_the_instrumented_copy_is_never_handed_to_the_verifier(self):
+        verifier = FakeVerifier([_sim(sim_log="Failed")], repeat=True)
+        result, client, spies = self._run("self", verifier, rounds=2)
+        self.assertEqual(len(spies.trace_calls), 2)  # the trace really ran, twice
+        for scored_rtl, _workdir in verifier.calls:
+            self.assertNotIn("$strobe", scored_rtl)
+            self.assertNotIn("RTLLM_TRACE", scored_rtl)
+            self.assertNotIn("`timescale", scored_rtl)
+        for record in result.samples[0].rounds:
+            self.assertNotIn("$strobe", record.rtl)
+        self.assertNotIn("$strobe", result.samples[0].final_rtl)
+
+    def test_the_policy_and_the_channels_used_are_recorded_on_every_row(self):
+        verifier = FakeVerifier([_sim(sim_log="Failed")], repeat=True)
+        result, _client, _spies = self._run("oracle", verifier, rounds=1)
+        payload = result.to_dict()
+        self.assertIs(payload["oracle_derived_evidence"], True)
+        sample = payload["samples"][0]
+        self.assertEqual(sample["evidence_policy"], "oracle")
+        self.assertIs(sample["oracle_derived_evidence"], True)
+        self.assertEqual(sample["evidence_sources"], ["logs", "oracle_diff"])
+        # The generation round consumed no evidence; the repair round did.
+        self.assertEqual(sample["rounds"][0]["evidence_sources"], [])
+        self.assertEqual(sample["rounds"][1]["evidence_sources"], ["logs", "oracle_diff"])
+
+    def test_a_strict_run_is_stamped_as_not_oracle_derived(self):
+        verifier = FakeVerifier([_sim(sim_log="Failed")], repeat=True)
+        result, _client, _spies = self._run("self", verifier, rounds=1)
+        payload = result.to_dict()
+        self.assertIs(payload["oracle_derived_evidence"], False)
+        self.assertIs(payload["samples"][0]["oracle_derived_evidence"], False)
+        self.assertEqual(payload["samples"][0]["evidence_sources"], ["logs", "self_trace"])
+
+    def test_a_design_that_passes_first_time_still_carries_its_track(self):
+        verifier = FakeVerifier([_sim(func=True)], repeat=True)
+        result, _client, spies = self._run("oracle", verifier, rounds=2)
+        self.assertIs(result.to_dict()["oracle_derived_evidence"], True)
+        self.assertEqual(spies.diff_calls, [])  # nothing failed, so nothing was diffed
+
+    def test_a_hang_reaches_the_repair_agent_with_a_diagnosis_instead_of_an_empty_log(self):
+        verifier = FakeVerifier([_sim(family="timeout", timed_out=True, sim_log="")], repeat=True)
+        _result, client, spies = self._run("logs", verifier, rounds=1)
+        repair_prompt = client.calls[-1][1]
+        self.assertIn(TIMEOUT_DIAG_MARKER, repair_prompt)
+        self.assertIn("last simulation time reached", repair_prompt)
+        self.assertIn("combinational loop", repair_prompt)  # the timeout repair procedure
+        self.assertEqual(len(spies.diagnosis_calls), 1)
+
+    def test_the_gate_still_refuses_a_self_printing_candidate_under_the_self_policy(self):
+        # Instrumentation must not be an excuse to relax the gate: a candidate shipping its
+        # own $display can print the oracle's pass marker.
+        cheating = (
+            "module adder_8bit(input [7:0] a, input [7:0] b, input cin,\n"
+            "                  output [7:0] sum, output cout);\n"
+            "  assign sum = 8'b0;\n"
+            "  assign cout = 1'b0;\n"
+            "  initial begin\n"
+            '    $display("===========Your Design Passed===========");\n'
+            "    $finish;\n"
+            "  end\n"
+            "endmodule\n"
+        )
+        client = FakeLLM([_fenced(cheating)], repeat=True)
+        spies = EvidenceSpies()
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            design = _make_design(tmp / "bench")
+            config = RtllmAgentConfig(plan=False, max_repair_rounds=1, evidence_policy="self")
+            with spies.patch():  # real verifier, faked sub-runs
+                result = run_design(design, client, config, tmp / "work")
+
+        sample = result.samples[0]
+        self.assertFalse(sample.func_pass)
+        self.assertFalse(sample.func_pass_strict)
+        self.assertEqual(sample.rounds[0].sim.failure_family, "illegal_system_task")
+        # It never compiled, so no trace was attempted ...
+        self.assertEqual(spies.trace_calls, [])
+        # ... and the repair agent is told exactly what to delete.
+        repair_prompt = client.calls[-1][1]
+        self.assertIn("illegal_system_task", repair_prompt)
+        self.assertIn("There is no acceptable use of them in a design", repair_prompt)
 
 
 if __name__ == "__main__":

@@ -32,6 +32,9 @@ python3 -m c2hlsc_agent.cli convert \
   --vitis-ssh USER@VITIS_HOST --keep-going
 ```
 
+Each Rosetta agent-rung row carries the same thing as `xilinx_followup_cmd`, with the app's
+generated `--config` (which supplies `-DSW` and the two include paths) attached.
+
 ---
 
 ## CHStone
@@ -177,18 +180,34 @@ the reference cannot build, no candidate result from that run means anything.
 Six FPGA applications built for Xilinx SDAccel/SDSoC. The Xilinx-only headers sit behind
 `#ifdef OCL` / `#ifdef SDSOC`, so the `src/sw` kernel plus `src/host` builds and runs with
 plain `g++ -DSW`. The harness reads each app's `Makefile` for `HOST_SRC_CPP` and
-`SW_KERNEL_SRC` rather than guessing the source list.
+`SW_KERNEL_SRC` rather than guessing the source list, and for `KERNEL_NAME` — the software
+top is `<KERNEL_NAME>_sw` — rather than guessing the kernel entry point. It resolves for
+all five buildable apps: `rendering_sw`, `DigitRec_sw`, `face_detect_sw`, `optical_flow_sw`,
+`SgdLR_sw`.
 
 ### Commands
 
 ```bash
 git clone https://github.com/cornell-zhang/rosetta.git ~/rosetta
 
+# Calibration rung: build and run each app's own software path against its golden output.
 python3 scripts/run_rosetta.py --benchmark ~/rosetta --sw-baseline \
   --out-dir runs/rosetta_sw --workers 3 --timeout 1800
+
+# Agent rung: convert each src/sw kernel to HLS-C and run host software equivalence.
+python3 scripts/run_rosetta.py --benchmark ~/rosetta --agent \
+  --auto-repair --max-iterations 2 --out-dir runs/rosetta_agent --workers 3 --timeout 1800
+
+# The repo's LLM generator instead of the deterministic converter.
+python3 scripts/run_rosetta.py --benchmark ~/rosetta --agent \
+  --use-llm --llm-backend claude-cli --llm-model opus --auto-repair --max-iterations 2 \
+  --out-dir runs/rosetta_llm --workers 3 --timeout 2400
 ```
 
-### The oracle, and where it runs out
+`--use-llm` and `--auto-repair` imply `--agent`, so an agent-only flag can never be
+silently ignored by the software-baseline default.
+
+### The software baseline's oracle, and where it runs out
 
 Three apps ship `outputs_golden.txt`, and their host code writes `outputs.txt`, so a run
 can be compared against a golden result. **The other apps ship no golden output at all**,
@@ -201,7 +220,7 @@ This matters because it was nearly a silent failure. `digit-recognition` prints
 that green. The accuracy actually goes to `outputs.txt` via `check_results()`, and reading
 it is the difference between a real oracle and a vacuous one.
 
-### Measured
+### Measured — software baseline (calibration)
 
 | app | built | ran | oracle | verdict |
 | --- | :-: | :-: | --- | :-: |
@@ -231,7 +250,188 @@ One environment fix was required and is worth stating plainly: three apps
 they rely on transitive `#include`s that newer libstdc++ no longer provides. The harness
 force-includes `cstdio`, `iostream`, `cstring` and `cstdlib`. That adds no symbol the
 sources do not already use, and without it those three read as build failures that have
-nothing to do with the code under test.
+nothing to do with the code under test. The agent rung passes the same four force-includes,
+plus `-DSW -I src/sw -I src/host`, through `--config` so the conversion compiles the kernel
+the same way the suite does — `-DSW` is what selects the plain-C++ typedefs over the
+`ap_int`/`ap_fixed` ones, and the two `-I` paths let the copied `input.c` resolve its own
+quoted includes (`"sgd_sw.h"` and, through it, `"../host/typedefs.h"`) from inside the
+generated project. No Rosetta source is copied, staged or rewritten.
+
+### Measured — agent rung (`src/sw` kernel → HLS-C → host equivalence)
+
+The same ladder rung as CHStone: convert the kernel and compare the generated HLS-C against
+the original on shared stimulus. **No `vitis_hls` and no Xilinx SDx**, so synthesis,
+SDAccel and SDSoC were *not attempted*; every row carries `xilinx_available: false` and a
+`rungs_not_attempted` list, exactly like the software-baseline rows.
+
+| rung | result |
+| --- | --- |
+| software baseline (calibration) | 5/5 build and run; **1/3** among apps with a golden output |
+| deterministic converter, **with repair** | **0/5** |
+| LLM generator, **with repair** | **0/5** |
+| HLS synthesis / SDAccel / SDSoC | not attempted (no Xilinx tooling) |
+
+**Quote the agent rung as 0/5.** Not 0/6 — `BNN` is a vendored copy of another repo with
+its own build and is not attempted. Unlike the software baseline there is no
+"no trustworthy oracle" exclusion here: the original `src/sw` kernel *is* the oracle for
+every app, so the denominator is all five buildable apps.
+
+Nothing reached host equivalence on either path, and none of it is a judgement about the
+Rosetta code. Every app stops inside this repo's own conversion flow, at one of four walls
+the compiler names outright.
+
+#### Where the deterministic path stops
+
+| wall | apps | whose defect |
+| --- | :-: | --- |
+| `top_signature_misparsed` | 4 | the analyzer |
+| `multidim_array_arg_unsupported` | 1 (3 by shape) | the testbench generator |
+| `struct_arg_stimulus_unsupported` | 2 | the testbench generator |
+| `generated_header_missing_app_types` | 1 | the generated project |
+
+**The analyzer captures a comment as the return type.** `analyze._extract_function` runs
+its extraction regex over the *raw* source, so a `//` comment on the line above the
+definition is swallowed into the captured return type. Four of the five Rosetta tops have
+exactly such a comment:
+
+| app | comment above the top | emitted declaration |
+| --- | --- | --- |
+| `spam-filter` | `// top-level function` | `level function void SgdLR_sw(...)` |
+| `face-detection` | `// top-level function` | `level function void face_detect_sw(...)` |
+| `optical-flow` | `// top-level sw function` | `level sw function void optical_flow_sw(...)` |
+| `digit-recognition` | `// sw top function` | `sw top function void DigitRec_sw(...)` |
+
+g++ then rejects the generated header and everything that includes it:
+
+```
+src/hls_top.hpp:6:1: error: 'level' does not name a type
+tb/testbench.cpp:116:5: error: 'level' was not declared in this scope
+  116 |     level function void ref_ret = SgdLR_sw_ref(ref_data, ref_label, ref_theta);
+```
+
+`3d-rendering` is the only app that escapes it, and only by luck: its top is preceded by a
+`/* ... */` banner, and the regex's character class cannot cross the `*` and `/`. CHStone
+never surfaced this because every CHStone top is K&R `int\nmain ()` with no comment line
+between. The harness detects it by re-running the *identical* regex on comment-stripped
+source and comparing — the converter itself is untouched.
+
+**The testbench generator cannot express a 2-D array parameter.** It declares one flat 1-D
+array per pointer-like argument, so a `[H][W]` parameter never type-checks:
+
+```
+tb/testbench.cpp:109:40: error: cannot convert 'bit8*' {aka 'unsigned char*'}
+                                to 'bit8 (*)[256]' {aka 'unsigned char (*)[256]'}
+```
+
+Measured on `3d-rendering`. `face-detection` (`Data[IMAGE_HEIGHT][IMAGE_WIDTH]`) and
+`optical-flow` (six `[MAX_HEIGHT][MAX_WIDTH]` parameters) have the same shape but abort on
+the misparse first, so the compiler never gets to say it. Read the counts in the report as a
+floor for that reason.
+
+**Struct-typed arrays have no stimulus.** `patterned_value<T>` starts with
+`static_cast<T>(0)`, which no struct accepts:
+
+```
+tb/testbench.cpp:53:29: error: no matching function for call to 'Triangle_3D::Triangle_3D(int)'
+tb/testbench.cpp:56:29: error: no matching function for call to 'velocity_t::velocity_t(int)'
+```
+
+**The generated header declares the top in types it never includes.** `src/hls_top.hpp`
+carries only `#include <stdint.h>`, so the app's own typedefs are undeclared:
+
+```
+src/hls_top.hpp:6:6:  error: variable or field 'rendering_sw' declared void
+src/hls_top.hpp:6:19: error: 'Triangle_3D' was not declared in this scope
+src/hls_top.hpp:6:57: error: 'bit8' was not declared in this scope
+```
+
+This is the same family as CHStone's "generated HLS-C references undeclared symbols". It is
+also the one wall the LLM path repeatedly tries to patch around, with partial success (see
+below).
+
+`hlsc_repair_agent` has no mechanical repair for any of the four: all five apps record a
+single `no_change` iteration. Its repertoire is missing standard includes, `restrict`
+compatibility, helper-source inclusion and interface-pragma stripping — none of which is
+the defect here. (It is classified as `testbench_or_c_semantics` on three apps and, because
+of the false-positive VLA diagnostic below, as `static_source_rejected` on
+`digit-recognition` and `face-detection`; the outcome is the same either way.)
+
+#### What the LLM path adds, and why it cannot close the gap
+
+The LLM generator (`--llm-backend claude-cli --llm-model opus`, `--auto-repair
+--max-iterations 2`) is also **0/5**, at the same four walls, 24 minutes for the sweep at
+three workers — 7–13 minutes per app. It is worth reading anyway, because the failure is
+not the model's.
+
+It produced substantial, self-contained translations for all five apps — 276 to 816 lines,
+helpers given internal linkage to sidestep the golden-vs-candidate link collision that cost
+CHStone five benchmarks, arithmetic order preserved for bit-exactness — and on three apps it
+*diagnosed the harness's own defects from the artifact and worked around them*. On
+`spam-filter` the first attempt opened with:
+
+```c
+// The generated hls_top.hpp declares the top function with a stray
+// "level function" prefix carried over from the signature metadata ...
+#define level
+#define function
+#include "hls_top.hpp"
+#undef function
+#undef level
+```
+
+Nothing in the prompt mentions the misparse. The workaround is correct, and it exposes the
+next wall — `hls_top.hpp` reduces to a clean `void SgdLR_sw(DataType ..., LabelType ...,
+FeatureType ...)` whose types it still never includes:
+
+```
+src/hls_top.hpp:6:30: error: 'DataType' was not declared in this scope
+```
+
+The repair iteration then fixed *that* — by including `"sgd_sw.h"` ahead of `hls_top.hpp`,
+guarded with `__has_include` — and in doing so dropped the macro workaround, so the run
+landed back on the misparse. `3d-rendering` and `optical-flow` show the same shape: the
+model restates the app's typedefs itself but places them after `#include "hls_top.hpp"`, so
+the header still fails first. The repair loop rewrites one file against one failure at a
+time, and these apps need two unrelated fixes to hold simultaneously.
+
+None of that would have been enough regardless. `tb/testbench.cpp` carries the same
+`level function void` text and the same flat-1-D-array and `static_cast<T>(0)` code, and the
+repair loop is deliberately forbidden to touch it — only `src/hls_top.cpp` is ever
+rewritten, so the golden oracle and the testbench stay outside the model's reach. That is
+the right design; it is also why no model can rescue a defect that lives in the generated
+testbench. On `3d-rendering` — the one app that escapes the misparse entirely — two of the
+three remaining walls are in `tb/testbench.cpp`, so even a perfect `src/hls_top.cpp` could
+not have compiled.
+
+#### The oracle here is weaker than "host equivalence" sounds
+
+Worth stating before anyone reads a future Rosetta pass as a strong result. Every Rosetta
+top takes arrays whose bounds are *named constants* (`NUM_FEATURES * NUM_TRAINING`,
+`MAX_HEIGHT`, `NUM_3D_TRI`), and the analyzer takes a test length only from a literal digit
+dimension. So **all 20 array arguments across the five apps fall back to the default test
+length 16**, and the analyzer says so, once per argument:
+
+```
+[warning] missing-pointer-bound: argument 'data' has no configured bound; using conservative test length 16
+```
+
+The kernels then index far past that — `SgdLR_sw` walks `data[i * 1024 + j]` for 4500
+samples, 4.6 M elements against a 16-element buffer. Even with all four walls fixed, a pass
+from this testbench would be reading out of bounds and would not be evidence of anything.
+Configuring the real bounds is not a drop-in fix either: `optical-flow`'s six 436×1024
+frames are ~18 MB per copy, and the testbench declares two copies of every argument as
+locals. Sound Rosetta equivalence needs the testbench generator to size arrays from the
+declared bounds and heap-allocate them, which is a change to the repo, not to the harness.
+
+#### `--strict-diagnostics`, and a false positive worth fixing
+
+Running with `--strict-diagnostics` instead of the default `--keep-going` stops
+`digit-recognition` and `face-detection` one rung earlier, at `analyzed` /
+`static_source_rejected`. The diagnostic that triggers it is wrong: the analyzer's
+variable-length-array check accepts only literal digit bounds, so `int dists[K_CONST]`
+(a `#define 3`) and `unsigned char Data[IMAGE_HEIGHT][...]` (a `const int 240`) are reported
+as variable-length arrays. Both are compile-time constants. Three errors across the suite,
+all false.
 
 ---
 
@@ -241,13 +441,30 @@ nothing to do with the code under test.
 calibration rung. The repo's deterministic converter cannot take a whole-program,
 globals-closing top through to compiling HLS-C, and the reason is identical across all 12.
 The LLM generator can: it produced self-contained, documented translations that pass host
-equivalence on 2 of the 4 benchmarks tried, with the other 2 blocked by a fixable
-golden-vs-candidate symbol collision rather than by wrong logic.
+equivalence on 6 of the 12 benchmarks — 6 of the 7 where the flow itself works — with the
+rest blocked by a fixable golden-vs-candidate symbol collision or by C that `g++` rejects,
+rather than by wrong logic.
 Rosetta's software path builds and runs for all 5 buildable apps, and one of the three
 judgeable apps reproduces its golden output exactly.
+
+On Rosetta's **agent** rung the result is 0/5 on both paths, and it is a measurement of this
+repo rather than of Rosetta: four of the five apps die on a comment absorbed into the parsed
+return type, and the multi-dimensional-array parameters, struct-typed arrays and app
+typedefs that the rest need are things the generated testbench and header cannot currently
+express. Those are four named, individually fixable defects with the compiler's own words
+attached — the same kind of finding as CHStone's symbol collision, and arguably more
+actionable, since Rosetta's kernels have real arguments and are the fairer target the
+CHStone write-up asks for.
 
 **Does not show.** Nothing about synthesizability, timing, area, or C/RTL equivalence for
 either suite — the Vitis and Xilinx rungs did not run. Nor does it show that the converter
 would fail on these programs' *inner* kernels (`adpcm_main`, `sha_stream`, and so on);
 this run targeted the suite-declared `chstone_main` top, and the inner kernels have real
 arguments and are a fairer target for the converter. That is the obvious next experiment.
+
+Nor does Rosetta's 0/5 show that the generator produces *wrong* HLS-C. Every app stopped at
+compile time, so no Rosetta kernel's generated translation was ever executed against its
+original — and even if one had been, the 16-element default stimulus above means the
+comparison would not have been sound. Whether this repo can translate a Rosetta kernel
+correctly is still an open question; this run only establishes what has to be fixed before
+it can be asked.

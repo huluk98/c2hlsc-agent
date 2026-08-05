@@ -1116,5 +1116,105 @@ class InterruptTests(DriverTestCase):
         self.assertIs(signal.getsignal(signal.SIGINT), before)
 
 
+class OracleDerivedStampTests(DriverTestCase):
+    """The upper-bound track has to be impossible to mistake for the strict one."""
+
+    def _report(self, policy: str):
+        config = rtllm_agent.RtllmAgentConfig(evidence_policy=policy)
+        rows = [
+            make_design_result("aaa_adder", "Arithmetic/Adder", [True]).to_dict(),
+            make_design_result("bbb_counter", "Control/Counter", [False]).to_dict(),
+        ]
+        for row in rows:
+            row["oracle_derived_evidence"] = config.oracle_derived_evidence
+        return driver.build_report(
+            rows,
+            mode="llm",
+            k=1,
+            selected=["aaa_adder", "bbb_counter"],
+            agent_config=config.to_dict(),
+        )
+
+    def test_the_driver_accepts_every_policy_the_agent_declares(self):
+        parser = driver.build_parser()
+        action = next(a for a in parser._actions if "--evidence-policy" in (a.option_strings or ()))
+        self.assertEqual(tuple(action.choices), rtllm_agent.EVIDENCE_POLICIES)
+
+    def test_report_json_is_stamped_under_oracle_and_only_under_oracle(self):
+        for policy in rtllm_agent.EVIDENCE_POLICIES:
+            with self.subTest(policy=policy):
+                report = self._report(policy)
+                self.assertEqual(report["oracle_derived_evidence"], policy == "oracle")
+                self.assertIn("oracle_derived_evidence_note", report)
+
+    def test_markdown_says_it_in_words_not_only_in_the_table(self):
+        text = driver.render_markdown(self._report("oracle"))
+        self.assertIn("| oracle_derived_evidence | `True` |", text)
+        self.assertIn("UPPER-BOUND track", text)
+        self.assertIn("not comparable to the strict self-derived", text)
+        self.assertIn("not comparable to published RTLLM results", text)
+
+    def test_markdown_of_a_strict_run_asserts_the_opposite(self):
+        text = driver.render_markdown(self._report("self"))
+        self.assertIn("| oracle_derived_evidence | `False` |", text)
+        self.assertNotIn("UPPER-BOUND track", text)
+        self.assertIn("No oracle-derived evidence", text)
+
+    def test_a_single_oracle_row_taints_a_report_whose_config_looks_strict(self):
+        # Resume and merge paths must not be able to launder an upper-bound row into a
+        # strict report by relabelling the run's configuration.
+        rows = [make_design_result("aaa_adder", "Arithmetic/Adder", [True]).to_dict()]
+        rows[0]["oracle_derived_evidence"] = True
+        report = driver.build_report(
+            rows,
+            mode="llm",
+            k=1,
+            selected=["aaa_adder"],
+            agent_config=rtllm_agent.RtllmAgentConfig(evidence_policy="logs").to_dict(),
+        )
+        self.assertTrue(report["oracle_derived_evidence"])
+        self.assertIn("UPPER-BOUND track", driver.render_markdown(report))
+
+    def test_the_driver_warns_on_stderr_before_running_anything(self):
+        with self.patch_discovery():
+            code, output = run_main(
+                [
+                    "--benchmark", str(self.bench),
+                    "--out-dir", str(self.out),
+                    "--evidence-policy", "oracle",
+                    "--reference",
+                ]
+            )
+        self.assertEqual(code, 0)
+        self.assertIn("WARNING", output)
+        self.assertIn("UPPER-BOUND track", output)
+        self.assertIn("oracle_derived_evidence=true", output)
+
+    def test_no_warning_for_the_strict_policies(self):
+        for policy in ("none", "logs", "self"):
+            with self.subTest(policy=policy), self.patch_discovery():
+                out_dir = self.out / policy
+                code, output = run_main(
+                    [
+                        "--benchmark", str(self.bench),
+                        "--out-dir", str(out_dir),
+                        "--evidence-policy", policy,
+                        "--reference",
+                    ]
+                )
+                self.assertEqual(code, 0)
+                self.assertNotIn("UPPER-BOUND track", output)
+
+    def test_the_external_configuration_block_drops_the_track_flag(self):
+        # Nothing was regenerated, so no evidence of any kind was shown; advertising a
+        # policy there would describe a repair loop that never ran.
+        report = self._report("logs")
+        report["mode"] = "external"
+        report["external"] = {"label": "gpt-4", "trials": [], "gate_impact": {}}
+        text = driver.render_markdown(report)
+        self.assertNotIn("| oracle_derived_evidence |", text)
+        self.assertNotIn("| evidence_policy |", text)
+
+
 if __name__ == "__main__":
     unittest.main()

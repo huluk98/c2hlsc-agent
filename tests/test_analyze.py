@@ -5,7 +5,9 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from c2hlsc_agent.analyze import analyze_source
+from textwrap import dedent
+
+from c2hlsc_agent.analyze import analyze_source, blank_comments
 from c2hlsc_agent.config import AgentConfig, ArgumentConfig
 
 
@@ -125,6 +127,96 @@ class AnalyzeTests(unittest.TestCase):
         codes = {diag.code for diag in result.unsupported_constructs}
         self.assertIn("pointer-arithmetic", codes)
         self.assertIn("unsupported-stdlib-call", codes)
+
+
+class CommentBlankingTests(unittest.TestCase):
+    """A comment above the top function must not leak into its return type.
+
+    Measured on Rosetta: ``// top-level function`` above ``void SgdLR_sw(...)`` was
+    absorbed by the signature regex, giving ``return_type='level function void'``,
+    which then emitted an ``hls_top.hpp`` that could not compile
+    (``error: 'level' does not name a type``). Four of five Rosetta applications
+    stopped there before the model's output was ever reached.
+    """
+
+    def _write(self, text: str) -> Path:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = Path(tmp.name) / "input.c"
+        path.write_text(dedent(text), encoding="utf-8")
+        return path
+
+    def _return_type(self, text: str, top: str = "kernel") -> str:
+        return analyze_source(self._write(text), top, AgentConfig(top=top)).function.return_type
+
+    def test_line_comment_above_definition_is_not_part_of_the_return_type(self):
+        self.assertEqual(
+            self._return_type(
+                """
+                // top-level function
+                void kernel(int a[4], int b[4]) { for (int i=0;i<4;++i) b[i]=a[i]; }
+                """
+            ),
+            "void",
+        )
+
+    def test_block_comment_above_definition_is_not_part_of_the_return_type(self):
+        self.assertEqual(
+            self._return_type(
+                """
+                /* top-level
+                   function */
+                int kernel(int a) { return a; }
+                """
+            ),
+            "int",
+        )
+
+    def test_comment_between_return_type_and_name_is_dropped(self):
+        self.assertEqual(self._return_type("unsigned /* wide */ kernel(int a) { return a; }"), "unsigned")
+
+    def test_body_and_definition_keep_their_comments(self):
+        result = analyze_source(
+            self._write(
+                """
+                // header note
+                int kernel(int a) {
+                  // inner note
+                  return a;
+                }
+                """
+            ),
+            "kernel",
+            AgentConfig(top="kernel"),
+        )
+        self.assertIn("inner note", result.function.body)
+        self.assertIn("inner note", result.function.definition)
+
+    def test_blanking_preserves_offsets_and_line_count(self):
+        source = "int a; // note\n/* two\n   lines */\nint b;\n"
+        blanked = blank_comments(source)
+        self.assertEqual(len(blanked), len(source))
+        self.assertEqual(blanked.count("\n"), source.count("\n"))
+        self.assertNotIn("note", blanked)
+        self.assertIn("int a;", blanked)
+
+    def test_comment_markers_inside_string_literals_survive(self):
+        self.assertIn('"http://x"', blank_comments('const char *u = "http://x"; // gone'))
+
+    def test_brace_inside_a_comment_does_not_end_the_body(self):
+        result = analyze_source(
+            self._write(
+                """
+                int kernel(int a) {
+                  // stray } brace in a comment
+                  return a;
+                }
+                """
+            ),
+            "kernel",
+            AgentConfig(top="kernel"),
+        )
+        self.assertIn("return a;", result.function.body)
 
 
 if __name__ == "__main__":

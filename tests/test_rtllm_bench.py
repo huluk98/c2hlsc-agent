@@ -9,27 +9,44 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from c2hlsc_agent.rtllm_bench import (
+    DIAG_MARKER,
     FAILURE_FAMILIES,
     ILLEGAL_TASK_MARKER,
     IVERILOG_STANDARD,
     KNOWN_ORACLE_ISSUES,
     LOG_TAIL_CHARS,
+    MAX_TRACE_SIGNALS,
     TESTBENCH_SHIMS,
+    TRACE_MARKER,
     VACUOUS_ORACLE_DESIGNS,
     RtllmDesign,
     SimResult,
+    TraceSample,
     apply_testbench_shims,
+    bounded_stop_time,
+    candidate_trace_signals,
     classify_failure,
     classify_output,
+    diagnose_timeout,
     discover_designs,
     empty_stub_rtl,
     evaluate_empty_stub,
     evaluate_reference,
     evaluate_rtl,
+    filter_trace_lines,
     find_illegal_system_tasks,
+    instrument_rtl,
+    oracle_behaviour_diff,
+    parse_trace,
     reference_rtl_text,
+    run_self_trace,
     shim_rationale,
+    trace_digest,
 )
+from c2hlsc_agent.rtllm_bench import TimeoutDiagnosis
+# Aliased: pytest collects any module-level name starting with "test" as a test function.
+from c2hlsc_agent.rtllm_bench import testbench_timescale as read_testbench_timescale
+from c2hlsc_agent.rtllm_bench import _BoundedCapture, _stuck_and_oscillating
 
 HAS_IVERILOG = shutil.which("iverilog") is not None and shutil.which("vvp") is not None
 
@@ -937,6 +954,590 @@ class EvaluateRtlTests(unittest.TestCase):
         with ThreadPoolExecutor(max_workers=4) as pool:
             results = list(pool.map(lambda job: evaluate_rtl(design, job[0], job[1]), jobs))
         self.assertTrue(all(result.func_pass_strict for result in results))
+
+
+# --------------------------------------------------------------------------- #
+# self-instrumentation: signal discovery and the instrumented copy
+# --------------------------------------------------------------------------- #
+
+
+class CandidateTraceSignalTests(unittest.TestCase):
+    """What the instrumentation decides to print, derived from the candidate ALONE."""
+
+    def test_ansi_header_ports_then_body_registers(self):
+        rtl = (
+            "module dut(input clk, input [7:0] a, output reg [7:0] q);\n"
+            "    reg [3:0] count;\n"
+            "    integer ticks;\n"
+            "    always @(posedge clk) q <= a;\n"
+            "endmodule\n"
+        )
+        self.assertEqual(
+            candidate_trace_signals(rtl, "dut"), ("clk", "a", "q", "count", "ticks")
+        )
+
+    def test_non_ansi_header_takes_directions_from_the_body(self):
+        rtl = (
+            "module dut(clk, a, q);\n"
+            "    input clk;\n"
+            "    input [7:0] a;\n"
+            "    output [7:0] q;\n"
+            "    reg [7:0] q;\n"
+            "endmodule\n"
+        )
+        self.assertEqual(candidate_trace_signals(rtl, "dut"), ("clk", "a", "q"))
+
+    def test_multiple_names_in_one_declaration(self):
+        rtl = "module dut(input a);\n    reg [1:0] x, y, z;\nendmodule\n"
+        self.assertEqual(candidate_trace_signals(rtl, "dut"), ("a", "x", "y", "z"))
+
+    def test_memory_arrays_are_never_traced(self):
+        # `$strobe(..., mem)` on an unpacked array does not elaborate, and one bad argument
+        # kills the whole instrumented copy -- so the memory is dropped, not the trace.
+        rtl = (
+            "module dut(input clk, output reg [7:0] q);\n"
+            "    reg [7:0] mem [0:255];\n"
+            "    reg [7:0] shadow;\n"
+            "endmodule\n"
+        )
+        signals = candidate_trace_signals(rtl, "dut")
+        self.assertNotIn("mem", signals)
+        self.assertEqual(signals, ("clk", "q", "shadow"))
+
+    def test_a_parameter_block_is_stepped_over_to_reach_the_ports(self):
+        rtl = (
+            "module dut #(parameter WIDTH = 8) (input clk, output [WIDTH-1:0] q);\n"
+            "endmodule\n"
+        )
+        self.assertEqual(candidate_trace_signals(rtl, "dut"), ("clk", "q"))
+
+    def test_the_signal_list_is_capped(self):
+        ports = ", ".join("input p%d" % index for index in range(MAX_TRACE_SIGNALS + 10))
+        rtl = "module dut(%s);\nendmodule\n" % ports
+        signals = candidate_trace_signals(rtl, "dut")
+        self.assertEqual(len(signals), MAX_TRACE_SIGNALS)
+        self.assertEqual(signals[0], "p0")  # ports first, in declaration order
+
+    def test_a_missing_module_yields_no_signals(self):
+        self.assertEqual(candidate_trace_signals("// just a comment\n", "dut"), ())
+
+
+class InstrumentRtlTests(unittest.TestCase):
+    RTL = (
+        "module dut(input clk, input [7:0] a, output reg [7:0] q);\n"
+        "    always @(posedge clk) q <= a;\n"
+        "endmodule\n"
+    )
+
+    def test_the_original_text_is_preserved_inside_the_copy(self):
+        instrumented = instrument_rtl(self.RTL, "dut")
+        self.assertIn("always @(posedge clk) q <= a;", instrumented)
+        self.assertIn(TRACE_MARKER, instrumented)
+        self.assertIn("$strobe", instrumented)
+        # and the input string is untouched -- the scored candidate is a separate object
+        self.assertNotIn(TRACE_MARKER, self.RTL)
+
+    def test_the_probe_is_strobe_not_monitor(self):
+        # $monitor is a simulator-wide singleton and 8 of the 50 RTLLM testbenches install
+        # one; a $monitor here would silently lose the race on those designs.
+        instrumented = instrument_rtl(self.RTL, "dut")
+        self.assertNotIn("$monitor", instrumented)
+
+    def test_every_traced_signal_appears_in_the_probe(self):
+        instrumented = instrument_rtl(self.RTL, "dut")
+        for signal in ("clk", "a", "q"):
+            self.assertIn("%s=%%b" % signal, instrumented)
+
+    def test_no_timescale_directive_is_emitted_unless_one_is_asked_for(self):
+        # A testbench that declares none must keep the compiler default, and so must the
+        # copy: a directive here would fire the injected bound 250000x too early.
+        instrumented = instrument_rtl(self.RTL, "dut")
+        self.assertNotIn("`timescale", instrumented)
+        self.assertNotIn("`resetall", instrumented)
+
+    def test_a_supplied_timescale_wraps_the_copy_and_is_undone_after_it(self):
+        # It must precede the module to apply to it, and must not survive into the testbench,
+        # which iverilog compiles next.
+        instrumented = instrument_rtl(self.RTL, "dut", timescale="`timescale 1ns/1ps")
+        self.assertTrue(instrumented.startswith("`timescale 1ns/1ps"))
+        self.assertTrue(instrumented.rstrip().endswith("`resetall"))
+        self.assertLess(instrumented.index("`timescale"), instrumented.index("module dut"))
+        self.assertLess(instrumented.index("endmodule"), instrumented.index("`resetall"))
+
+    def test_a_time_limit_injects_a_bounded_stop(self):
+        instrumented = instrument_rtl(self.RTL, "dut", time_limit=1234)
+        self.assertIn("#1234;", instrumented)
+        self.assertIn(DIAG_MARKER, instrumented)
+        self.assertIn("$finish", instrumented)
+
+    def test_no_bounded_stop_without_a_time_limit(self):
+        self.assertNotIn("$finish", instrument_rtl(self.RTL, "dut"))
+
+    def test_a_candidate_with_no_traceable_signals_still_instruments(self):
+        instrumented = instrument_rtl("module dut;\nendmodule\n", "dut")
+        self.assertIn(TRACE_MARKER, instrumented)
+        self.assertIn("$strobe", instrumented)
+        self.assertNotIn("always @()", instrumented)  # an empty sensitivity list is illegal
+
+    def test_a_missing_module_yields_no_copy(self):
+        self.assertEqual(instrument_rtl("not verilog at all", "dut"), "")
+
+    def test_the_instrumented_copy_is_exactly_what_the_gate_refuses(self):
+        # The load-bearing invariant of the whole self track: this text may NEVER be scored,
+        # and the gate is what would catch it if a future refactor tried.
+        violations = find_illegal_system_tasks(instrument_rtl(self.RTL, "dut", time_limit=10))
+        tokens = {token.lower() for _line, token in violations}
+        self.assertIn("$strobe", tokens)
+        self.assertIn("$finish", tokens)
+        # ... while the candidate it was built from is admissible.
+        self.assertEqual(find_illegal_system_tasks(self.RTL), ())
+
+
+class TraceTextTests(unittest.TestCase):
+    """Filtering, digesting and parsing, all pure functions over trace text."""
+
+    def test_only_the_instrumentations_own_lines_survive(self):
+        # This filter IS the boundary of the strict track: the testbench knows the expected
+        # answers and prints them, so nothing it printed may reach the repair agent here.
+        raw = (
+            "Failed at a= 0 b= 3 sum=29 expected=3\n"
+            "%s time=0 a=0000 q=xxxx\n"
+            "===========Your Design Passed===========\n"
+            "%s time=5 a=0001 q=0000\n"
+            "%s bounded_stop t=100\n"
+        ) % (TRACE_MARKER, TRACE_MARKER, DIAG_MARKER)
+        filtered = filter_trace_lines(raw)
+        self.assertNotIn("Failed at", filtered)
+        self.assertNotIn("expected=3", filtered)
+        self.assertNotIn("Passed", filtered)
+        self.assertEqual(len(filtered.splitlines()), 3)
+
+    def test_consecutive_duplicate_snapshots_collapse(self):
+        line = "%s time=5 a=0001 q=0000" % TRACE_MARKER
+        raw = "\n".join([line, line, line, "%s time=6 a=0010 q=0001" % TRACE_MARKER, line])
+        self.assertEqual(len(filter_trace_lines(raw).splitlines()), 3)
+
+    def test_digest_keeps_the_head_and_samples_the_tail(self):
+        lines = ["%s time=%d v=%d" % (TRACE_MARKER, index, index) for index in range(500)]
+        digest = trace_digest("\n".join(lines), head=5, tail=4, limit=10_000)
+        self.assertIn("time=0 ", digest)
+        self.assertIn("time=4 ", digest)
+        self.assertIn("transitions omitted", digest)
+        self.assertIn("time=499 ", digest)  # the last transition is always kept
+        self.assertLess(len(digest.splitlines()), 20)
+
+    def test_a_short_trace_is_returned_whole(self):
+        lines = ["%s time=%d v=%d" % (TRACE_MARKER, index, index) for index in range(4)]
+        self.assertEqual(trace_digest("\n".join(lines), head=5, tail=4), "\n".join(lines))
+
+    def test_digest_respects_the_character_limit(self):
+        lines = ["%s time=%d %s" % (TRACE_MARKER, index, "x" * 200) for index in range(500)]
+        self.assertLessEqual(len(trace_digest("\n".join(lines), limit=1000)), 1000)
+
+    def test_empty_trace_digests_to_nothing(self):
+        self.assertEqual(trace_digest(""), "")
+
+    def test_parse_trace_reads_time_and_values(self):
+        raw = "%s time=15 a=0001 q=1010\n%s time=20 a=0010 q=0001" % (TRACE_MARKER, TRACE_MARKER)
+        samples = parse_trace(raw)
+        self.assertEqual([s.time for s in samples], [15, 20])
+        self.assertEqual(samples[0].values, {"a": "0001", "q": "1010"})
+
+    def test_parse_trace_ignores_anything_untagged(self):
+        self.assertEqual(parse_trace("Failed at a=1 b=2\nsomething else"), ())
+
+    def test_the_bounded_stop_time_is_an_independent_witness_that_time_moved(self):
+        # One snapshot at t=0 plus a stop at t=20000 means "time advanced but nothing in the
+        # design ever changed", which is a different fault from "time never advanced".
+        trace = "%s time=0 clk=0\n%s bounded_stop time=20000" % (TRACE_MARKER, DIAG_MARKER)
+        self.assertEqual(bounded_stop_time(trace), 20000)
+        self.assertEqual(len(parse_trace(trace)), 1)
+
+    def test_no_bounded_stop_line_means_no_witness(self):
+        self.assertIsNone(bounded_stop_time("%s time=5 a=1" % TRACE_MARKER))
+        self.assertIsNone(bounded_stop_time(""))
+
+
+class TestbenchTimescaleTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.root = _make_benchmark(self.tmp / "bench")
+        self.designs = {d.name: d for d in discover_designs(self.root)}
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _with_testbench(self, text):
+        design = self.designs["tiny_adder"]
+        design.testbench.write_text(text, encoding="utf-8")
+        return design
+
+    def test_a_declared_timescale_is_copied(self):
+        design = self._with_testbench("`timescale 1ns / 1ps\nmodule testbench;\nendmodule\n")
+        self.assertEqual(read_testbench_timescale(design), "`timescale 1ns/1ps")
+
+    def test_a_testbench_without_one_yields_none(self):
+        design = self._with_testbench("module testbench;\nendmodule\n")
+        self.assertIsNone(read_testbench_timescale(design))
+
+    def test_only_the_two_time_literals_can_escape(self):
+        # The justification for reading the testbench at all: nothing else comes out.
+        design = self._with_testbench(
+            "`timescale 10ps/1ps\n"
+            "module testbench;\n"
+            "  // EXPECTED_ANSWER_MARKER sum should be 8'h06\n"
+            "endmodule\n"
+        )
+        directive = read_testbench_timescale(design)
+        self.assertEqual(directive, "`timescale 10ps/1ps")
+        self.assertNotIn("EXPECTED_ANSWER_MARKER", directive)
+        self.assertNotIn("8'h06", directive)
+
+    def test_stuck_is_constant_over_the_second_half_not_the_whole_run(self):
+        # The interesting hang: `done` leaves X at the first clock edge, settles to 0, and
+        # never rises. Requiring zero changes overall would call that signal healthy.
+        samples = [
+            TraceSample(0, {"clk": "0", "done": "x"}),
+            TraceSample(1, {"clk": "1", "done": "0"}),
+            TraceSample(2, {"clk": "0", "done": "0"}),
+            TraceSample(3, {"clk": "1", "done": "0"}),
+            TraceSample(4, {"clk": "0", "done": "0"}),
+            TraceSample(5, {"clk": "1", "done": "0"}),
+            TraceSample(6, {"clk": "0", "done": "0"}),
+            TraceSample(7, {"clk": "1", "done": "0"}),
+        ]
+        stuck, oscillating = _stuck_and_oscillating(samples)
+        self.assertEqual(stuck, ("done",))
+        self.assertEqual(oscillating, ("clk",))
+
+    def test_a_single_sample_classifies_nothing(self):
+        self.assertEqual(_stuck_and_oscillating([TraceSample(0, {"a": "1"})]), ((), ()))
+
+
+class BoundedCaptureHeadTests(unittest.TestCase):
+    def test_without_a_head_budget_only_the_tail_survives(self):
+        sink = _BoundedCapture(tail=10, limit=10_000)
+        sink.feed(b"A" * 50 + b"B" * 10)
+        text = sink.text()
+        self.assertTrue(text.endswith("B" * 10))
+        self.assertNotIn("A" * 20, text)
+
+    def test_a_head_budget_keeps_both_ends(self):
+        sink = _BoundedCapture(tail=10, limit=10_000, head=8)
+        sink.feed(b"HEADHEAD" + b"x" * 200 + b"TAILTAIL12")
+        text = sink.text()
+        self.assertTrue(text.startswith("HEADHEAD"))
+        self.assertTrue(text.endswith("TAILTAIL12"))
+        self.assertIn("truncated", text)
+
+    def test_a_stream_that_fits_is_not_duplicated(self):
+        sink = _BoundedCapture(tail=100, limit=10_000, head=8)
+        sink.feed(b"short stream")
+        self.assertEqual(sink.text(), "short stream")
+
+
+# --------------------------------------------------------------------------- #
+# self-instrumentation and the oracle diff, against the real simulator
+# --------------------------------------------------------------------------- #
+
+SEQ_TB = """`timescale 1ns/1ps
+module testbench;
+    reg clk = 0;
+    reg rst = 1;
+    wire done;
+    always #5 clk = ~clk;
+    seq_done dut(.clk(clk), .rst(rst), .done(done));
+    initial begin
+        #20 rst = 0;
+        wait (done === 1'b1);
+        $display("__PASS_BANNER__");
+        $finish;
+    end
+endmodule
+""".replace("__PASS_BANNER__", PASS_BANNER)
+
+SEQ_RTL = """module seq_done(input clk, input rst, output reg done);
+    reg [3:0] count;
+    always @(posedge clk) begin
+        if (rst) begin
+            count <= 4'd0;
+            done <= 1'b0;
+        end else if (count == 4'd5) begin
+            done <= 1'b1;
+        end else begin
+            count <= count + 4'd1;
+        end
+    end
+endmodule
+"""
+
+#: The serial2parallel failure shape: it compiles, it runs, and `done` never rises, so the
+#: watchdog kills it and the simulation log comes back EMPTY.
+SEQ_HANG_RTL = SEQ_RTL.replace(
+    "end else if (count == 4'd5) begin\n            done <= 1'b1;\n        end else begin\n            count <= count + 4'd1;\n        end",
+    "end else begin\n            count <= count;\n            done <= 1'b0;\n        end",
+)
+
+
+@unittest.skipUnless(HAS_IVERILOG, "iverilog/vvp not installed")
+class SelfTraceRunTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.root = self.tmp / "bench"
+        _write_design(
+            self.root, "Misc/Seq", "seq_done", SEQ_TB, SEQ_RTL.replace("seq_done", "verified_seq_done")
+        )
+        self.design = {d.name: d for d in discover_designs(self.root)}["seq_done"]
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_the_trace_holds_the_candidates_own_signals_and_nothing_the_testbench_printed(self):
+        result = run_self_trace(self.design, SEQ_RTL, self.tmp / "trace")
+        self.assertTrue(result.ran, result.note)
+        self.assertTrue(result.compiled)
+        self.assertEqual(result.signals, ("clk", "rst", "done", "count"))
+        self.assertIn("count=", result.trace)
+        # The testbench's own stdout -- which is where the expected answers live -- is gone.
+        self.assertNotIn(PASS_BANNER, result.trace)
+        self.assertNotIn("Passed", result.trace)
+        samples = parse_trace(result.trace)
+        self.assertGreater(len(samples), 3)
+        self.assertGreater(max(s.time for s in samples), 0)  # time really advances
+
+    def test_a_trace_run_produces_no_verdict_at_all(self):
+        # Structural, not incidental: a TraceResult has no pass/fail field, so no code path
+        # can promote an instrumented run into a score.
+        result = run_self_trace(self.design, SEQ_RTL, self.tmp / "trace2")
+        for forbidden in ("func_pass", "func_pass_strict", "syntax_pass", "failure_family"):
+            self.assertFalse(hasattr(result, forbidden), forbidden)
+
+    def test_tracing_leaves_the_scored_verdict_untouched(self):
+        before = evaluate_rtl(self.design, SEQ_RTL, self.tmp / "score_before")
+        run_self_trace(self.design, SEQ_RTL, self.tmp / "trace3")
+        after = evaluate_rtl(self.design, SEQ_RTL, self.tmp / "score_after")
+        self.assertTrue(before.func_pass_strict, before.sim_log)
+        self.assertEqual(before.func_pass, after.func_pass)
+        self.assertEqual(before.failure_family, after.failure_family)
+
+    def test_a_candidate_the_instrumenter_cannot_locate_is_reported_not_raised(self):
+        result = run_self_trace(self.design, "module other(input a);\nendmodule\n", self.tmp / "t4")
+        # `other` is the only module, so it is instrumented as the top -- but it will not
+        # link against a testbench looking for `seq_done`.
+        self.assertFalse(result.ran)
+        self.assertFalse(result.compiled)
+        self.assertIn("scored candidate is unaffected", result.note)
+
+    def test_a_candidate_that_is_not_verilog_yields_no_trace(self):
+        result = run_self_trace(self.design, "I refuse to write this design.", self.tmp / "t5")
+        self.assertFalse(result.ran)
+        self.assertIn("could not locate", result.note)
+
+
+@unittest.skipUnless(HAS_IVERILOG, "iverilog/vvp not installed")
+class TimeoutDiagnosisTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.root = self.tmp / "bench"
+        _write_design(
+            self.root, "Misc/Seq", "seq_done", SEQ_TB, SEQ_RTL.replace("seq_done", "verified_seq_done")
+        )
+        self.design = {d.name: d for d in discover_designs(self.root)}["seq_done"]
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_the_hang_leaves_an_empty_sim_log_which_is_why_this_exists(self):
+        result = evaluate_rtl(self.design, SEQ_HANG_RTL, self.tmp / "scored", sim_timeout=3)
+        self.assertTrue(result.syntax_pass, result.compile_log)
+        self.assertEqual(result.failure_family, "timeout")
+        self.assertEqual(result.sim_log.strip(), "")  # nothing for a repair agent to read
+
+    def test_the_diagnosis_names_the_signal_that_never_rises(self):
+        diagnosis = diagnose_timeout(self.design, SEQ_HANG_RTL, self.tmp / "diag")
+        self.assertTrue(diagnosis.ran, diagnosis.note)
+        self.assertGreater(diagnosis.transitions, 10)
+        self.assertIn("done", diagnosis.stuck)
+        self.assertIn("clk", diagnosis.oscillating)
+        self.assertEqual(diagnosis.final_values.get("done"), "0")
+
+    def test_simulation_time_is_reported_in_units_that_actually_advance(self):
+        # Regression 1: with the candidate on iverilog's 1s default and this testbench on
+        # 1ns/1ps, every snapshot read time=0 and the diagnosis said "time never advanced --
+        # zero-delay loop" about a design whose real fault was a counter that never reached
+        # its terminal value.
+        diagnosis = diagnose_timeout(self.design, SEQ_HANG_RTL, self.tmp / "diag2")
+        self.assertTrue(diagnosis.time_advanced)
+        self.assertTrue(diagnosis.signals_moved)
+        self.assertIsNotNone(diagnosis.last_time)
+        self.assertGreater(diagnosis.last_time, 0)
+
+    def test_matching_the_testbenchs_timescale_is_what_makes_time_readable(self):
+        # `$time` is rounded to the *enclosing module's* time unit before it is formatted.
+        # A copy compiled on iverilog's 1s default against a 1ns/1ps testbench therefore
+        # rounds every instant to zero -- which is precisely the trace that made the
+        # diagnosis announce a zero-delay loop. Matching the testbench is the whole fix.
+        matched = run_self_trace(self.design, SEQ_RTL, self.tmp / "units_matched")
+        unmatched = run_self_trace(self.design, SEQ_RTL, self.tmp / "units_unmatched", timescale=None)
+        matched_times = {sample.time for sample in parse_trace(matched.trace)}
+        unmatched_times = {sample.time for sample in parse_trace(unmatched.trace)}
+        self.assertEqual(unmatched_times, {0})  # the bug
+        self.assertGreater(len(matched_times), 5)  # the fix
+        self.assertEqual(sorted(matched_times)[0], 0)
+
+    def test_a_testbench_with_no_timescale_still_gets_a_usable_bound(self):
+        # Regression 2: forcing 1ps on the copy while this testbench runs on the 1s default
+        # made the injected `#n $finish` fire 250000x before the first clock edge, so the
+        # diagnosis saw a single t=0 snapshot and called a stuck design a zero-delay loop.
+        # 10 of the 50 RTLLM testbenches declare no timescale, including serial2parallel.
+        self.design.testbench.write_text(
+            SEQ_TB.replace("`timescale 1ns/1ps\n", ""), encoding="utf-8"
+        )
+        self.assertIsNone(read_testbench_timescale(self.design))
+        diagnosis = diagnose_timeout(self.design, SEQ_HANG_RTL, self.tmp / "nots")
+        self.assertTrue(diagnosis.ran, diagnosis.note)
+        self.assertGreater(diagnosis.transitions, 10)
+        self.assertTrue(diagnosis.time_advanced)
+        self.assertTrue(diagnosis.signals_moved)
+        self.assertIn("done", diagnosis.stuck)
+
+    def test_the_bounded_stop_witnesses_time_even_when_nothing_in_the_design_moves(self):
+        diagnosis = diagnose_timeout(self.design, SEQ_HANG_RTL, self.tmp / "witness")
+        self.assertIsNotNone(diagnosis.last_time)
+        # The stop line is parsed even though it is not a signal snapshot.
+        self.assertGreaterEqual(diagnosis.last_time, max(s.time for s in parse_trace(diagnosis.digest)))
+
+    def test_the_report_is_self_derived_and_actionable(self):
+        report = diagnose_timeout(self.design, SEQ_HANG_RTL, self.tmp / "diag3").report()
+        self.assertIn("last simulation time reached", report)
+        self.assertIn("did simulation time advance at all: yes", report)
+        self.assertIn("NEVER changed again", report)
+        self.assertIn("final observed values", report)
+        # Nothing from the oracle: not the reference, not the testbench's stdout.
+        self.assertNotIn(PASS_BANNER, report)
+        self.assertNotIn("verified_", report)
+
+    def test_the_diagnosis_is_bounded_and_cheap(self):
+        started = time.time()
+        diagnose_timeout(self.design, SEQ_HANG_RTL, self.tmp / "diag4")
+        self.assertLess(time.time() - started, 30)
+
+    def test_a_healthy_design_diagnoses_as_live(self):
+        diagnosis = diagnose_timeout(self.design, SEQ_RTL, self.tmp / "diag5")
+        self.assertTrue(diagnosis.ran)
+        self.assertTrue(diagnosis.time_advanced)
+        self.assertNotIn("done", diagnosis.stuck)
+
+
+@unittest.skipUnless(HAS_IVERILOG, "iverilog/vvp not installed")
+class TimeoutReadingTests(unittest.TestCase):
+    """The three verdicts a diagnosis can reach. They need opposite repairs, so they must
+    not collapse into one another."""
+
+    def _diagnosis(self, **overrides):
+        base = dict(
+            design="dut",
+            ran=True,
+            last_time=20000,
+            time_advanced=True,
+            transitions=800,
+            stuck=("done",),
+            oscillating=("clk",),
+            digest="",
+            timed_out=False,
+            note="",
+            signals_moved=True,
+            final_values={"done": "0"},
+        )
+        base.update(overrides)
+        return TimeoutDiagnosis(**base)
+
+    def test_time_never_advanced_reads_as_a_zero_delay_loop(self):
+        report = self._diagnosis(time_advanced=False, last_time=0, signals_moved=False).report()
+        self.assertIn("zero-delay loop", report)
+        self.assertNotIn("NOT ONE of your module's signals", report)
+
+    def test_time_advanced_but_nothing_moved_reads_as_an_undriven_design(self):
+        report = self._diagnosis(signals_moved=False, stuck=(), oscillating=()).report()
+        self.assertIn("NOT ONE of your module's signals ever changed", report)
+        self.assertNotIn("zero-delay loop", report)
+
+    def test_time_advanced_and_a_signal_settled_reads_as_an_unreachable_condition(self):
+        report = self._diagnosis(oscillating=()).report()
+        self.assertIn("terminating condition", report)
+        self.assertNotIn("zero-delay loop", report)
+
+    def test_a_run_that_produced_nothing_says_so_instead_of_guessing(self):
+        report = self._diagnosis(ran=False, note="the instrumented copy did not compile").report()
+        self.assertIn("did not compile", report)
+        self.assertNotIn("zero-delay loop", report)
+        self.assertNotIn("terminating condition", report)
+
+
+class OracleBehaviourDiffTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.root = _make_benchmark(self.tmp / "bench")
+        self.designs = {d.name: d for d in discover_designs(self.root)}
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _candidate(self, rtl, name="w"):
+        return evaluate_rtl(self.designs["tiny_adder"], rtl, self.tmp / name)
+
+    def test_the_first_divergence_is_reported_with_expected_and_got(self):
+        wrong = "module tiny_adder(input [3:0] a, input [3:0] b, output [4:0] sum);\n    assign sum = a - b;\nendmodule\n"
+        sim = self._candidate(wrong)
+        diff = oracle_behaviour_diff(self.designs["tiny_adder"], sim.sim_log, self.tmp / "o1")
+        self.assertTrue(diff.ran)
+        self.assertTrue(diff.diverged)
+        self.assertEqual(diff.line, 1)
+        self.assertEqual(diff.expected, PASS_BANNER)
+        self.assertIn("Failed at", diff.got)
+        report = diff.report()
+        self.assertIn("ORACLE-DERIVED EVIDENCE", report)
+        self.assertIn("first divergence at output line 1", report)
+
+    def test_the_reference_rtl_source_never_appears_in_the_report(self):
+        # The whole justification for calling this "behaviour only": the answer key is
+        # simulated, never quoted.
+        wrong = "module tiny_adder(input [3:0] a, input [3:0] b, output [4:0] sum);\n    assign sum = 5'd0;\nendmodule\n"
+        sim = self._candidate(wrong, "w2")
+        diff = oracle_behaviour_diff(self.designs["tiny_adder"], sim.sim_log, self.tmp / "o2")
+        report = diff.report()
+        for leak in ("verified_tiny_adder", "assign sum = a + b", "endmodule", "module "):
+            self.assertNotIn(leak, report)
+        self.assertNotIn(reference_rtl_text(self.designs["tiny_adder"]).strip(), report)
+
+    def test_matching_behaviour_reports_no_divergence(self):
+        sim = self._candidate(TINY_ADDER_RTL, "w3")
+        diff = oracle_behaviour_diff(self.designs["tiny_adder"], sim.sim_log, self.tmp / "o3")
+        self.assertTrue(diff.ran)
+        self.assertFalse(diff.diverged)
+        self.assertIsNone(diff.line)
+        self.assertIn("identical", diff.report())
+
+    def test_a_design_without_reference_rtl_is_reported_not_raised(self):
+        design = self.designs["tiny_adder"]
+        stripped = RtllmDesign(
+            name=design.name,
+            category=design.category,
+            directory=design.directory,
+            description=design.description,
+            testbench=design.testbench,
+            reference_files=(),
+        )
+        diff = oracle_behaviour_diff(stripped, "whatever", self.tmp / "o4")
+        self.assertFalse(diff.ran)
+        self.assertIn("no reference RTL", diff.report())
+
+    def test_a_candidate_that_printed_nothing_still_diffs(self):
+        diff = oracle_behaviour_diff(self.designs["tiny_adder"], "", self.tmp / "o5")
+        self.assertTrue(diff.ran)
+        self.assertTrue(diff.diverged)
+        self.assertEqual(diff.candidate_lines, 0)
+        self.assertIn("your run stopped here", diff.report())
 
 
 if __name__ == "__main__":

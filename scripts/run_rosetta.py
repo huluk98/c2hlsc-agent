@@ -465,20 +465,21 @@ _ANY_ERROR_RE = re.compile(r"\berror:")
 def detect_walls(log_text: str, project: Path, top: str, kernel_source: str) -> list[tuple[str, str]]:
     """Every distinct wall the run hit, in the order they block the build.
 
-    Reporting all of them (not only the first) is the point: three of the five apps stop on
-    more than one independent limitation, and a report that named only the first would
-    suggest fixing it is enough.
+    Reporting all of them, not only the first, is the point: an app can stop on several
+    independent limitations at once, and a report naming only the first would suggest that
+    fixing it is enough to move the app. The counts are still a floor -- an error in
+    ``src/hls_top.hpp`` aborts that translation unit and can hide later walls.
     """
 
     walls: list[tuple[str, str]] = []
     emitted = generated_return_type(project, top)
     declared = declared_return_type(kernel_source, top)
     if emitted is not None and declared is not None and emitted != declared:
+        stray = _quote(log_text, re.compile(r"does not name a type"))
         walls.append((
             "top_signature_misparsed",
             f"converter emitted return type {emitted!r} for a top declared {declared!r}"
-            + (f"; {_quote(log_text, re.compile(r'does not name a type'))}"
-               if _quote(log_text, re.compile(r"does not name a type")) else ""),
+            + (f"; {stray}" if stray else ""),
         ))
     for family, pattern in (
         ("multidim_array_arg_unsupported", _MULTIDIM_RE),

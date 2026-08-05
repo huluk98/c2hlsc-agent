@@ -1201,24 +1201,19 @@ TRACE_DIGEST_HEAD = 24
 TRACE_DIGEST_TAIL = 12
 TRACE_DIGEST_LIMIT = 4000
 
-#: Timescale forced onto the instrumented copy, and undone with ``resetall`` at end of file.
-#:
-#: Without it the diagnosis is not merely imprecise, it is WRONG. ``$time`` is reported in the
-#: enclosing module's own time unit; a candidate never writes a ``timescale`` directive, and
-#: the design file is compiled before the testbench, so the candidate's modules take
-#: iverilog's 1s default. Measured on a hang whose testbench uses ``#5`` clock edges under
-#: ``timescale 1ns/1ps``: every snapshot printed ``time=0``, and the diagnosis confidently
-#: reported "simulation time never advanced -- zero-delay loop" for a design whose real fault
-#: was a counter that never reached its terminal value. ``resetall`` at end of file keeps the
-#: directive from leaking into the testbench, which is compiled next and which sets its own
-#: (10 of the 50 RTLLM testbenches declare none and must keep the default they have today).
-TRACE_TIMESCALE = "`timescale 1ps/1ps"
+#: Simulation-time bound injected into the timeout re-run, in the TESTBENCH's time unit --
+#: about 2000 cycles of a clock with a ``#5`` half period, whatever that unit happens to be.
+#: Best effort only: a candidate that ships its own ``timescale`` directive overrides the
+#: matched one and changes the unit. The authoritative bound on the re-run is the wall clock,
+#: :data:`DIAG_WALL_CLOCK_S`.
+DEFAULT_DIAG_TIME_LIMIT = 20_000
 
-#: Simulation-time bound injected into the timeout re-run, in the units :data:`TRACE_TIMESCALE`
-#: establishes -- 20 us, i.e. 2000 cycles of a 10 ns clock. Best effort only: a candidate that
-#: ships its own ``timescale`` directive overrides ours and changes the unit. The authoritative
-#: bound on the re-run is the wall clock, :data:`DIAG_WALL_CLOCK_S`.
-DEFAULT_DIAG_TIME_LIMIT = 20_000_000
+#: Matches ONLY the two time literals of a ``timescale`` directive. Nothing else from the
+#: testbench text can escape through :func:`testbench_timescale` -- see its docstring for why
+#: reading this one directive is not an oracle leak.
+_TIMESCALE_RE = re.compile(
+    r"`timescale\s+(\d+\s*[munpf]?s)\s*/\s*(\d+\s*[munpf]?s)", re.IGNORECASE
+)
 
 #: Wall-clock seconds for the bounded timeout re-run. Deliberately short: the design has
 #: already burned one full ``sim_timeout`` proving it hangs, and the diagnosis only needs the
@@ -1373,12 +1368,40 @@ def candidate_trace_signals(rtl_text: str, design_name: str) -> "tuple[str, ...]
     return tuple(ordered[:MAX_TRACE_SIGNALS])
 
 
+def testbench_timescale(design: RtllmDesign) -> "str | None":
+    """The ``timescale`` directive the design's testbench declares, or ``None``.
+
+    The instrumented copy must be compiled under the SAME time unit as the testbench that
+    drives it. iverilog scopes ``timescale`` by position in the compilation unit and the
+    design file is compiled first, so a candidate -- which never writes the directive --
+    takes iverilog's 1s default while a ``1ns/1ps`` testbench runs 10^9 times finer. Two
+    measured consequences of not matching: every snapshot printed ``time=0`` (so the
+    diagnosis reported "time never advanced" for a design that was merely stuck), and the
+    injected ``#n $finish`` bound fired 250000x too early on the 10 RTLLM testbenches that
+    declare no directive at all, ending the diagnostic run before the first clock edge.
+
+    Reading this is not an oracle leak. :data:`_TIMESCALE_RE` captures the two time literals
+    and nothing else -- no expected value, no golden behaviour, no testbench text can come
+    out of this function -- and the result reaches the model only as the unit of the ``time=``
+    numbers in its own trace.
+    """
+
+    match = _TIMESCALE_RE.search(_read_text(design.testbench))
+    if not match:
+        return None
+    return "`timescale %s/%s" % (
+        re.sub(r"\s+", "", match.group(1)),
+        re.sub(r"\s+", "", match.group(2)),
+    )
+
+
 def instrument_rtl(
     rtl_text: str,
     design_name: str,
     *,
     signals: "Sequence[str] | None" = None,
     time_limit: "int | None" = None,
+    timescale: "str | None" = None,
 ) -> str:
     """Return a NON-SCORED copy of the candidate that prints its own signals.
 
@@ -1390,6 +1413,12 @@ def instrument_rtl(
 
     ``time_limit`` additionally injects ``#<n> $finish``, a best-effort bound for a hung
     design (see :data:`DEFAULT_DIAG_TIME_LIMIT` on why it is only best-effort).
+
+    ``timescale`` is the directive to compile this copy under -- pass the testbench's, from
+    :func:`testbench_timescale`, so ``$time`` and the injected delay are in the same unit as
+    the stimulus. It is undone with ``resetall`` at end of file so it cannot change the
+    testbench, which is compiled next. Passing ``None`` emits no directive, which is right
+    when the testbench declares none: both then take the same compiler default.
 
     Returns ``""`` when the module cannot be located, which the caller reports as "no trace
     available" rather than guessing. **The result must never be scored**: it contains system
@@ -1421,16 +1450,18 @@ def instrument_rtl(
     if time_limit is not None:
         block.append("initial begin")
         block.append("    #%d;" % int(time_limit))
-        block.append('    $display("%s bounded_stop t=%%0t", $time);' % DIAG_MARKER)
+        block.append('    $display("%s bounded_stop time=%%0t", $time);' % DIAG_MARKER)
         block.append("    $finish;")
         block.append("end")
     block.append("// ---- end rtllm_bench self-instrumentation ----")
 
     injected = "\n".join("    " + line if line else "" for line in block) + "\n"
-    body = text[: span.end] + injected + text[span.end :]
-    # The timescale must precede the module to apply to it, and must be undone before the
-    # testbench is compiled -- see TRACE_TIMESCALE.
-    return "%s\n%s\n`resetall\n" % (TRACE_TIMESCALE, body.rstrip("\n"))
+    body = (text[: span.end] + injected + text[span.end :]).rstrip("\n") + "\n"
+    if not timescale:
+        return body
+    # The directive must precede the module to apply to it, and must be undone before the
+    # testbench is compiled -- see testbench_timescale.
+    return "%s\n%s`resetall\n" % (timescale, body)
 
 
 @dataclass
@@ -1472,6 +1503,7 @@ def run_self_trace(
     apply_shims: bool = True,
     time_limit: "int | None" = None,
     signals: "Sequence[str] | None" = None,
+    timescale: "str | None | bool" = True,
 ) -> TraceResult:
     """Run an instrumented COPY of the candidate and return its own signal trace.
 
@@ -1487,7 +1519,12 @@ def run_self_trace(
     names = (
         tuple(signals) if signals is not None else candidate_trace_signals(rtl_text, design.name)
     )
-    instrumented = instrument_rtl(rtl_text, design.name, signals=names, time_limit=time_limit)
+    # `timescale=True` (the default) means "match the testbench"; a string overrides it and
+    # None/False emits no directive.
+    directive = testbench_timescale(design) if timescale is True else (timescale or None)
+    instrumented = instrument_rtl(
+        rtl_text, design.name, signals=names, time_limit=time_limit, timescale=directive
+    )
     if not instrumented:
         return TraceResult(
             design=design.name,
@@ -1629,6 +1666,22 @@ class TraceSample(NamedTuple):
 
 _TRACE_TIME_RE = re.compile(r"%s\s+time=(\d+)" % re.escape(TRACE_MARKER))
 _TRACE_PAIR_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_$]*)=([^\s]+)")
+_DIAG_TIME_RE = re.compile(r"%s\s+bounded_stop\s+time=(\d+)" % re.escape(DIAG_MARKER))
+
+
+def bounded_stop_time(trace: str) -> "int | None":
+    """Simulation time at which the injected bound fired, if it did.
+
+    An independent witness that time advanced. Snapshots alone cannot tell "simulation time
+    never moved" (a zero-delay loop) from "time moved but none of the candidate's signals
+    ever changed" (an unclocked design) -- both print exactly one snapshot at t=0, and those
+    two faults need opposite repairs.
+    """
+
+    match = None
+    for match in _DIAG_TIME_RE.finditer(trace or ""):
+        pass
+    return int(match.group(1)) if match else None
 
 
 def parse_trace(trace: str) -> "tuple[TraceSample, ...]":
@@ -1663,6 +1716,10 @@ class TimeoutDiagnosis:
     digest: str
     timed_out: bool
     note: str
+    #: Whether the candidate's own signals were ever observed at more than one instant. False
+    #: with ``time_advanced`` True means the design is not being clocked at all -- a different
+    #: fault from a zero-delay loop, needing a different repair.
+    signals_moved: bool = False
     final_values: "dict[str, str]" = field(default_factory=dict)
 
     def to_dict(self) -> "dict[str, object]":
@@ -1671,6 +1728,7 @@ class TimeoutDiagnosis:
             "ran": self.ran,
             "last_time": self.last_time,
             "time_advanced": self.time_advanced,
+            "signals_moved": self.signals_moved,
             "transitions": self.transitions,
             "stuck": list(self.stuck),
             "oscillating": list(self.oscillating),
@@ -1720,6 +1778,13 @@ class TimeoutDiagnosis:
             lines.append(
                 "- reading: simulation time never advanced. That is a zero-delay loop -- "
                 "combinational feedback, or an always block with no edge and no delay."
+            )
+        elif not self.signals_moved:
+            lines.append(
+                "- reading: simulation time advanced, but NOT ONE of your module's signals "
+                "ever changed after the start. The design is not being driven: check that "
+                "every port in your declaration has the exact name the description gives, "
+                "and that your logic is sensitive to the clock at all."
             )
         elif self.stuck and not self.oscillating:
             lines.append(
@@ -1814,12 +1879,16 @@ def diagnose_timeout(
     )
     samples = parse_trace(trace.trace)
     times = [sample.time for sample in samples]
+    stopped_at = bounded_stop_time(trace.trace)
+    if stopped_at is not None:
+        times.append(stopped_at)
     stuck, oscillating = _stuck_and_oscillating(samples)
     return TimeoutDiagnosis(
         design=design.name,
         ran=trace.ran,
         last_time=max(times) if times else None,
-        time_advanced=bool(times) and max(times) > min(times),
+        time_advanced=bool(times) and max(times) > 0,
+        signals_moved=len({s.time for s in samples}) > 1,
         transitions=len(samples),
         stuck=stuck,
         oscillating=oscillating,
