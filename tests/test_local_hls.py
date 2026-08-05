@@ -260,8 +260,13 @@ class OptimizeBaselineTests(unittest.TestCase):
             (project / "rtl" / "top.v").write_text("module top(); endmodule\n")
             cfg = AgentConfig(top="top", node="nangate45")
             phase = PhaseResult("ppa", ppa_status, summary="area 100 um^2")
-            with mock.patch.object(cli, "_ppa_gate_phase", return_value=phase):
-                rc = cli._optimize_local_hls_baseline(project, cfg, analysis=None, verbose=False)
+            verified = VerificationState()
+            for name in ("software_equivalence", "csim", "csynth", "cosim"):
+                verified.add_phase(PhaseResult(name, "pass"))
+            with mock.patch.object(cli, "_ppa_gate_phase", return_value=phase), \
+                 mock.patch.object(cli.LocalHlsCosim, "from_config", return_value=object()), \
+                 mock.patch.object(cli, "verify_project", return_value=verified):
+                rc = cli._optimize_local_hls_baseline(project, cfg, analysis=object(), verbose=False)
             report = json.loads((project / "qor_report.json").read_text())
             return rc, report
 
@@ -270,6 +275,7 @@ class OptimizeBaselineTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(report["backend"], "local-hls")
         self.assertEqual(report["optimization"], "not_applicable")
+        self.assertEqual(report["baseline_verification"], "pass")
 
     def test_unmet_criterion_exits_nonzero(self):
         rc, _ = self._run("fail")

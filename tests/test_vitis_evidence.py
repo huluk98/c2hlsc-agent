@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -87,6 +88,8 @@ class VitisEvidenceTests(unittest.TestCase):
         project = root / "project"
         (project / "src").mkdir(parents=True)
         (project / "tb").mkdir()
+        (project / "input.c").write_text("void top() {}\n", encoding="utf-8")
+        (project / "src" / "hls_top.hpp").write_text("void top();\n", encoding="utf-8")
         (project / "src" / "hls_top.cpp").write_text("void top() {}\n", encoding="utf-8")
         (project / "tb" / "testbench.cpp").write_text("int main() { return 0; }\n", encoding="utf-8")
         report_dir = project / "c2hlsc_project" / "solution1" / "syn" / "report"
@@ -132,6 +135,7 @@ class VitisEvidenceTests(unittest.TestCase):
         self.assertEqual(evidence["backend"], "vitis")
         self.assertEqual(evidence["seed"], 7)
         self.assertEqual(evidence["num_tests"], 64)
+        self.assertEqual(len(evidence["inputs"]), 4)
         self.assertEqual(len(evidence["rtl"]), 1)
         self.assertEqual(
             evidence["native_cosim_command"],
@@ -149,6 +153,22 @@ class VitisEvidenceTests(unittest.TestCase):
             project = self._project(Path(tmp))
             (project / "cosim.log").write_text("Vitis exited 0\n", encoding="utf-8")
             with self.assertRaisesRegex(VitisEvidenceError, "positive"):
+                validate_vitis_project(project)
+
+    def test_rejects_source_changed_after_native_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = self._project(Path(tmp))
+            (project / "input.c").write_text("void top() { /* changed */ }\n", encoding="utf-8")
+            with self.assertRaisesRegex(VitisEvidenceError, "csynth.xml predates"):
+                validate_vitis_project(project)
+
+    def test_rejects_any_stale_rtl_in_the_evidence_set(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = self._project(Path(tmp))
+            stale = project / "c2hlsc_project" / "solution1" / "syn" / "verilog" / "stale.v"
+            stale.write_text("module stale; endmodule\n", encoding="utf-8")
+            os.utime(stale, (1, 1))
+            with self.assertRaisesRegex(VitisEvidenceError, "RTL predates"):
                 validate_vitis_project(project)
 
     def test_online_workflow_runs_native_ladder_and_evidence_gate(self):

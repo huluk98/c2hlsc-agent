@@ -13,7 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from c2hlsc_agent import hls_runner
 from c2hlsc_agent.agent_loop import classify_failure
 from c2hlsc_agent.cli import _external_failure_state
-from c2hlsc_agent.config import AgentConfig, load_config, merge_cli_config
+from c2hlsc_agent.config import COSIM_BACKENDS, AgentConfig, load_config, merge_cli_config
 from c2hlsc_agent.equivalence import PhaseResult, VerificationState
 from c2hlsc_agent.hls_project import render_makefile, render_run_all
 from c2hlsc_agent.hls_runner import _gate_cosim_on_log, _run_vitis_phase, run_software_equivalence
@@ -265,6 +265,37 @@ class ConfigMergeTests(unittest.TestCase):
         self.assertEqual(config.max_iterations, 5)
         self.assertTrue(config.auto_repair)
         self.assertTrue(config.keep_going)
+
+
+class CosimBackendConfigTests(unittest.TestCase):
+    """A typo'd cosim_backend used to survive load_config, match no dispatch branch,
+    leave run_vitis false, and still report a pass with the RTL ladder never run."""
+
+    def _load(self, backend: str) -> AgentConfig:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = Path(tmp.name) / "config.json"
+        path.write_text(
+            '{"input_files": ["input.c"], "top": "k", "cosim_backend": "%s"}' % backend,
+            encoding="utf-8",
+        )
+        return load_config(path)
+
+    def test_every_supported_backend_is_accepted(self):
+        for backend in COSIM_BACKENDS:
+            self.assertEqual(self._load(backend).cosim_backend, backend)
+
+    def test_typo_is_rejected_instead_of_silently_skipping_the_ladder(self):
+        with self.assertRaises(ValueError) as caught:
+            self._load("vitis-shh")
+        self.assertIn("vitis-shh", str(caught.exception))
+
+    def test_default_is_auto_when_the_key_is_absent(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = Path(tmp.name) / "config.json"
+        path.write_text('{"input_files": ["input.c"], "top": "k"}', encoding="utf-8")
+        self.assertEqual(load_config(path).cosim_backend, "auto")
 
 
 if __name__ == "__main__":

@@ -406,7 +406,11 @@ static inline void klee_assume(unsigned long condition) {
         self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
         report = project / "coverage" / "gcov_report.json"
         self.assertTrue(report.exists())
-        self.assertIn('"status": "pass"', report.read_text(encoding="utf-8"))
+        payload = json.loads(report.read_text(encoding="utf-8"))
+        self.assertEqual(payload["status"], "pass")
+        self.assertEqual(payload["gcov_returncode"], 0)
+        self.assertTrue(payload["gcno_files"])
+        self.assertTrue(payload["gcov_files"])
 
     @unittest.skipUnless(shutil.which("make") and shutil.which("python3"), "make and python3 are required")
     def test_project_klee_target_skips_cleanly_when_klee_missing(self):

@@ -73,6 +73,8 @@ def validate_vitis_project(project_dir: Path) -> dict[str, object]:
     if csynth is None:
         raise VitisEvidenceError("csynth passed but no csynth.xml report exists")
     source_inputs = [
+        project_dir / "input.c",
+        project_dir / "src" / "hls_top.hpp",
         project_dir / "src" / "hls_top.cpp",
         project_dir / "tb" / "testbench.cpp",
     ]
@@ -110,8 +112,12 @@ def validate_vitis_project(project_dir: Path) -> dict[str, object]:
     )
     if not rtl_files:
         raise VitisEvidenceError("csynth passed but no Vitis-generated Verilog/SystemVerilog exists")
-    if not any(path.stat().st_mtime >= newest_input_mtime for path in rtl_files):
-        raise VitisEvidenceError("all Vitis-generated RTL predates the generated source")
+    stale_rtl = [path for path in rtl_files if path.stat().st_mtime < newest_input_mtime]
+    if stale_rtl:
+        raise VitisEvidenceError(
+            "Vitis-generated RTL predates the generated source: "
+            + ", ".join(_relative(project_dir, path) for path in stale_rtl)
+        )
 
     cosim_log = project_dir / "cosim.log"
     try:
@@ -120,6 +126,14 @@ def validate_vitis_project(project_dir: Path) -> dict[str, object]:
         raise VitisEvidenceError(f"cosim.log is unavailable: {exc}") from exc
     if not any(marker in cosim_text for marker in VITIS_COSIM_SUCCESS_MARKERS):
         raise VitisEvidenceError("cosim.log has no positive C/RTL co-simulation PASS marker")
+    newest_rtl_mtime = max(path.stat().st_mtime for path in rtl_files)
+    newest_prerequisite_mtime = max(
+        newest_input_mtime,
+        csynth.stat().st_mtime,
+        newest_rtl_mtime,
+    )
+    if cosim_log.stat().st_mtime < newest_prerequisite_mtime:
+        raise VitisEvidenceError("cosim.log predates source, synthesis, or RTL artifacts")
 
     vitis_bin = str(report.get("vitis_bin") or "")
     if not vitis_bin:
@@ -141,6 +155,10 @@ def validate_vitis_project(project_dir: Path) -> dict[str, object]:
             phase: report.get(phase)
             for phase in ("coverage_gcov", "symbolic_klee")
         },
+        "inputs": [
+            {"path": _relative(project_dir, path), "sha256": _sha256(path)}
+            for path in source_inputs
+        ],
         "csynth_report": {
             "path": _relative(project_dir, csynth),
             "sha256": _sha256(csynth),

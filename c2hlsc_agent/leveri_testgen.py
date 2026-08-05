@@ -716,21 +716,22 @@ def main() -> int:
         write_report({"status": "fail", "stage": "build_or_run", "commands": command_logs})
         return exc.returncode or 1
 
-    gcov_cmd = [gcov, "-b", "-c", "-o", str(COVERAGE_DIR), "tb/leveri_golden_tb.cpp", "tb/leveri_hls_tb.cpp", "src/hls_top.cpp"]
+    gcno_files = sorted(path.relative_to(ROOT) for path in COVERAGE_DIR.glob("*.gcno"))
+    gcov_cmd = [gcov, "-b", "-c", "-o", str(COVERAGE_DIR), *map(str, gcno_files)]
     gcov_result = run(gcov_cmd, check=False)
     gcov_files = sorted(str(path.relative_to(ROOT)) for path in ROOT.rglob("*.gcov"))
     coverage_data = sorted(str(path.relative_to(ROOT)) for path in ROOT.rglob("*.gcda"))
-    # The build, execution, and dual-trace comparison all succeeded above, so coverage
-    # correctness is already established. This target's job is to PRODUCE a coverage
-    # report; pass when instrumentation actually emitted data. gcov's own exit code is
-    # advisory only -- it varies across gcov/compiler versions and platforms for
-    # source-path resolution -- so it does not gate the result.
-    produced_coverage = bool(coverage_data or gcov_files)
+    # Invoke gcov on the compiler-emitted note files instead of guessing their names
+    # from source paths.  Compilers commonly prefix .gcno files with the output binary
+    # name (for example ``leveri_hls_tb-hls_top.gcno``).  Raw .gcda data alone is not a
+    # usable coverage report, so fail closed unless gcov successfully emits .gcov files.
+    produced_coverage = gcov_result.returncode == 0 and bool(gcov_files)
     write_report({
         "status": "pass" if produced_coverage else "fail",
         "policy_id": "hls_leveri_shift_left_v1",
         "commands": command_logs,
         "gcov_cmd": gcov_cmd,
+        "gcno_files": [str(path) for path in gcno_files],
         "gcov_returncode": gcov_result.returncode,
         "gcov_stdout": gcov_result.stdout[-8000:],
         "gcov_stderr": gcov_result.stderr[-8000:],

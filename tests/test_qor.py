@@ -230,6 +230,14 @@ def _optimized_cpp(latency_hint: str) -> str:
 
 
 class OptimizerLoopTests(unittest.TestCase):
+    def setUp(self):
+        baseline_verifier = mock.patch(
+            "c2hlsc_agent.qor_optimizer.verify_project",
+            return_value=self._passing_state(),
+        )
+        baseline_verifier.start()
+        self.addCleanup(baseline_verifier.stop)
+
     def _project(self, tmp: Path) -> tuple[Path, object, AgentConfig]:
         config = AgentConfig()
         source = tmp / "input.c"
@@ -288,6 +296,8 @@ class OptimizerLoopTests(unittest.TestCase):
                 outcome = optimize_project(out_dir, analysis, config, llm, None,
                                            objective="latency", iterations=1)
             self.assertTrue(outcome.accepted)
+            self.assertTrue(outcome.baseline_verified)
+            self.assertEqual(outcome.winner_verification, "pass")
             self.assertEqual(outcome.winner_index, 1)
             self.assertIn("UNROLL", (out_dir / "src" / "hls_top.cpp").read_text(encoding="utf-8"))
             self.assertEqual((out_dir / "src" / PRE_QOR_BACKUP).read_text(encoding="utf-8"), original)
@@ -326,7 +336,10 @@ class OptimizerLoopTests(unittest.TestCase):
             with mock.patch("c2hlsc_agent.qor_optimizer.run_software_equivalence",
                             return_value=PhaseResult("software_equivalence", "pass")), \
                  mock.patch("c2hlsc_agent.qor_optimizer.run_vitis", side_effect=self._fake_run_vitis([200, 120])), \
-                 mock.patch("c2hlsc_agent.qor_optimizer.verify_project", return_value=failing):
+                 mock.patch(
+                     "c2hlsc_agent.qor_optimizer.verify_project",
+                     side_effect=[self._passing_state(), failing],
+                 ):
                 outcome = optimize_project(out_dir, analysis, config, llm, None,
                                            objective="latency", iterations=1)
             self.assertFalse(outcome.accepted)
@@ -467,19 +480,39 @@ class OptimizerReviewFixTests(OptimizerLoopTests):
             # backup still holds the TRUE original, not run 1's optimized source
             self.assertEqual((out_dir / "src" / PRE_QOR_BACKUP).read_text(encoding="utf-8"), original)
 
-    def test_no_cosim_winner_keeps_candidate_metrics(self):
+    def test_host_only_winner_acceptance_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
             out_dir, analysis, config = self._project(Path(tmp))
-            llm = SeqLLM([_optimized_cpp("fast")])
-            with mock.patch("c2hlsc_agent.qor_optimizer.run_software_equivalence",
-                            return_value=PhaseResult("software_equivalence", "pass")), \
-                 mock.patch("c2hlsc_agent.qor_optimizer.run_vitis", side_effect=self._fake_run_vitis([200, 120])):
-                outcome = optimize_project(out_dir, analysis, config, llm, None,
-                                           objective="latency", iterations=1, cosim_winner=False)
-            self.assertTrue(outcome.accepted)
-            # delta must reflect the candidate's 120, not the baseline xml's 230
-            self.assertEqual(outcome.delta["latency_worst"]["candidate"], 120)
-            self.assertLess(outcome.delta["latency_worst"]["delta"], 0)
+            with self.assertRaisesRegex(RuntimeError, "host-only QoR acceptance is disabled"):
+                optimize_project(
+                    out_dir,
+                    analysis,
+                    config,
+                    None,
+                    None,
+                    objective="latency",
+                    iterations=1,
+                    cosim_winner=False,
+                )
+
+    def test_unverified_baseline_is_rejected_before_qor_scoring(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir, analysis, config = self._project(Path(tmp))
+            failing = VerificationState()
+            failing.add_phase(PhaseResult("software_equivalence", "fail"))
+            with mock.patch(
+                "c2hlsc_agent.qor_optimizer.verify_project",
+                return_value=failing,
+            ), self.assertRaisesRegex(RuntimeError, "baseline project failed"):
+                optimize_project(
+                    out_dir,
+                    analysis,
+                    config,
+                    None,
+                    None,
+                    objective="latency",
+                    iterations=0,
+                )
 
     def test_rollback_deletes_stale_report_and_cli_maps_exit_code(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -492,7 +525,10 @@ class OptimizerReviewFixTests(OptimizerLoopTests):
             with mock.patch("c2hlsc_agent.qor_optimizer.run_software_equivalence",
                             return_value=PhaseResult("software_equivalence", "pass")), \
                  mock.patch("c2hlsc_agent.qor_optimizer.run_vitis", side_effect=self._fake_run_vitis([200, 120])), \
-                 mock.patch("c2hlsc_agent.qor_optimizer.verify_project", return_value=failing):
+                 mock.patch(
+                     "c2hlsc_agent.qor_optimizer.verify_project",
+                     side_effect=[self._passing_state(), failing],
+                 ):
                 outcome = optimize_project(out_dir, analysis, config, llm, None,
                                            objective="latency", iterations=1)
             self.assertTrue(outcome.rolled_back)
@@ -738,10 +774,17 @@ class TargetLoopTests(OptimizerLoopTests):
                                            targets=PPATargets(min_slack_ns=1.0), max_rounds=3)
             self.assertFalse(outcome.accepted)
             self.assertTrue(outcome.targets_met)
+            self.assertTrue(outcome.baseline_verified)
             self.assertIn("already meets", outcome.summary)
 
 
 class OptimizeCliTests(unittest.TestCase):
+    def test_parser_rejects_host_only_winner_escape(self):
+        with self.assertRaises(SystemExit):
+            build_parser().parse_args(
+                ["optimize", "--project", "p", "--no-cosim-winner"]
+            )
+
     def test_parser_accepts_targets(self):
         args = build_parser().parse_args(
             ["optimize", "--project", "p", "--target-latency", "150", "--target-slack", "0.5",
