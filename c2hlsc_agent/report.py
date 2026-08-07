@@ -38,6 +38,7 @@ def write_reports(
     state: VerificationState,
     iterations: int,
     repairs: list[RepairOutcome] | None = None,
+    run_control: dict[str, object] | None = None,
 ) -> None:
     repairs = repairs or []
     status = final_status(state, config.run_vitis, analysis.diagnostics.has_errors)
@@ -63,12 +64,38 @@ def write_reports(
     if repairs:
         report_files.append(REPAIR_AUDIT_FILENAME)
 
+    run_control_section = ''
+    if run_control:
+        run_id = run_control.get('run_id', '')
+        controller_status = run_control.get('status', '')
+        controller_reason = run_control.get('reason', '') or '-'
+        ledger_file = run_control.get('ledger_file', '')
+        usage = dict(run_control.get('usage', {}))
+        budget = dict(run_control.get('budget', {}))
+        attempts = usage.get('attempts', 0)
+        max_attempts = budget.get('max_attempts', 0)
+        llm_calls = usage.get('llm_calls', 0)
+        max_llm_calls = budget.get('max_llm_calls', 0)
+        vitis_runs = usage.get('vitis_runs', 0)
+        max_vitis_runs = budget.get('max_vitis_runs', 0)
+        run_control_section = (
+            '## Bounded Run Controller\n\n'
+            f'- Run ID: `{run_id}`\n'
+            f'- Controller status: `{controller_status}`\n'
+            f'- Reason: {controller_reason}\n'
+            f'- Attempts: {attempts}/{max_attempts}\n'
+            f'- LLM calls: {llm_calls}/{max_llm_calls}\n'
+            f'- Vitis runs: {vitis_runs}/{max_vitis_runs}\n'
+            f'- Ledger: `{ledger_file}`\n'
+        )
+
     md = f"""# c2hlsc_agent Conversion Report
 
 ## Final Status
 
 **{status.upper()}**
 
+{run_control_section}
 ## Inputs
 
 - Top function: `{fn.name}`
@@ -137,6 +164,7 @@ def write_reports(
     (project.root / "conversion_report.md").write_text(md, encoding="utf-8")
 
     machine = {
+        'run_control': run_control,
         "status": status,
         "top": fn.name,
         "generator_prompt_id": generated.generator_prompt_id,
