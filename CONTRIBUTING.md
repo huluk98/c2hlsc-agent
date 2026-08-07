@@ -27,7 +27,7 @@ python -m pip install -e .
 python -m unittest discover -s tests
 ```
 
-Read `AGENTS.md`, this file, `PEER_COLLABORATION_TRAINING.md`, and the README sections related to your task. Do not install the optional Anthropic SDK merely to make ordinary CI pass; the offline deterministic and fallback paths are intentional test coverage.
+Read `AGENTS.md`, this file, `PEER_COMMANDS.md`, `PEER_COLLABORATION_TRAINING.md`, and the README sections related to your task. Do not install the optional Anthropic SDK merely to make ordinary CI pass; the offline deterministic and fallback paths are intentional test coverage.
 
 Maintainers should protect `main` by requiring a pull request, one approval from someone other than the owner, passing CI, resolved conversations, and no force pushes or branch deletion. Prefer squash merges.
 

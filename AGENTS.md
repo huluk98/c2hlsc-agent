@@ -15,7 +15,7 @@
 
 ## Team collaboration
 
-- Read `CONTRIBUTING.md` and use `PEER_COLLABORATION_TRAINING.md` for onboarding, task prompts, review prompts, and handoffs.
+- Read `CONTRIBUTING.md` and `PEER_COMMANDS.md`. Use `PEER_COLLABORATION_TRAINING.md` for onboarding exercises and coaching.
 - Treat GitHub `origin` as the shared source of truth. Local clones and Codex worktrees are isolated working copies, not live-synchronized folders.
 - Every implementation task must reference a GitHub issue with acceptance criteria, non-goals, expected files, verification scope, and one current owner. Read-only investigation may proceed before assignment; file edits may not.
 - Before editing, identify the operator, inspect `git status`, fetch and prune `origin`, read the issue, inspect open pull requests and remote branches, and compare planned behavior and files for overlap.

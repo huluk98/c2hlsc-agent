@@ -559,8 +559,10 @@ run a custom flow instead.
 For the three-person issue, branch, pull-request, and handoff workflow, see
 [CONTRIBUTING.md](CONTRIBUTING.md). Team leads can onboard peers with the exercises and
 reusable Codex prompts in
-[PEER_COLLABORATION_TRAINING.md](PEER_COLLABORATION_TRAINING.md). Codex sessions inherit
-the repository-specific engineering and evidence rules in [AGENTS.md](AGENTS.md).
+[PEER_COLLABORATION_TRAINING.md](PEER_COLLABORATION_TRAINING.md). For a compact sheet
+that teammates can copy and run, use [PEER_COMMANDS.md](PEER_COMMANDS.md). Codex
+sessions inherit the repository-specific engineering and evidence rules in
+[AGENTS.md](AGENTS.md).
 
 ## Install
 
