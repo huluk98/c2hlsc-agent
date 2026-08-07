@@ -554,6 +554,14 @@ std-cell area, worst slack, and total power whenever the local flow ran (ASIC-st
 next to the FPGA estimates, as in `build/cnn_3x3`). `--ppa-script` remains available to
 run a custom flow instead.
 
+## Team collaboration
+
+For the three-person issue, branch, pull-request, and handoff workflow, see
+[CONTRIBUTING.md](CONTRIBUTING.md). Team leads can onboard peers with the exercises and
+reusable Codex prompts in
+[PEER_COLLABORATION_TRAINING.md](PEER_COLLABORATION_TRAINING.md). Codex sessions inherit
+the repository-specific engineering and evidence rules in [AGENTS.md](AGENTS.md).
+
 ## Install
 
 From the repository root:
