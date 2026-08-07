@@ -559,6 +559,9 @@ run a custom flow instead.
 Start and update shared work in the pinned
 [Team Work Queue #12](https://github.com/huluk98/c2hlsc-agent/issues/12).
 
+New collaborators should begin with the self-contained
+[COLLABORATOR_START_HERE.md](COLLABORATOR_START_HERE.md) guide.
+
 For the three-person issue, branch, pull-request, and handoff workflow, see
 [CONTRIBUTING.md](CONTRIBUTING.md). Team leads can onboard peers with the exercises and
 reusable Codex prompts in
