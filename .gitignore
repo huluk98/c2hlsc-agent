@@ -13,3 +13,4 @@ dist/
 c2hlsc_project/
 c2hlsc_tb
 vitis_hls_bin_path.txt
+run_ledger.jsonl

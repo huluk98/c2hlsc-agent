@@ -7,14 +7,31 @@ from pathlib import Path
 
 from .analyze import analyze_source
 from .candidates import select_best_candidate
-from .config import load_config, merge_cli_config
+from .config import AgentConfig, load_config, merge_cli_config
 from .convert import ReferenceGenerationError, generate_hls_sources, generate_reference_c
+from .equivalence import VerificationState
 from .hlsc_repair_agent import clear_repair_audit, repair_project
 from .hls_project import write_project
 from .hls_runner import verify_project
 from .llm import build_llm_client, missing_llm_reason
 from .remote import RemoteVitis
 from .report import final_status, write_reports
+from .run_control import (
+    RUN_LEDGER_FILENAME,
+    BudgetedLLMClient,
+    RunBudget,
+    RunBudgetExceeded,
+    RunClosed,
+    RunController,
+    RunLedger,
+    RunStatus,
+    derive_run_id,
+    failure_fingerprint,
+    files_fingerprint,
+    fresh_run_id,
+    snapshot_for_record,
+    stable_fingerprint,
+)
 
 
 def _add_llm_arguments(parser: argparse.ArgumentParser) -> None:
@@ -61,6 +78,34 @@ def _add_remote_vitis_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--vitis-bin", help="remote vitis_hls executable name or absolute path")
 
 
+def _add_run_control_arguments(parser: argparse.ArgumentParser) -> None:
+    group = parser.add_argument_group(
+        'bounded continuous run',
+        'persistent budgets prevent runaway retries across repeated invocations',
+    )
+    group.add_argument('--run-id', help='stable run id; derived from inputs by default')
+    group.add_argument(
+        '--new-run',
+        action='store_true',
+        help='start a fresh run id after an intentional reset',
+    )
+    group.add_argument(
+        '--max-wall-seconds',
+        type=int,
+        help='persistent wall-time budget in seconds (default 14400)',
+    )
+    group.add_argument(
+        '--max-llm-calls',
+        type=int,
+        help='persistent model-call budget (default 8)',
+    )
+    group.add_argument(
+        '--max-vitis-runs',
+        type=int,
+        help='persistent Vitis verification budget (default 8)',
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="c2hlsc_agent", description="Conservative C to Vitis HLS C/C++ conversion agent")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -91,6 +136,7 @@ def build_parser() -> argparse.ArgumentParser:
     convert.add_argument("--cosim-tool", help="cosim simulator tool, e.g. xsim")
     convert.add_argument("--rtl", default="verilog", help="RTL language for cosim, default verilog")
     _add_llm_arguments(convert)
+    _add_run_control_arguments(convert)
     convert.add_argument("--seed", type=int, help="random seed")
     convert.add_argument("--max-iterations", type=int, help="max verification iterations (default 1); repaired reruns require --auto-repair")
     convert.add_argument("--auto-repair", action="store_true", help="apply mechanical and LLM repairs automatically between verification attempts")
@@ -156,7 +202,77 @@ def build_parser() -> argparse.ArgumentParser:
     optimize.add_argument("--verbose", action="store_true", help="print per-candidate progress")
     _add_remote_vitis_arguments(optimize)
     _add_llm_arguments(optimize)
+    status = sub.add_parser(
+        'status',
+        help='show the latest persistent bounded-run state for a project',
+    )
+    status.add_argument('--project', required=True, help='generated project directory')
+    status.add_argument('--run-id', help='specific run id; latest run by default')
+    status.add_argument('--json', action='store_true', help='emit machine-readable JSON')
     return parser
+
+
+def _run_identity(config: AgentConfig) -> dict[str, object]:
+    source_hash = files_fingerprint(config.input_files) if config.input_files else None
+    arguments = {
+        name: {
+            'direction': value.direction,
+            'length': value.length,
+            'range': value.range,
+            'interface': value.interface,
+        }
+        for name, value in sorted(config.arguments.items())
+    }
+    return {
+        'source_hash': source_hash,
+        'nl_spec': config.nl_spec or '',
+        'top': config.top,
+        'part': config.part,
+        'clock': config.clock,
+        'seed': config.seed,
+        'run_vitis': config.run_vitis,
+        'arguments': arguments,
+        'compiler_flags': list(config.compiler_flags),
+        'num_tests': config.num_tests,
+        'directed_tests': list(config.directed_tests),
+        'interface_mode': config.interface_mode,
+        'allow_pragmas': config.allow_pragmas,
+        'cosim_tool': config.cosim_tool,
+        'rtl': config.rtl,
+        'llm_backend': config.llm_backend if config.use_llm else 'none',
+        'llm_model': config.llm_model if config.use_llm else None,
+        'llm_candidates': config.llm_candidates,
+    }
+
+
+def _start_run_controller(
+    out_dir: Path,
+    config: AgentConfig,
+    args: argparse.Namespace,
+) -> RunController:
+    identity = _run_identity(config)
+    identity_fingerprint = stable_fingerprint(identity)
+    run_id = config.run_id or derive_run_id(identity)
+    if args.new_run:
+        run_id = fresh_run_id(run_id)
+    budget = RunBudget(
+        max_attempts=max(1, config.max_iterations),
+        max_wall_seconds=config.max_wall_seconds,
+        max_llm_calls=config.max_llm_calls,
+        max_vitis_runs=config.max_vitis_runs,
+    )
+    return RunController(out_dir, run_id, budget, identity_fingerprint)
+
+
+def _permit_optional_llm_fallback(
+    controller: RunController,
+    exc: RunBudgetExceeded,
+    stage: str,
+) -> None:
+    if exc.resource == 'llm_calls':
+        return
+    controller.finish(RunStatus.EXHAUSTED, str(exc))
+    raise SystemExit(f'{stage} stopped: {exc}') from exc
 
 
 def run_convert(args: argparse.Namespace) -> int:
@@ -177,9 +293,23 @@ def run_convert(args: argparse.Namespace) -> int:
         else:
             config.use_llm = True
     out_dir = Path(args.out).resolve()
-    llm = build_llm_client(config)
+    try:
+        controller = _start_run_controller(out_dir, config, args)
+    except (RunClosed, ValueError) as exc:
+        raise SystemExit(f'cannot start bounded run: {exc}') from exc
+    raw_llm = build_llm_client(config)
+    llm = (
+        BudgetedLLMClient(raw_llm, controller)
+        if raw_llm is not None
+        else None
+    )
     if config.use_llm and llm is None:
         if nl_only:
+            reason = (
+                f'NL-only generation requires an LLM: '
+                f'{missing_llm_reason(config)}'
+            )
+            controller.finish(RunStatus.BLOCKED, reason)
             raise SystemExit(f"NL-only generation requires an LLM: {missing_llm_reason(config)}")
         print(
             f"--use-llm requested but the LLM path is unavailable: {missing_llm_reason(config)}; "
@@ -195,9 +325,20 @@ def run_convert(args: argparse.Namespace) -> int:
     if nl_only:
         try:
             reference = generate_reference_c(config.nl_spec, config.top, llm)
+        except RunBudgetExceeded as exc:
+            controller.finish(RunStatus.EXHAUSTED, str(exc))
+            raise SystemExit(f'NL-only reference generation exhausted its budget: {exc}') from exc
         except ReferenceGenerationError as exc:
+            controller.finish(
+                RunStatus.BLOCKED,
+                f'NL-only reference generation backend failed: {exc}',
+            )
             raise SystemExit(f"NL-only reference generation failed (LLM backend error): {exc}")
         if not reference:
+            controller.finish(
+                RunStatus.FAILED,
+                'model returned no usable golden C reference',
+            )
             raise SystemExit(
                 "the model did not return a usable golden C reference from the spec; "
                 "retry or refine --spec/--spec-file"
@@ -228,7 +369,21 @@ def run_convert(args: argparse.Namespace) -> int:
             )
     generated = None
     if llm is not None and config.use_llm and config.llm_candidates > 1:
-        generated, scores = select_best_candidate(out_dir, analysis, config, llm)
+        try:
+            generated, scores = select_best_candidate(out_dir, analysis, config, llm)
+        except RunBudgetExceeded as exc:
+            _permit_optional_llm_fallback(
+                controller,
+                exc,
+                'candidate generation',
+            )
+            print(
+                f'LLM candidate budget exhausted ({exc}); using the '
+                'deterministic generator.',
+                file=sys.stderr,
+            )
+            generated = generate_hls_sources(analysis, config, llm=None)
+            scores = []
         if scores:
             (out_dir / "candidate_scores.json").parent.mkdir(parents=True, exist_ok=True)
             (out_dir / "candidate_scores.json").write_text(
@@ -245,7 +400,16 @@ def run_convert(args: argparse.Namespace) -> int:
                 "fell back to the conservative deterministic copy."
             )
     if generated is None:
-        generated = generate_hls_sources(analysis, config, llm=llm)
+        try:
+            generated = generate_hls_sources(analysis, config, llm=llm)
+        except RunBudgetExceeded as exc:
+            _permit_optional_llm_fallback(controller, exc, 'HLS generation')
+            print(
+                f'LLM generation budget exhausted ({exc}); using the '
+                'deterministic generator.',
+                file=sys.stderr,
+            )
+            generated = generate_hls_sources(analysis, config, llm=None)
     project = write_project(out_dir, analysis, generated, config)
     clear_repair_audit(out_dir)
     repair_history = []
@@ -254,7 +418,20 @@ def run_convert(args: argparse.Namespace) -> int:
         from .equivalence import VerificationState
 
         state = VerificationState()
-        write_reports(project, analysis, generated, config, state, 0, repair_history)
+        controller.finish(
+            RunStatus.BLOCKED,
+            'static diagnostics contain errors; manual input is required',
+        )
+        write_reports(
+            project,
+            analysis,
+            generated,
+            config,
+            state,
+            0,
+            repair_history,
+            run_control=controller.snapshot(),
+        )
         print(f"Static analysis failed; report written to {out_dir / 'conversion_report.md'}", file=sys.stderr)
         return 1
 
@@ -264,30 +441,108 @@ def run_convert(args: argparse.Namespace) -> int:
     seen_signatures = {_project_signature(out_dir)}
     for iteration in range(iterations):
         completed_iterations = iteration + 1
+        source_signature = _project_signature(out_dir)
+        try:
+            controller.reserve_attempt(source_signature)
+            if config.run_vitis:
+                controller.reserve_vitis_run()
+        except RunBudgetExceeded as exc:
+            controller.finish(RunStatus.EXHAUSTED, str(exc))
+            state = state or VerificationState()
+            completed_iterations = controller.record.usage.attempts
+            break
         state = verify_project(out_dir, config.run_vitis, verbose=args.verbose, remote=remote)
         status = final_status(state, config.run_vitis, analysis.diagnostics.has_errors)
-        if status == "pass":
+        if status == 'pass':
+            controller.record_verification(source_signature, None)
+            controller.finish(
+                RunStatus.PASSED,
+                'all required verification phases passed',
+            )
             break
-        if completed_iterations >= iterations:
+        failure = failure_fingerprint(state)
+        repeat_count = controller.record_verification(
+            source_signature,
+            failure,
+        )
+        if repeat_count > 1:
+            controller.finish(
+                RunStatus.EXHAUSTED,
+                'the same source and failure recurred; stopping oscillation',
+            )
             break
         if not config.auto_repair:
+            controller.finish(
+                RunStatus.FAILED,
+                'verification failed and automatic repair is disabled',
+            )
             if args.verbose:
-                print("Automatic repair is disabled; bring Vitis/CoSim evidence back with the repair command.")
+                print(
+                    'Automatic repair is disabled; bring Vitis/CoSim evidence '
+                    'back with the repair command.'
+                )
             break
-        repair = repair_project(out_dir, analysis, config, state, completed_iterations, llm=llm)
+        if completed_iterations >= iterations:
+            controller.finish(
+                RunStatus.EXHAUSTED,
+                'verification-attempt budget reached without a pass',
+            )
+            break
+        try:
+            repair = repair_project(
+                out_dir,
+                analysis,
+                config,
+                state,
+                completed_iterations,
+                llm=llm,
+            )
+        except RunBudgetExceeded as exc:
+            _permit_optional_llm_fallback(controller, exc, 'project repair')
+            print(
+                f'LLM repair budget exhausted ({exc}); trying only safe '
+                'deterministic repairs.',
+                file=sys.stderr,
+            )
+            repair = repair_project(
+                out_dir,
+                analysis,
+                config,
+                state,
+                completed_iterations,
+                llm=None,
+            )
         repair_history.append(repair)
         if args.verbose:
             print(f"Repair iteration {completed_iterations}: {repair.summary}")
         if not repair.changed:
+            controller.finish(
+                RunStatus.FAILED,
+                'no safe repair changed the failing project',
+            )
             break
         signature = _project_signature(out_dir)
         if signature in seen_signatures:
+            controller.finish(
+                RunStatus.EXHAUSTED,
+                'repair returned to a previously seen project state',
+            )
             if args.verbose:
                 print("Repair reproduced a previously seen project state; stopping to avoid oscillation.")
             break
         seen_signatures.add(signature)
     assert state is not None
-    write_reports(project, analysis, generated, config, state, completed_iterations, repair_history)
+    completed_iterations = controller.record.usage.attempts
+    write_reports(
+        project,
+        analysis,
+        generated,
+        config,
+        state,
+        completed_iterations,
+        repair_history,
+        run_control=controller.snapshot(),
+    )
     status = final_status(state, config.run_vitis, analysis.diagnostics.has_errors)
     if args.verbose:
         print(f"Report: {out_dir / 'conversion_report.md'}")
@@ -467,6 +722,45 @@ def run_optimize(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_status(args: argparse.Namespace) -> int:
+    project_dir = Path(args.project).expanduser().resolve()
+    ledger = RunLedger(project_dir / RUN_LEDGER_FILENAME)
+    try:
+        record = ledger.latest(args.run_id)
+    except ValueError as exc:
+        raise SystemExit(f'cannot read run ledger: {exc}') from exc
+    if record is None:
+        target = f' for run {args.run_id!r}' if args.run_id else ''
+        raise SystemExit(
+            f'no bounded-run state found{target} in {project_dir}'
+        )
+    snapshot = snapshot_for_record(record, ledger.path)
+    if args.json:
+        print(json.dumps(snapshot, indent=2, sort_keys=True))
+        return 0
+    usage = snapshot['usage']
+    budget = snapshot['budget']
+    run_id = snapshot['run_id']
+    status = snapshot['status']
+    reason = snapshot['reason'] or '-'
+    elapsed = snapshot['elapsed_seconds']
+    print(f'Run: {run_id}')
+    print(f'Status: {status}')
+    print(f'Reason: {reason}')
+    attempts = usage['attempts']
+    max_attempts = budget['max_attempts']
+    llm_calls = usage['llm_calls']
+    max_llm_calls = budget['max_llm_calls']
+    vitis_runs = usage['vitis_runs']
+    max_vitis_runs = budget['max_vitis_runs']
+    max_wall_seconds = budget['max_wall_seconds']
+    print(f'Attempts: {attempts}/{max_attempts}')
+    print(f'LLM calls: {llm_calls}/{max_llm_calls}')
+    print(f'Vitis runs: {vitis_runs}/{max_vitis_runs}')
+    print(f'Elapsed: {elapsed}/{max_wall_seconds} seconds')
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -476,6 +770,8 @@ def main(argv: list[str] | None = None) -> int:
         return run_repair(args)
     if args.command == "optimize":
         return run_optimize(args)
+    if args.command == 'status':
+        return run_status(args)
     parser.error(f"unknown command {args.command}")
     return 2
 
