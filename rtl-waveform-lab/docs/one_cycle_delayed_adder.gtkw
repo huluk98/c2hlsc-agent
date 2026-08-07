@@ -1,0 +1,30 @@
+[*] GTKWave Analyzer save file
+[timestart] 0
+[size] 1280 720
+[pos] -1 -1
+*-15.000000 0 110000 110000 110000 110000
+[treeopen] tb_one_cycle_delayed_adder.
+[sst_width] 260
+[signals_width] 260
+[sst_expanded] 1
+[sst_vpaned_height] 220
+@28
+tb_one_cycle_delayed_adder.clk
+tb_one_cycle_delayed_adder.rst
+[blank]
+tb_one_cycle_delayed_adder.in_valid
+@22
+tb_one_cycle_delayed_adder.a[7:0]
+tb_one_cycle_delayed_adder.b[7:0]
+[blank]
+@28
+tb_one_cycle_delayed_adder.out_valid
+@22
+tb_one_cycle_delayed_adder.sum[8:0]
+[blank]
+@28
+tb_one_cycle_delayed_adder.expected_pending_valid
+@22
+tb_one_cycle_delayed_adder.expected_pending_sum[8:0]
+[pattern_trace] 1
+[pattern_trace] 0
