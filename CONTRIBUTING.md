@@ -33,6 +33,8 @@ Maintainers should protect `main` by requiring a pull request, one approval from
 
 ## Define and claim work
 
+Start from the pinned [Team Work Queue #12](https://github.com/huluk98/c2hlsc-agent/issues/12). Each Team work item is a separate linked sub-issue, receives the team-work and status:todo labels, and remains the canonical record for its scope and handoff.
+
 Create a **Team work item** issue before implementation. Record:
 
 - the observable outcome and acceptance criteria;
@@ -53,7 +55,7 @@ gh pr list --state open
 git branch --remotes
 ```
 
-Issue assignment is the ownership lock. Add a claim comment containing the branch name, short plan, and expected files. If another owner or PR already covers the behavior, stop and agree on a split or sequence.
+Issue assignment is the ownership lock. Add a claim comment containing the branch name, short plan, and expected files, then replace status:todo with status:in-progress. Use status:review when the draft PR is ready for review and status:blocked only with a named blocker. If another owner or PR already covers the behavior, stop and agree on a split or sequence.
 
 ## Start an owned branch
 

@@ -1,5 +1,9 @@
 # Training three contributors to work with Codex and GitHub
 
+Begin every planning session at the pinned
+[Team Work Queue #12](https://github.com/huluk98/c2hlsc-agent/issues/12), then open
+or update its linked child work items.
+
 This guide gives a team lead a repeatable way to teach three people to collaborate on `c2hlsc-agent` without duplicating work, overwriting local changes, or overstating verification evidence.
 
 The objective is not to make three machines behave like one shared folder. The objective is to give three independent contributors one visible queue, one owner per task, one integration path, and one evidence standard.

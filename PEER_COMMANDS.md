@@ -72,12 +72,23 @@ checkout. Resolve any mismatch before starting work.
 
 ## 2. Create or claim one work item
 
+Start at the pinned shared queue:
+
+https://github.com/huluk98/c2hlsc-agent/issues/12
+
 Create a Team work item from:
 
 https://github.com/huluk98/c2hlsc-agent/issues/new/choose
 
 The issue must contain the outcome, acceptance criteria, non-goals, expected
-files, evidence tiers, dependencies, and one owner.
+files, evidence tiers, dependencies, and one owner. The form automatically adds
+the team-work and status:todo labels.
+
+Link the new issue under the shared queue:
+
+~~~bash
+gh issue edit 12 --add-sub-issue ISSUE_NUMBER
+~~~
 
 Before claiming it:
 
@@ -92,7 +103,7 @@ git branch --remotes
 If the issue is unassigned and does not overlap existing work:
 
 ~~~bash
-gh issue edit ISSUE_NUMBER --add-assignee '@me'
+gh issue edit ISSUE_NUMBER --add-assignee '@me' --remove-label 'status:todo' --add-label 'status:in-progress'
 gh issue comment ISSUE_NUMBER --body 'Claimed by @GITHUB_USER. Branch: work/ISSUE_NUMBER-GITHUB_USER-SHORT_SLUG. Expected files: PATHS.'
 ~~~
 
@@ -194,9 +205,18 @@ Open a draft PR in the browser so the repository template is available:
 gh pr create --draft --base main --web
 ~~~
 
+After the draft PR exists:
+
+~~~bash
+gh issue edit ISSUE_NUMBER --remove-label 'status:in-progress' --add-label 'status:review'
+~~~
+
 In the PR, include Closes #ISSUE_NUMBER, the owner, scope, non-goals, changed
 files, commands actually run, evidence or artifact paths, unavailable tools,
 overlap, risks, and the next action.
+
+If work cannot proceed, replace the current status with status:blocked and add
+a comment naming the blocker, required input, and owner of the next action.
 
 ## 7. Safe daily synchronization
 

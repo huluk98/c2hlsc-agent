@@ -1,12 +1,12 @@
 name: Team work item
 description: Claim a focused change with an owner, boundaries, and evidence plan.
 title: '[Work] '
-labels: []
+labels: ['team-work', 'status:todo']
 body:
   - type: markdown
     attributes:
       value: |
-        Use one issue per independently reviewable outcome. Assign one primary owner before implementation starts.
+        Use one issue per independently reviewable outcome. Assign one primary owner before implementation starts, then link this issue under Team Work Queue #12.
 
   - type: input
     id: owner
