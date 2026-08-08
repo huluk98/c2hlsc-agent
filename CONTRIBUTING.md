@@ -14,6 +14,11 @@ Rotate these responsibilities between the three contributors:
 
 One person owns an issue at a time. Parallel implementation requires explicit subissues with dependencies and non-overlapping files or interfaces.
 
+Use the repeating sequence A/B/C = owner/reviewer/integrator, then B/C/A,
+then C/A/B. Record all three usernames in the issue. The reviewer supplies the
+non-author approval; the integrator checks and performs the merge. No person
+approves their own change.
+
 ## One-time contributor setup
 
 ```text
@@ -29,7 +34,16 @@ python -m unittest discover -s tests
 
 Read `AGENTS.md`, this file, `PEER_COMMANDS.md`, `PEER_COLLABORATION_TRAINING.md`, and the README sections related to your task. Do not install the optional Anthropic SDK merely to make ordinary CI pass; the offline deterministic and fallback paths are intentional test coverage.
 
-Maintainers should protect `main` by requiring a pull request, one approval from someone other than the owner, passing CI, resolved conversations, and no force pushes or branch deletion. Prefer squash merges.
+For Codex work, invoke `$coordinate-team-work`. The repository's project
+agents separate read-only coordination, bounded implementation, and read-only
+verification; copy-ready requests are in `CODEX_TEAM_PROMPTS.md`.
+
+Maintainers protect `main` by requiring the stable `ci` check, one
+non-author approval for the latest reviewable push, stale-review dismissal,
+resolved conversations, and current branches. Protection applies to
+administrators and blocks force pushes and branch deletion. Prefer squash
+merges and keep repository auto-merge disabled. Verify the live policy with
+`python scripts/verify_github_guardrails.py` or `python3` on Ubuntu.
 
 ## Define and claim work
 
@@ -78,6 +92,13 @@ Never commit implementation work to `main`. Never reuse another contributor's br
 - Push meaningful checkpoints so the team can see and recover the work.
 - Open a draft PR after the first meaningful commit and include `Closes #<issue>`.
 - Do not commit secrets, provider credentials, licensed-tool credentials, local Vitis paths, ignored build outputs, or machine-specific result folders.
+
+Controller and repair work must keep finite attempts, timeouts, worker caps,
+durable checkpoints, and repeated-state detection. When a run stops, preserve
+its immutable budget, fingerprints, latest candidate, sanitized logs, and
+dead-letter state. Report `blocked` or `exhausted` in the owning issue using
+the repository skill's controller handoff; a human decides whether scope or
+budget changes in a follow-up. Never hide extra retries in a resume.
 
 ## Verification tiers
 
@@ -138,7 +159,7 @@ A push does not alter another person's files. A merge updates shared `origin/mai
 
 ## Review, merge, and handoff
 
-The reviewer checks issue alignment, duplicate work, architecture boundaries, tests, evidence, optional-provider behavior, Vitis and RTL claims, secrets, generated artifacts, and outstanding risks. The owner addresses feedback on the same branch. The integrator squash-merges only after required approval, CI, and resolved conversations.
+The reviewer checks issue alignment, duplicate work, architecture boundaries, tests, evidence, optional-provider behavior, Vitis and RTL claims, secrets, generated artifacts, and outstanding risks. The owner addresses feedback on the same branch. The integrator squash-merges only after stable `ci`, a non-author approval covering the latest reviewable push, resolved conversations, and successful guardrail readback. The integrator does not bypass protection or enable auto-merge.
 
 Every owner ends with:
 

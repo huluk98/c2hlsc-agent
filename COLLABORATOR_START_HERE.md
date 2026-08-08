@@ -14,6 +14,7 @@ a time. Never paste this whole document into a terminal.
 - Create a work item: https://github.com/huluk98/c2hlsc-agent/issues/new/choose
 - Open team work: https://github.com/huluk98/c2hlsc-agent/issues?q=is%3Aissue%20is%3Aopen%20label%3Ateam-work
 - Open pull requests: https://github.com/huluk98/c2hlsc-agent/pulls?q=is%3Apr%20is%3Aopen
+- Copy-ready Codex prompts: [CODEX_TEAM_PROMPTS.md](CODEX_TEAM_PROMPTS.md)
 
 ## The shared mental model
 
@@ -58,6 +59,35 @@ applied safely.
 
 Rotate the roles so all three contributors learn the complete workflow.
 
+Use this exact three-issue rotation and record it in each issue:
+
+| Work item | Owner | Reviewer | Integrator |
+| --- | --- | --- | --- |
+| Round 1 | Person A | Person B | Person C |
+| Round 2 | Person B | Person C | Person A |
+| Round 3 | Person C | Person A | Person B |
+
+Repeat the cycle. The reviewer supplies the required non-author approval. The
+integrator performs the guarded merge and may not approve their own change.
+Add one issue comment: `Rotation: owner @USER; reviewer @USER; integrator @USER.`
+
+## Invite peers and add CODEOWNERS later
+
+The repository owner invites each real GitHub username under **Settings >
+Collaborators** and grants the minimum role needed to push branches and review
+pull requests. Do not share one account or token.
+
+This repository intentionally does not hard-code placeholder usernames in
+`.github/CODEOWNERS`. After both peer usernames are known and have accepted
+their invitations, create a separate reviewed PR containing, for example:
+
+~~~text
+* @OWNER_USERNAME @PEER_ONE_USERNAME @PEER_TWO_USERNAME
+~~~
+
+Then decide whether to enable required code-owner review. The existing
+non-author approval rule works before CODEOWNERS exists.
+
 ## Shared issue lifecycle
 
 | State | Meaning | Required action |
@@ -98,25 +128,27 @@ On Linux, macOS, or WSL:
 ~~~bash
 python3 -m pip install -r requirements.txt
 python3 -m pip install -e .
-python3 -m unittest discover -s tests
+bash scripts/team_preflight.sh --run-tests
 ~~~
 
 On native Windows PowerShell:
 
 ~~~powershell
-py -m pip install -r requirements.txt
-py -m pip install -e .
-py -m unittest discover -s tests
+python -m pip install -r requirements.txt
+python -m pip install -e .
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\team_preflight.ps1 -RunTests
 ~~~
 
-GitHub Actions runs on Ubuntu. If native Windows exposes platform-specific path
-or Makefile behavior, record it accurately and run the CI-equivalent suite in
-Linux or WSL. Do not modify unrelated runtime code without an assigned issue.
+If `python` is unavailable on Windows, substitute `py -3`. Native Windows
+and Ubuntu are both expected to pass the offline suite. GitHub Actions supplies
+the Ubuntu check; Windows contributors should still run the native PowerShell
+preflight rather than treating WSL as a substitute.
 
 Open the repository folder in Codex and paste:
 
 ~~~text
-Read AGENTS.md and COLLABORATOR_START_HERE.md. Do not edit anything.
+Use $coordinate-team-work to onboard me. Read AGENTS.md and
+COLLABORATOR_START_HERE.md. Do not edit anything.
 
 Report:
 1. repository root;
@@ -206,14 +238,16 @@ Never reuse another person's branch or implement on main.
 Paste this into Codex after replacing the placeholders:
 
 ~~~text
-Coordinate and implement GitHub issue #ISSUE_NUMBER in
+Use $coordinate-team-work to coordinate and implement GitHub issue #ISSUE_NUMBER in
 huluk98/c2hlsc-agent as @GITHUB_USER.
 
 Outcome: SHORT_OUTCOME
 Expected files: EXPECTED_PATHS
 Required evidence: REQUIRED_EVIDENCE_TIERS
 
-Follow AGENTS.md and COLLABORATOR_START_HERE.md.
+Follow AGENTS.md and COLLABORATOR_START_HERE.md. Use the read-only
+coordination_explorer before the bounded_implementer; use the
+verification_reviewer before handoff. Do not recursively delegate.
 
 First perform a read-only collaboration preflight:
 1. Identify the authenticated GitHub user, repository, current branch,
@@ -377,8 +411,13 @@ The integrator verifies approval, conversations, and CI:
 ~~~bash
 gh pr checks PR_NUMBER
 gh pr view PR_NUMBER --comments
-gh pr view PR_NUMBER --json reviewDecision,mergeStateStatus,statusCheckRollup
+gh pr view PR_NUMBER --json reviewDecision,latestReviews,mergeStateStatus,statusCheckRollup
+python scripts/verify_github_guardrails.py
 ~~~
+
+Use `python3` for the last command on Ubuntu when needed. The stable `ci`
+check must pass, one non-author approval must cover the latest reviewable push,
+and all review conversations must be resolved.
 
 Only the authorized integrator merges:
 
@@ -387,7 +426,8 @@ gh pr merge PR_NUMBER --squash --delete-branch
 ~~~
 
 Do not merge with pending or failing checks, missing required evidence,
-unresolved review, or unmet branch protection.
+unresolved review, stale approval, or unmet branch protection. Do not enable
+auto-merge or bypass protection.
 
 The Closes reference closes the child issue automatically. Closed child issues
 are the completed archive beneath Team Work Queue #12.
@@ -517,6 +557,15 @@ Use status:blocked and comment with:
 - the person responsible for the next action; and
 - what work remains safe to do.
 
+For a controller loop, also record the immutable attempt budget, last
+checkpoint, source and failure fingerprints, cycle detection, latest candidate,
+sanitized log or dead-letter path, and completed evidence. Use `exhausted`
+when the finite budget or repeated-state guard ends the run; use
+`status:blocked` on the issue while a human decides the next scope. Copy the
+exact format from
+`.agents/skills/coordinate-team-work/references/controller-handoffs.md`.
+Never restart with hidden extra attempts or erase resume history.
+
 ## Team-lead readiness checklist
 
 Before unsupervised collaboration, each person should demonstrate:
@@ -529,12 +578,14 @@ Before unsupervised collaboration, each person should demonstrate:
 - a draft PR with actual evidence;
 - a review that catches an unsupported claim;
 - a complete handoff;
+- a correctly classified blocked or exhausted controller handoff;
 - a safe merge by the integrator; and
 - a clean post-merge synchronization.
 
 ## Deeper references
 
 - Repository rules: [AGENTS.md](AGENTS.md)
+- Copy-ready Codex requests: [CODEX_TEAM_PROMPTS.md](CODEX_TEAM_PROMPTS.md)
 - Contribution policy: [CONTRIBUTING.md](CONTRIBUTING.md)
 - Copy-and-run command reference: [PEER_COMMANDS.md](PEER_COMMANDS.md)
 - Training exercises and coaching: [PEER_COLLABORATION_TRAINING.md](PEER_COLLABORATION_TRAINING.md)

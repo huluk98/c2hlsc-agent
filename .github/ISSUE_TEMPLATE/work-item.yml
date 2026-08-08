@@ -17,6 +17,24 @@ body:
     validations:
       required: true
 
+  - type: input
+    id: reviewer
+    attributes:
+      label: Reviewer
+      description: The non-author teammate responsible for review and approval.
+      placeholder: GitHub username
+    validations:
+      required: true
+
+  - type: input
+    id: integrator
+    attributes:
+      label: Integrator
+      description: The teammate responsible for guardrail verification and merge.
+      placeholder: GitHub username
+    validations:
+      required: true
+
   - type: textarea
     id: outcome
     attributes:
@@ -88,6 +106,15 @@ body:
       label: Dependencies and possible overlap
       description: Link related issues or pull requests and identify shared files.
       placeholder: 'Depends on #...; may overlap with #...'
+
+  - type: textarea
+    id: loop_plan
+    attributes:
+      label: Loop, retry, and handoff plan
+      description: For controller or batch work, state finite attempts, timeouts, worker cap, checkpoints, repeated-state rule, and blocked/exhausted handoff. Enter Not applicable for ordinary work.
+      placeholder: Attempts, timeout, workers, checkpoint, fingerprint, terminal handoff...
+    validations:
+      required: true
 
   - type: checkboxes
     id: coordination

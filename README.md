@@ -568,7 +568,11 @@ reusable Codex prompts in
 [PEER_COLLABORATION_TRAINING.md](PEER_COLLABORATION_TRAINING.md). For a compact sheet
 that teammates can copy and run, use [PEER_COMMANDS.md](PEER_COMMANDS.md). Codex
 sessions inherit the repository-specific engineering and evidence rules in
-[AGENTS.md](AGENTS.md).
+[AGENTS.md](AGENTS.md). Copy a complete request from
+[CODEX_TEAM_PROMPTS.md](CODEX_TEAM_PROMPTS.md); it invokes the repository-local
+`$coordinate-team-work` skill and its bounded project agents. Native Windows
+and Ubuntu preflight commands live in `scripts/team_preflight.ps1` and
+`scripts/team_preflight.sh`.
 
 ## Install
 

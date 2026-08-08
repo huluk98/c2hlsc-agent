@@ -1,0 +1,4 @@
+interface:
+  display_name: "Coordinate Team Work"
+  short_description: "Coordinate safe issue-to-PR teamwork"
+  default_prompt: "Use $coordinate-team-work to coordinate this repository task safely from issue claim through handoff."

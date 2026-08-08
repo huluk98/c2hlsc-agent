@@ -1,1 +1,5 @@
 blank_issues_enabled: false
+contact_links:
+  - name: Team Work Queue
+    url: https://github.com/huluk98/c2hlsc-agent/issues/12
+    about: Check ownership and overlap before creating another work item.

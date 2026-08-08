@@ -11,11 +11,14 @@
 - Vitis C/RTL CoSim checks generated HLS-C against generated RTL; it is not by itself proof that the original C and RTL are equivalent. Preserve the host golden-C comparison and the full evidence chain.
 - Do not claim latency, area, timing, power, or comparative QoR without fresh reports from a named tool, version, target, clock, and flow.
 - Preserve repair and transformation audit records. Do not hide a failed phase, oscillation rejection, deterministic fallback, or unavailable backend.
+- Keep every autonomous loop bounded by explicit attempts, timeouts, worker caps, durable checkpoints, and repeated-state detection. Preserve immutable retry budgets across resume and hand `blocked` or `exhausted` runs to a human.
 - Never commit API keys, provider tokens, licensed-tool credentials, machine-specific Vitis paths, generated `build/` output, or local dataset results unless an issue explicitly defines a reviewed artifact policy.
 
 ## Team collaboration
 
 - Use COLLABORATOR_START_HERE.md as the self-contained onboarding and operational entry point for human and Codex contributors.
+- Use the repository skill `$coordinate-team-work` for onboarding, issue work, synchronization, review, blocked-run handoff, and merge-readiness tasks. Copy-ready user prompts are in `CODEX_TEAM_PROMPTS.md`.
+- Project agents are deliberately narrow: `coordination_explorer` and `verification_reviewer` are read-only; `bounded_implementer` may edit only after preflight passes. They do not publish GitHub state or recursively spawn agents. The parent agent owns Git and GitHub writes.
 - Treat pinned GitHub issue #12 and its linked sub-issues as the shared work queue. Every implementation issue must carry the team-work label and exactly one current status label until it closes.
 - Read `CONTRIBUTING.md` and `PEER_COMMANDS.md`. Use `PEER_COLLABORATION_TRAINING.md` for onboarding exercises and coaching.
 - Treat GitHub `origin` as the shared source of truth. Local clones and Codex worktrees are isolated working copies, not live-synchronized folders.
@@ -27,7 +30,8 @@
 - If another issue or pull request overlaps, stop before editing and propose a scope split, dependency order, or explicit handoff.
 - Open a draft pull request after the first meaningful commit. Link the issue with `Closes #<issue>` and update the issue and PR when scope changes.
 - Fetch before synchronization. Fast-forward a clean local `main`; merge fresh `origin/main` into a published feature branch without rewriting its history.
-- Require CI and at least one teammate review before merge. Prefer squash merge and do not self-merge unless repository policy explicitly permits it.
+- Require the stable `ci` check, at least one non-author approval, approval of the latest reviewable push, and resolved conversations before merge. Prefer squash merge, never use auto-merge for this workflow, and do not bypass branch protection.
+- Prefer native PowerShell, Git, GitHub CLI, and Python on Windows. Ubuntu contributors use the equivalent Bash and `python3` commands; do not require WSL for a Windows checkout.
 
 ## Required checks and output
 
