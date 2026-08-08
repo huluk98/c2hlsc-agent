@@ -15,10 +15,13 @@ does:
 - **Everything else is a point estimate, not an effect.** The planner moves the score by one
   design. Repair rounds past the first are flat. Blind retry (`evidence=none`) loses five designs
   — the second-largest gap in the table — and is *still* not significant at Holm p=0.750.
-- **The upper bound on richer evidence is zero.** `evidence=oracle`, which may see where the
+- **Richer evidence was not tested, despite an arm that looks like it was.** `evidence=oracle`, which may see where the
   candidate diverges from the reference RTL, produced **identical outcomes on all 13 designs** as
-  the plain log tail. Whatever the loop is worth, none of it is waiting behind better failure
-  evidence.
+  the plain log tail — but auditing what it actually delivered shows the treatment was nearly
+  empty: the `expected` line it revealed was RTLLM's pass banner rather than a concrete expected
+  *value*, and on three designs the channel never fired at all. A null result from a near-null
+  treatment bounds nothing. The narrower true finding: a first-divergence **stdout** diff is
+  worthless on this benchmark, because these testbenches print a verdict, not a value trace.
 
 So the honest summary is narrow: *having a repair loop* is worth a great deal and is proven here;
 *how the loop is configured* — planner, evidence channel, round count — is not distinguishable at
@@ -78,13 +81,15 @@ Read the "what the agent is shown" column literally and the ladder is cumulative
 except `none` begins with `logs`.** `self` is not an alternative to `logs`, it is `logs` plus one
 extra channel. So although `self`'s extra channel really is self-derived — it is the candidate's
 own signals, simulated from an instrumented copy — the policy as a whole still forwards the
-benchmark testbench's transcript verbatim, and on **13 of the 50** RTLLM v2 testbenches that
+benchmark testbench's transcript verbatim, and on **11 of the 50** RTLLM v2 testbenches that
 transcript prints the expected value outright in the failing `$display`. (Criterion: a `$display`
 whose format string names an expected/golden/reference value *and* interpolates it with a format
 specifier — `adder_bcd`, `radix2_div`, `multi_8bit`, `multi_pipe_8bit`, `fixed_point_adder`,
-`fixed_point_substractor`, `sub_64bit`, `ring_counter`, `LFSR`, `freq_divbyeven`, `freq_divbyfrac`,
-`freq_divbyodd`, `instr_reg`. No testbench leaks a purely literal expected value that this
-criterion would miss.)
+`fixed_point_substractor`, `sub_64bit`, `ring_counter`, `freq_divbyeven`, `freq_divbyfrac`,
+`freq_divbyodd`, `instr_reg`. `LFSR` and `multi_pipe_8bit` were on an earlier version of this
+list and are **not** leakers: their expected-value `$display` is commented out and can never
+print. Within the 13-design ablation subset the leak therefore touches **4** designs, not 5.
+No testbench leaks a purely literal expected value that this criterion would miss.)
 
 That makes **`none` the only evidence policy in the strict track**, and it is a floor, not a
 shippable configuration. `scripts/run_ablation.py` originally filed `self` as strict on the strength
@@ -188,7 +193,7 @@ All arms ran the same 13 designs. The `significance` column is the verdict; the 
 
 - **The repair loop is the one demonstrated ingredient.** With no repair at all (`rounds=0`) the score is 1/13 against the baseline's 10/13 — 9 discordant designs, all in the same direction, Holm p=0.027. This is the only comparison in the matrix that clears the corrected bar, and it clears it exactly at the floor. Everything the loop scores on this subset, the loop earned: the generator alone recovers almost none of it.
 - **Repair works by diagnosis, not by resampling — but this arm does not prove it.** Blind retry (`evidence=none`) keeps the retries and removes the evidence, and scores 5/13 against 10/13. The point estimate is large (-38.5 pp) and the direction is the expected one, but at 7 discordant (+1/-6) it is Holm p=0.750 and **not significant**. It is the second-largest effect in the table and still cannot be claimed.
-- **The upper-bound evidence channel adds literally nothing.** `evidence=oracle` is allowed to see where the candidate's output first diverges from the *reference RTL* — an advantage no shippable system has — and it produced **identical outcomes on all 13 designs** as the baseline (10/13). Zero discordant. This is the most useful negative result here: it bounds how much of the score could possibly be attributed to richer failure evidence, and the bound is zero.
+- **The upper-bound evidence channel adds literally nothing.** `evidence=oracle` is allowed to see where the candidate's output first diverges from the *reference RTL* — an advantage no shippable system has — and it produced **identical outcomes on all 13 designs** as the baseline (10/13). Zero discordant. **Read this as a fact about RTLLM's testbenches, not as a bound on richer evidence in general.** Auditing what the channel actually delivered: on every design where it fired, the `expected` line it revealed was the testbench's pass banner (`===========Your Design Passed===========`) rather than a concrete expected *value*; on three designs the round-0 candidate did not compile, so the channel was gated off entirely; and on one the candidate's own log already printed the expected value. The treatment was therefore close to empty, and a null result from a near-null treatment bounds nothing. What this arm does establish is narrower and still useful: a first-divergence *stdout* diff is worthless on this benchmark, because these testbenches print a verdict banner instead of a value trace. An evidence channel carrying real expected-vs-actual values is untested.
 - **`evidence=self` is the nominal top scorer and should not be read as one.** It scores 11/13 against 10/13 — a one-design difference, which is 7.7 pp and this experiment's noise floor. It is also not a strict-track arm (§1), so it is not a candidate for a headline configuration even if the difference were real.
 - **Returns past the first repair round are flat.** `rounds=1` scores 8/13, the baseline (`rounds=2`) 10/13, `rounds=3` 10/13. The jump is from 0 rounds to 1; after that the curve is level within noise, which is the argument for leaving the default at 2 rather than raising it.
 - **The planner is not measurable here.** `no-plan` scores 9/13 against 10/13 — one design, one discordant. Nothing in this matrix supports keeping or dropping it.
@@ -216,12 +221,12 @@ Two columns, and the left one is the one that matters. **`reached the oracle`** 
 | LLM | `golden_c_tu` | 0 | **12/12** | 1/12 | `runs/abl_llm_staged_r0` |
 | LLM | `golden_c_tu` | 1 | **12/12** | 8/12 | `runs/chstone_llm_staged` |
 | LLM | `golden_c_tu` | 2 | **12/12** | 9/12 | `runs/abl_llm_staged_r2` |
-
-_Still in flight at the time of writing: `abl_llm_staged_r3`, `abl_llm_legacy_r1`. Re-run `scripts/render_ablation_sections.py` to fill these in._
+| LLM | `golden_c_tu` | 3 | **12/12** | 7/12 | `runs/abl_llm_staged_r3` |
+| LLM | `legacy_inline` | 1 | **3/12** | 0/12 | `runs/abl_llm_legacy_r1` |
 
 ### The findings
 
-**0. The repair loop carries this suite too, and the return is almost all in the first round.** With staging fixed so every benchmark reaches the oracle, the deterministic converter goes **0/12 → 6/12** on the first repair round and then flat (0/12, 6/12, 6/12, 6/12 at 0/1/2/3 rounds); the LLM generator goes **1/12 → 8/12** on the first round (1/12, 8/12, 9/12 at 0/1/2 rounds). This is the same shape as the RTLLM result in §3: generation alone recovers almost nothing, one repair round recovers most of it, and further rounds add little. Note the CHStone repair is largely *mechanical* — `hlsc_repair_agent` applies deterministic fixes before any model is consulted — so this is not a claim about LLM self-correction.
+**0. The repair loop carries this suite too, and the return is almost all in the first round.** With staging fixed so every benchmark reaches the oracle, the deterministic converter goes **0/12 → 6/12** on the first repair round and then flat (0/12, 6/12, 6/12, 6/12 at 0/1/2/3 rounds); the LLM generator goes **1/12 → 8/12** on the first round (1/12, 8/12, 9/12, 7/12 at 0/1/2/3 rounds). This is the same shape as the RTLLM result in §3: generation alone recovers almost nothing and one repair round recovers most of it. Beyond that the curve is not merely flat — the LLM arm *loses* two benchmarks at round 3. This sweep gets no significance test (see 'On significance' below), and at this family size a two-benchmark move is well inside the noise, so read it as 'no evidence that further rounds help', not as evidence that they hurt. Note the CHStone repair is largely *mechanical* — `hlsc_repair_agent` applies deterministic fixes before any model is consulted — so this is not a claim about LLM self-correction.
 
 **1. The dominant CHStone effect is a harness fix, not an agent ingredient.** Moving from `legacy_inline` to `golden_c_tu` staging takes reachability from 3/12 to 12/12 at one repair round. Reporting that as a pass-rate improvement would be wrong twice over: it understates the change (nine benchmarks went from *unmeasured* to *measured*, which is not the same as nine failures becoming passes), and it credits the agent for a defect in the test rig.
 
@@ -261,7 +266,7 @@ discordant designs below which **no arrangement of results can reach significanc
 | correction | family size | minimum discordant designs | what 6 discordant would score |
 | --- | :-: | :-: | --- |
 | none | 1 | **6** | p = 0.031 |
-| Holm | 5 (CHStone) | **8** | p = 0.156 |
+| Holm | 5 (CHStone, **asserted not derived** — see note) | **8** | p = 0.156 |
 | Holm | 7 (RTLLM) | **9** | p = 0.219 |
 
 The verdict this study reports is the **Holm-corrected** one, so the floor that applies to the
@@ -394,7 +399,9 @@ printed floor understated the real bar by three designs, in a document whose ent
 to stop small deltas being over-read.
 
 `min_discordant_for_significance()` now takes the family size and is called with it, giving
-**9** for the seven-arm RTLLM matrix and **8** for the five-arm CHStone one.
+**9** for the seven-arm RTLLM matrix and **8** for the CHStone one.
+
+**Caveat on the CHStone family size.** The RTLLM family size is computed from the arms actually run (`n_tests=len(comparisons)`); the CHStone `m=5` is not — it is written into the prose, while `render_ablation_sections.py::CHSTONE_ARMS` enumerates 13 arms and the table above displays 11, and nothing states which 5 were meant. At the arm count actually run the corrected p for the round sweep would be 0.34 (m=11) to 0.41 (m=13) and the floor would be 10, so the CHStone conclusions get *weaker*, not stronger, under an honest family size. Unlike the RTLLM figures, the CHStone p-values are hardcoded strings in the renderer and so cannot drift-check themselves. Treat every CHStone significance number here as indicative only; the reachability finding stands on its identified mechanism, not on its p-value.
 
 ### 7.3 A leaked-expected-value count was off by one
 

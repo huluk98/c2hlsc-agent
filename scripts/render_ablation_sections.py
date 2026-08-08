@@ -146,9 +146,18 @@ def render_rtllm(report: "dict[str, Any] | None") -> str:
             f"is allowed to see where the candidate's output first diverges from the "
             f"*reference RTL* — an advantage no shippable system has — and it produced "
             f"**identical outcomes on all {d.get('n_paired','?')} designs** as the baseline "
-            f"({orc[0]}/{orc[1]}). Zero discordant. This is the most useful negative result "
-            "here: it bounds how much of the score could possibly be attributed to richer "
-            "failure evidence, and the bound is zero."
+            f"({orc[0]}/{orc[1]}). Zero discordant. **Read this as a fact about RTLLM's "
+            "testbenches, not as a bound on richer evidence in general.** Auditing what the "
+            "channel actually delivered: on every design where it fired, the `expected` line "
+            "it revealed was the testbench's pass banner "
+            "(`===========Your Design Passed===========`) rather than a concrete expected "
+            "*value*; on three designs the round-0 candidate did not compile, so the channel "
+            "was gated off entirely; and on one the candidate's own log already printed the "
+            "expected value. The treatment was therefore close to empty, and a null result "
+            "from a near-null treatment bounds nothing. What this arm does establish is "
+            "narrower and still useful: a first-divergence *stdout* diff is worthless on this "
+            "benchmark, because these testbenches print a verdict banner instead of a value "
+            "trace. An evidence channel carrying real expected-vs-actual values is untested."
         )
     if base and slf:
         notes.append(
@@ -267,8 +276,12 @@ def render_chstone() -> str:
             "first round.** With staging fixed so every benchmark reaches the oracle, "
             + "; ".join(curve)
             + ". This is the same shape as the RTLLM result in §3: generation alone recovers "
-            "almost nothing, one repair round recovers most of it, and further rounds add "
-            "little. Note the CHStone repair is largely *mechanical* — `hlsc_repair_agent` "
+            "almost nothing and one repair round recovers most of it. Beyond that the curve is "
+            "not merely flat — the LLM arm *loses* two benchmarks at round 3. This sweep gets "
+            "no significance test (see 'On significance' below), and at this family size a "
+            "two-benchmark move is well inside the noise, so read it as 'no evidence that "
+            "further rounds help', not as evidence that they hurt. Note the CHStone repair is "
+            "largely *mechanical* — `hlsc_repair_agent` "
             "applies deterministic fixes before any model is consulted — so this is not a "
             "claim about LLM self-correction.",
             "",

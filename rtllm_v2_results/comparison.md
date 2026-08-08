@@ -26,6 +26,13 @@ Basis: the **29 designs** the RTLLM v2.0 archives `_chatgpt35/` and `_chatgpt4/`
 >    design an archive never attempted is out of the denominator entirely rather than
 >    counted as a failure. All columns are recomputed on this same 29-design basis, so the
 >    numbers here will not match the 50-design headline in `report.md`.
+> 5. **One catalogued broken oracle sits inside this basis: `radix2_div`.** The benchmark's own
+>    verified RTL fails its testbench, which is exactly why the reference row reads 28/29 rather
+>    than 29/29. This agent passes it after one repair round, so it *adds* a design to the
+>    after-repair column that the reference cannot score. The round-0 column is unaffected --
+>    `radix2_div` fails at round 0 -- so the single-shot comparison, which is the fair one, does
+>    not depend on it. Subtracting it from both numerator and denominator moves this agent's
+>    after-repair figure by roughly one design.
 
 
 ## The table
