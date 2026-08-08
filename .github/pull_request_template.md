@@ -2,6 +2,8 @@
 
 - Closes:
 - Primary owner:
+- Reviewer:
+- Integrator:
 - Branch:
 
 ## Scope
@@ -44,6 +46,14 @@ Use only the tiers relevant to this change. Record pass, fail, blocked, or skipp
 | Dataset evaluation |  |  |
 | QoR measurement |  |  |
 
+### Bounded-run handoff
+
+- Controller state: not applicable / active / blocked / exhausted
+- Attempt budget and checkpoint:
+- Source/failure fingerprint or cycle:
+- Sanitized log or dead-letter artifact:
+- Required human decision and next owner:
+
 ## Evidence integrity
 
 - [ ] The original C remains the golden reference.
@@ -54,6 +64,7 @@ Use only the tiers relevant to this change. Record pass, fail, blocked, or skipp
 - [ ] Any direct original-C-to-RTL claim has separate direct-RTL evidence.
 - [ ] Any QoR claim includes the target, toolchain, constraints, and report artifact.
 - [ ] No credentials, secrets, machine-specific tool paths, or generated build output are committed.
+- [ ] Every retry loop has finite attempts, timeouts, worker caps, checkpoints, and repeated-state handling where applicable.
 
 ## Sync and handoff
 
@@ -61,3 +72,11 @@ Use only the tiers relevant to this change. Record pass, fail, blocked, or skipp
 - Unresolved decisions:
 - Reviewer should focus on:
 - Safe next action:
+
+## Integration guardrails
+
+- [ ] Stable `ci` check passed.
+- [ ] A non-author approval covers the latest reviewable push.
+- [ ] Review conversations are resolved.
+- [ ] `python scripts/verify_github_guardrails.py` passed.
+- [ ] Auto-merge remains disabled; no protection bypass is requested.

@@ -32,6 +32,19 @@ Rotate the roles after each merged issue so everyone practices the complete work
 
 The reviewer and integrator may be combined during ordinary work, but keep them separate during the first training exercise so all three people remain engaged.
 
+Use a fixed rotation for the first three issues:
+
+| Round | Owner | Reviewer | Integrator |
+| --- | --- | --- | --- |
+| 1 | Person A | Person B | Person C |
+| 2 | Person B | Person C | Person A |
+| 3 | Person C | Person A | Person B |
+
+Repeat the cycle and record the three usernames in each issue. The reviewer
+provides the non-author approval; the integrator checks `ci`, latest-push
+approval, resolved conversations, and branch protection before squash merge.
+Nobody approves their own change.
+
 ## Before the training session
 
 Each person should have:
@@ -43,7 +56,8 @@ Each person should have:
 - `gh auth status` reporting the correct account; and
 - the offline unit suite passing after editable installation.
 
-Baseline commands:
+Baseline commands are maintained in `PEER_COMMANDS.md`. The shortest verified
+entry points are:
 
 ```text
 git clone https://github.com/huluk98/c2hlsc-agent.git
@@ -54,7 +68,12 @@ gh auth login
 python -m pip install -r requirements.txt
 python -m pip install -e .
 python -m unittest discover -s tests
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\team_preflight.ps1 -RunTests
 ```
+
+Ubuntu contributors use `bash scripts/team_preflight.sh --run-tests` and
+`python3`. Windows contributors use native PowerShell; WSL is optional rather
+than required.
 
 Do not distribute provider API keys or Vitis credentials during onboarding. Ordinary CI is deliberately offline. Optional LLM, Vitis, SSH, dataset, and QoR environments should be added only for people assigned to those evidence tiers.
 
@@ -62,14 +81,14 @@ Do not distribute provider API keys or Vitis credentials during onboarding. Ordi
 
 | Time | Topic | Observable result |
 | --- | --- | --- |
-| 0–10 min | Shared mental model | Everyone can explain commit, push, merge, fetch, and pull. |
-| 10–20 min | Repository evidence model | Everyone distinguishes golden-C host equivalence, Vitis CoSim, direct RTL simulation, and QoR. |
-| 20–35 min | Issue definition and ownership | The team creates one scoped issue and assigns one owner. |
-| 35–50 min | Codex preflight and branch | Codex reports status and overlap before the owner edits. |
-| 50–65 min | Small implementation and draft PR | The owner pushes one focused commit and opens a draft PR. |
-| 65–78 min | Review and evidence handoff | The reviewer checks the diff and evidence using the standard prompt. |
-| 78–87 min | Merge and synchronization | The integrator merges; the other two safely fetch and fast-forward. |
-| 87–90 min | Debrief | Each person names one anti-pattern and one required handoff field. |
+| 0-10 min | Shared mental model | Everyone can explain commit, push, merge, fetch, and pull. |
+| 10-20 min | Repository evidence model | Everyone distinguishes golden-C host equivalence, Vitis CoSim, direct RTL simulation, and QoR. |
+| 20-35 min | Issue definition and ownership | The team creates one scoped issue and assigns one owner. |
+| 35-50 min | Codex preflight and branch | Codex reports status and overlap before the owner edits. |
+| 50-65 min | Small implementation and draft PR | The owner pushes one focused commit and opens a draft PR. |
+| 65-78 min | Review and evidence handoff | The reviewer checks the diff and evidence using the standard prompt. |
+| 78-87 min | Merge and synchronization | The integrator merges; the other two safely fetch and fast-forward. |
+| 87-90 min | Debrief | Each person names one anti-pattern and one required handoff field. |
 
 ## First supervised exercise
 
@@ -173,9 +192,10 @@ The training is complete only when each person can demonstrate:
 ## Prompt 1: start, claim, implement, and open a draft PR
 
 Replace every value in angle brackets.
+The maintained complete prompt set is [CODEX_TEAM_PROMPTS.md](CODEX_TEAM_PROMPTS.md).
 
 ```text
-Coordinate and implement GitHub issue #<ISSUE> for @<GITHUB_USER> in c2hlsc-agent.
+Use $coordinate-team-work to coordinate and implement GitHub issue #<ISSUE> for @<GITHUB_USER> in c2hlsc-agent.
 
 Goal: <SHORT OUTCOME>
 Expected scope: <FILES OR COMPONENTS>

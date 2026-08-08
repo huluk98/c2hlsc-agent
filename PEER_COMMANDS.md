@@ -2,7 +2,9 @@
 
 Send this file to every contributor. It is the command-focused companion to
 [CONTRIBUTING.md](CONTRIBUTING.md) and
-[PEER_COLLABORATION_TRAINING.md](PEER_COLLABORATION_TRAINING.md).
+[PEER_COLLABORATION_TRAINING.md](PEER_COLLABORATION_TRAINING.md). Copy-ready
+Codex requests are in [CODEX_TEAM_PROMPTS.md](CODEX_TEAM_PROMPTS.md); each one
+invokes the repository's `$coordinate-team-work` skill.
 
 Replace every ALL_CAPS placeholder before running a command. Run one section at
 a time; do not paste the entire file into a terminal.
@@ -43,26 +45,26 @@ On Linux, macOS, or WSL:
 ~~~bash
 python3 -m pip install -r requirements.txt
 python3 -m pip install -e .
-python3 -m unittest discover -s tests
+bash scripts/team_preflight.sh --run-tests
 ~~~
 
 On native Windows PowerShell:
 
 ~~~powershell
-py -m pip install -r requirements.txt
-py -m pip install -e .
-py -m unittest discover -s tests
+python -m pip install -r requirements.txt
+python -m pip install -e .
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\team_preflight.ps1 -RunTests
 ~~~
 
-GitHub Actions runs the suite on Ubuntu. If native Windows reports the known
-path-separator or Unix Makefile-clean failures, do not hide them or change
-unassigned runtime code. Record the Windows result and run the CI-equivalent
-suite in Linux or WSL.
+If `python` is unavailable on Windows, substitute `py -3`. Native Windows
+and Ubuntu are both expected to pass. GitHub Actions provides the independent
+Ubuntu result; it does not replace the Windows contributor's native preflight.
 
 Open this repository folder in Codex and paste:
 
 ~~~text
-Read AGENTS.md, CONTRIBUTING.md, and PEER_COMMANDS.md. Do not edit anything.
+Use $coordinate-team-work to onboard me. Read AGENTS.md, CONTRIBUTING.md, and
+PEER_COMMANDS.md. Do not edit anything.
 Report the repository root, current branch, working-tree state, remote, and the
 collaboration and verification rules you loaded.
 ~~~
@@ -121,6 +123,16 @@ gh issue view ISSUE_NUMBER --comments
 gh pr list --state open
 ~~~
 
+Or run the platform helper:
+
+~~~powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\team_preflight.ps1 -Issue ISSUE_NUMBER
+~~~
+
+~~~bash
+bash scripts/team_preflight.sh --issue ISSUE_NUMBER
+~~~
+
 The checkout must be clean. The owner, issue, expected files, and evidence
 scope must agree before implementation begins.
 
@@ -140,7 +152,7 @@ Never reuse another contributor's branch. Never implement directly on main.
 ## 5. Owner prompt to paste into Codex
 
 ~~~text
-Coordinate and implement GitHub issue #ISSUE_NUMBER in
+Use $coordinate-team-work to coordinate and implement GitHub issue #ISSUE_NUMBER in
 huluk98/c2hlsc-agent as @GITHUB_USER.
 
 Outcome: SHORT_OUTCOME
@@ -294,8 +306,13 @@ The integrator verifies approval, resolved conversations, and CI:
 ~~~bash
 gh pr checks PR_NUMBER
 gh pr view PR_NUMBER --comments
-gh pr view PR_NUMBER --json reviewDecision,mergeStateStatus,statusCheckRollup
+gh pr view PR_NUMBER --json reviewDecision,latestReviews,mergeStateStatus,statusCheckRollup
+python scripts/verify_github_guardrails.py
 ~~~
+
+Use `python3` for the guardrail command on Ubuntu when needed. Require the
+stable `ci` check, a non-author approval for the latest reviewable push, and
+resolved conversations.
 
 Only the authorized integrator merges:
 
@@ -304,7 +321,8 @@ gh pr merge PR_NUMBER --squash --delete-branch
 ~~~
 
 Do not merge when checks are pending or failing, required evidence is missing,
-review is unresolved, or branch protection has not been satisfied.
+review is unresolved or stale, or branch protection has not been satisfied.
+Never enable auto-merge or bypass protection.
 
 ## 10. Synchronize after merge
 
