@@ -1,0 +1,129 @@
+name: Team work item
+description: Claim a focused change with an owner, boundaries, and evidence plan.
+title: '[Work] '
+labels: ['team-work', 'status:todo']
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use one issue per independently reviewable outcome. Assign one primary owner before implementation starts, then link this issue under Team Work Queue #12.
+
+  - type: input
+    id: owner
+    attributes:
+      label: Primary owner
+      description: One person accountable for this work item.
+      placeholder: GitHub username
+    validations:
+      required: true
+
+  - type: input
+    id: reviewer
+    attributes:
+      label: Reviewer
+      description: The non-author teammate responsible for review and approval.
+      placeholder: GitHub username
+    validations:
+      required: true
+
+  - type: input
+    id: integrator
+    attributes:
+      label: Integrator
+      description: The teammate responsible for guardrail verification and merge.
+      placeholder: GitHub username
+    validations:
+      required: true
+
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Desired outcome
+      description: Describe the user-visible or engineering result, not just the activity.
+      placeholder: When this is complete...
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: List observable conditions that must be true before merge.
+      placeholder: |
+        - Criterion one
+        - Criterion two
+    validations:
+      required: true
+
+  - type: textarea
+    id: non_goals
+    attributes:
+      label: Non-goals
+      description: State what this issue intentionally will not change.
+      placeholder: Out of scope...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected_files
+    attributes:
+      label: Expected files or components
+      description: Name likely paths or modules so teammates can detect overlap early.
+      placeholder: src/c2hlsc/..., tests/...
+    validations:
+      required: true
+
+  - type: dropdown
+    id: evidence
+    attributes:
+      label: Required evidence
+      description: Select every verification tier needed to support the intended claim.
+      multiple: true
+      options:
+        - Offline unit tests
+        - Host equivalence
+        - Vitis CSim
+        - Vitis CSynth
+        - Vitis C/RTL CoSim
+        - Direct RTL testbench
+        - Dataset evaluation
+        - QoR measurement
+    validations:
+      required: true
+
+  - type: textarea
+    id: toolchain_scope
+    attributes:
+      label: Provider and toolchain scope
+      description: Identify optional LLM providers, compilers, Vitis versions, simulators, datasets, or PPA tools involved.
+      placeholder: Offline only, or exact optional tools and versions...
+    validations:
+      required: true
+
+  - type: textarea
+    id: dependencies
+    attributes:
+      label: Dependencies and possible overlap
+      description: Link related issues or pull requests and identify shared files.
+      placeholder: 'Depends on #...; may overlap with #...'
+
+  - type: textarea
+    id: loop_plan
+    attributes:
+      label: Loop, retry, and handoff plan
+      description: For controller or batch work, state finite attempts, timeouts, worker cap, checkpoints, repeated-state rule, and blocked/exhausted handoff. Enter Not applicable for ordinary work.
+      placeholder: Attempts, timeout, workers, checkpoint, fingerprint, terminal handoff...
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: coordination
+    attributes:
+      label: Coordination check
+      options:
+        - label: I searched open issues and pull requests for overlapping work.
+          required: true
+        - label: This issue has one primary owner, or separate sub-issues will be created.
+          required: true
+        - label: The evidence plan does not claim more than the selected checks can prove.
+          required: true

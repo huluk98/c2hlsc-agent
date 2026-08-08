@@ -33,6 +33,10 @@ class AgentConfig:
     rtl: str = "verilog"
     seed: int = 1
     max_iterations: int = 1
+    max_wall_seconds: int = 14_400
+    max_llm_calls: int = 8
+    max_vitis_runs: int = 8
+    run_id: str | None = None
     auto_repair: bool = False
     keep_going: bool = False
     run_vitis: bool = False
@@ -196,6 +200,10 @@ def load_config(path: Path | None) -> AgentConfig:
         compiler_flags=[str(item) for item in _as_list(data.get("compiler_flags"))],
         top=data.get("top"),
         arguments=arguments,
+        max_wall_seconds=int(data.get('max_wall_seconds', 14_400)),
+        max_llm_calls=int(data.get('max_llm_calls', 8)),
+        max_vitis_runs=int(data.get('max_vitis_runs', 8)),
+        run_id=str(data['run_id']) if data.get('run_id') else None,
         num_tests=int(data.get("num_tests", data.get("random_test_count", 100))),
         directed_tests=[str(item) for item in _as_list(data.get("directed_tests"))] or ["zeros", "ones", "minmax", "alternating"],
         part=str(data.get("part", "xczu7ev-ffvc1156-2-e")),
@@ -240,6 +248,14 @@ def merge_cli_config(config: AgentConfig, args: Any) -> AgentConfig:
         config.seed = int(args.seed)
     if getattr(args, "max_iterations", None) is not None:
         config.max_iterations = int(args.max_iterations)
+    if getattr(args, 'max_wall_seconds', None) is not None:
+        config.max_wall_seconds = int(args.max_wall_seconds)
+    if getattr(args, 'max_llm_calls', None) is not None:
+        config.max_llm_calls = int(args.max_llm_calls)
+    if getattr(args, 'max_vitis_runs', None) is not None:
+        config.max_vitis_runs = int(args.max_vitis_runs)
+    if getattr(args, 'run_id', None):
+        config.run_id = str(args.run_id)
     if getattr(args, "auto_repair", False):
         config.auto_repair = True
     if getattr(args, "keep_going", False):

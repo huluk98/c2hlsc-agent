@@ -7,15 +7,25 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import signal
 import shutil
 import subprocess
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from c2hlsc_agent.cosim_verdict import evaluate_cosim_verdict
+from c2hlsc_agent.run_control import stable_fingerprint
 
 from generate_hls_nl_testbenches import (
     FunctionSig,
@@ -25,6 +35,17 @@ from generate_hls_nl_testbenches import (
     record_source_file,
     write_design,
 )
+
+
+MAX_VITIS_WORKERS = 4
+TERMINAL_STATUSES = {
+    "pass",
+    "fail",
+    "fail_no_verilog",
+    "blocked",
+    "exhausted",
+    "cancelled",
+}
 
 
 def render_verilog_tcl(sig: FunctionSig, part: str, clock: str) -> str:
@@ -134,6 +155,98 @@ def subprocess_output_text(value: str | bytes | None) -> str:
     return value
 
 
+def source_fingerprint(source: str) -> str:
+    return hashlib.sha256(source.encode("utf-8")).hexdigest()
+
+
+def design_source_fingerprint(design: dict[str, Any]) -> str:
+    path = Path(design["path"]) / "dut.cpp"
+    if path.exists():
+        return source_fingerprint(path.read_text(encoding="utf-8", errors="replace"))
+    return source_fingerprint(str(design.get("hls_cpp", "")))
+
+
+def _normalize_failure_text(text: str) -> str:
+    normalized = (text or "").replace("\r\n", "\n")
+    normalized = re.sub(
+        r"\b\d{4}-\d{2}-\d{2}[T ][0-9:.+-]+Z?\b",
+        "<timestamp>",
+        normalized,
+    )
+    normalized = re.sub(r"\b0x[0-9a-fA-F]+\b", "<address>", normalized)
+    normalized = re.sub(r"(?i)\b[A-Z]:[\\/][^\s' ]+", "<path>", normalized)
+    return "\n".join(
+        " ".join(line.split()) for line in normalized.splitlines()
+    ).strip()[-4000:]
+
+
+def failure_fingerprint_for_result(result: dict[str, Any]) -> str | None:
+    if result.get("status") == "pass":
+        return None
+    phases = {
+        name: {
+            "status": row.get("status"),
+            "returncode": row.get("returncode"),
+        }
+        for name, row in sorted(dict(result.get("phases", {})).items())
+    }
+    return stable_fingerprint(
+        {
+            "status": result.get("status"),
+            "failed_phase": result.get("failed_phase"),
+            "phases": phases,
+            "evidence": _normalize_failure_text(
+                str(result.get("vitis_log_tail") or result.get("error") or "")
+            ),
+        }
+    )
+
+
+_NON_RETRYABLE_ERROR_MARKERS = (
+    "filenotfounderror",
+    "permissionerror",
+    "valueerror",
+    "typeerror",
+)
+_RETRYABLE_INFRA_MARKERS = (
+    "license",
+    "temporarily unavailable",
+    "connection reset",
+    "connection timed out",
+    "no space left",
+    "resource busy",
+)
+
+
+def classify_failure(result: dict[str, Any]) -> tuple[str | None, bool]:
+    status = str(result.get("status", "error"))
+    evidence = str(result.get("error") or result.get("vitis_log_tail") or "").lower()
+    if status == "pass":
+        return None, False
+    if status == "timeout":
+        return "infrastructure_timeout", True
+    if status == "error":
+        if any(marker in evidence for marker in _NON_RETRYABLE_ERROR_MARKERS):
+            return "configuration_error", False
+        return "host_infrastructure_error", True
+    if any(marker in evidence for marker in _RETRYABLE_INFRA_MARKERS):
+        return "toolchain_infrastructure_error", True
+    if status == "fail_no_verilog":
+        return "missing_verilog_artifact", False
+    return "verification_failure", False
+
+
+def retry_backoff_seconds(base_seconds: float, retry_count: int) -> float:
+    if base_seconds <= 0:
+        return 0.0
+    return min(60.0, base_seconds * (2 ** max(0, retry_count - 1)))
+
+
+def retry_at(delay_seconds: float) -> str:
+    value = datetime.now(timezone.utc) + timedelta(seconds=delay_seconds)
+    return value.isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
 def generate_designs(args: argparse.Namespace) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     records = load_records(args.input)
     selected = records[args.offset :]
@@ -145,7 +258,9 @@ def generate_designs(args: argparse.Namespace) -> tuple[list[dict[str, Any]], li
     skipped: list[dict[str, Any]] = []
     for local_idx, record in enumerate(selected):
         record_id = record_id_for(record, args.offset + local_idx)
-        sig = extract_function(str(record.get("hls_cpp", "")))
+        hls_cpp = str(record.get("hls_cpp", ""))
+        source_hash = source_fingerprint(hls_cpp)
+        sig = extract_function(hls_cpp)
         if sig is None:
             skipped.append(
                 {
@@ -153,6 +268,7 @@ def generate_designs(args: argparse.Namespace) -> tuple[list[dict[str, Any]], li
                     "source_file": record_source_file(record),
                     "status": "skipped",
                     "reason": "no_parseable_function_definition",
+                    "source_fingerprint": source_hash,
                 }
             )
             continue
@@ -163,6 +279,7 @@ def generate_designs(args: argparse.Namespace) -> tuple[list[dict[str, Any]], li
         (design_dir / "run_csynth.tcl").write_text(render_csynth_tcl(), encoding="utf-8")
         (design_dir / "run_cosim.tcl").write_text(render_cosim_tcl(), encoding="utf-8")
         row["status"] = "generated"
+        row["source_fingerprint"] = source_hash
         row["verilog_tcl"] = str(design_dir / "run_verilog.tcl")
         designs.append(row)
 
@@ -185,6 +302,13 @@ class VitisProcessResult:
 
 
 def terminate_process_group(proc: subprocess.Popen[str]) -> None:
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+            capture_output=True,
+            check=False,
+        )
+        return
     try:
         os.killpg(proc.pid, signal.SIGTERM)
     except (AttributeError, ProcessLookupError, PermissionError):
@@ -192,6 +316,13 @@ def terminate_process_group(proc: subprocess.Popen[str]) -> None:
 
 
 def kill_process_group(proc: subprocess.Popen[str]) -> None:
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+            capture_output=True,
+            check=False,
+        )
+        return
     try:
         os.killpg(proc.pid, signal.SIGKILL)
     except (AttributeError, ProcessLookupError, PermissionError):
@@ -231,6 +362,15 @@ def phase_plan(run_full_cosim: bool) -> list[tuple[str, str]]:
     return [("verilog_csynth", "run_verilog.tcl")]
 
 
+def finalize_design_result(
+    result: dict[str, Any],
+    design: dict[str, Any],
+) -> dict[str, Any]:
+    result["source_fingerprint"] = design_source_fingerprint(design)
+    result["failure_fingerprint"] = failure_fingerprint_for_result(result)
+    return result
+
+
 def run_design(vitis_hls: str, design: dict[str, Any], timeout: int, run_full_cosim: bool, log_tail_lines: int) -> dict[str, Any]:
     design_dir = Path(design["path"])
     aggregate_log_path = design_dir / ("vitis_full.log" if run_full_cosim else "vitis_verilog.log")
@@ -248,6 +388,10 @@ def run_design(vitis_hls: str, design: dict[str, Any], timeout: int, run_full_co
         rtl = verilog_files(design_dir)
         cosim = cosim_artifacts(design_dir)
         phase_status = "timeout" if phase_result.timed_out else ("pass" if phase_result.returncode == 0 else "fail")
+        cosim_verdict = None
+        if phase == "cosim":
+            cosim_verdict = evaluate_cosim_verdict(phase_status, phase_result.output)
+            phase_status = cosim_verdict.status
         phase_row: dict[str, Any] = {
             "name": phase,
             "tcl": tcl,
@@ -258,6 +402,9 @@ def run_design(vitis_hls: str, design: dict[str, Any], timeout: int, run_full_co
         }
         if phase_result.timed_out:
             phase_row["timeout_seconds"] = timeout
+        if cosim_verdict and cosim_verdict.reason:
+            phase_row["verdict_reason"] = cosim_verdict.reason
+            phase_row["failure_marker"] = cosim_verdict.failure_marker
         if log_tail_lines:
             phase_row["vitis_log_tail"] = text_tail(phase_result.output, log_tail_lines)
         result["phases"][phase] = phase_row
@@ -273,11 +420,16 @@ def run_design(vitis_hls: str, design: dict[str, Any], timeout: int, run_full_co
             result["status"] = "timeout"
             result["failed_phase"] = phase
             result["timeout_seconds"] = timeout
-            return result
+            return finalize_design_result(result, design)
         if phase_result.returncode != 0:
             result["status"] = "fail"
             result["failed_phase"] = phase
-            return result
+            return finalize_design_result(result, design)
+        if phase_status != "pass":
+            result["status"] = "fail"
+            result["failed_phase"] = phase
+            result["failure_reason"] = cosim_verdict.reason if cosim_verdict else "phase failed"
+            return finalize_design_result(result, design)
 
     rtl = verilog_files(design_dir)
     result["verilog_files"] = rtl
@@ -285,7 +437,7 @@ def run_design(vitis_hls: str, design: dict[str, Any], timeout: int, run_full_co
     result["status"] = "pass" if rtl else "fail_no_verilog"
     if result["status"] != "pass":
         result["failed_phase"] = "verilog_artifact_check"
-    return result
+    return finalize_design_result(result, design)
 
 
 def _atomic_write(path: Path, text: str) -> None:
@@ -329,13 +481,9 @@ def normalize_record_id(value: Any) -> Any:
         return value
 
 
-def load_prior_results(results_path: Path) -> list[dict[str, Any]]:
-    """Executed-verdict rows from an interrupted/previous sweep.
+def load_latest_results(results_path: Path) -> list[dict[str, Any]]:
+    """Latest valid state row per record from a possibly torn JSONL ledger."""
 
-    Tolerates a torn final line. Rows whose status is not a Vitis verdict
-    (host-side status=error, --generate-only's generated_only) are dropped so
-    --resume retries those records instead of treating them as done.
-    """
     if not results_path.exists():
         return []
     by_id: dict[Any, dict[str, Any]] = {}
@@ -350,14 +498,49 @@ def load_prior_results(results_path: Path) -> list[dict[str, Any]]:
                 continue
             if isinstance(row, dict) and "record_id" in row:
                 by_id[normalize_record_id(row["record_id"])] = row
-    return [row for row in by_id.values() if row.get("status") in EXECUTED_STATUSES]
+    return list(by_id.values())
+
+
+def _is_terminal_result(row: dict[str, Any]) -> bool:
+    status = str(row.get("status", ""))
+    if status in TERMINAL_STATUSES:
+        return True
+    return status in EXECUTED_STATUSES and "retryable" not in row
+
+
+def load_prior_results(results_path: Path) -> list[dict[str, Any]]:
+    """Terminal rows that --resume must not execute again.
+
+    Legacy timeout rows remain terminal for backward compatibility. New bounded
+    runs convert retryable timeouts to retry_pending or exhausted.
+    """
+    return [row for row in load_latest_results(results_path) if _is_terminal_result(row)]
 
 
 def run_design_row(vitis_hls: str, design: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
     try:
-        return run_design(vitis_hls, design, args.timeout_seconds, args.run_full_cosim, args.log_tail_lines)
+        result = run_design(
+            vitis_hls,
+            design,
+            args.timeout_seconds,
+            args.run_full_cosim,
+            args.log_tail_lines,
+        )
+        result.setdefault("source_fingerprint", design_source_fingerprint(design))
+        result.setdefault(
+            "failure_fingerprint",
+            failure_fingerprint_for_result(result),
+        )
+        return result
     except Exception as exc:  # noqa: BLE001 - one bad record must not kill a multi-day sweep
-        return {**design, "status": "error", "error": f"{type(exc).__name__}: {exc}"}
+        result = {
+            **design,
+            "status": "error",
+            "error": f"{type(exc).__name__}: {exc}",
+            "source_fingerprint": design_source_fingerprint(design),
+        }
+        result["failure_fingerprint"] = failure_fingerprint_for_result(result)
+        return result
 
 
 def input_digest(path: Path) -> str:
@@ -387,14 +570,113 @@ def check_resume_compatibility(out_dir: Path, args: argparse.Namespace, current_
         ("input", str(args.input)),
         ("mode", mode),
         ("input_sha256", current_digest),
+        ("max_retries", getattr(args, "max_retries", None)),
+        (
+            "retry_backoff_seconds",
+            getattr(args, "retry_backoff_seconds", None),
+        ),
     )
     for key, current in checks:
         prior = summary.get(key)
-        if prior is not None and prior != current:
+        if prior is not None and current is not None and prior != current:
             raise SystemExit(
                 f"--resume {key} mismatch: prior run in {out_dir} used {key}={prior!r}, "
                 f"this run uses {current!r}. Rerun without --resume or use a fresh --out-dir."
             )
+
+
+def _attempt_summary(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "attempt_count": row["attempt_count"],
+        "status": row.get("original_status", row.get("status")),
+        "failure_class": row.get("failure_class"),
+        "source_fingerprint": row.get("source_fingerprint"),
+        "failure_fingerprint": row.get("failure_fingerprint"),
+    }
+
+
+def run_design_with_retry_policy(
+    vitis_hls: str,
+    design: dict[str, Any],
+    args: argparse.Namespace,
+    record_result: Callable[[dict[str, Any]], None],
+    stop_event: threading.Event | None = None,
+) -> dict[str, Any]:
+    max_retries = int(getattr(args, "max_retries", 0))
+    attempt_count = int(design.get("_attempt_count", 0))
+    history = list(design.get("_attempt_history", []))
+    while True:
+        if attempt_count >= max_retries + 1:
+            row = {
+                **{key: value for key, value in design.items() if not key.startswith("_")},
+                "status": "exhausted",
+                "reason": "retry budget was already exhausted before resume",
+                "attempt_count": attempt_count,
+                "retry_count": max(0, attempt_count - 1),
+                "max_retries": max_retries,
+                "retry_backoff_seconds": float(
+                    getattr(args, "retry_backoff_seconds", 0)
+                ),
+                "retryable": False,
+                "dead_letter": True,
+                "attempt_history": history,
+                "source_fingerprint": design_source_fingerprint(design),
+            }
+            record_result(row)
+            return row
+
+        row = run_design_row(vitis_hls, design, args)
+        attempt_count += 1
+        retry_count = attempt_count - 1
+        failure_class, retryable = classify_failure(row)
+        row["attempt_count"] = attempt_count
+        row["retry_count"] = retry_count
+        row["max_retries"] = max_retries
+        row["retry_backoff_seconds"] = float(
+            getattr(args, "retry_backoff_seconds", 0)
+        )
+        row["failure_class"] = failure_class
+        row["retryable"] = retryable
+        row["dead_letter"] = False
+        history.append(_attempt_summary(row))
+        row["attempt_history"] = list(history)
+
+        if row.get("status") == "pass":
+            record_result(row)
+            return row
+        if not retryable:
+            if row.get("status") == "error":
+                row["original_status"] = "error"
+                row["status"] = "blocked"
+            row["dead_letter"] = True
+            row["reason"] = "non-retryable worker failure"
+            record_result(row)
+            return row
+        if retry_count >= max_retries:
+            row["original_status"] = row.get("status")
+            row["status"] = "exhausted"
+            row["retryable"] = False
+            row["dead_letter"] = True
+            row["reason"] = "retry budget exhausted"
+            record_result(row)
+            return row
+
+        delay = retry_backoff_seconds(
+            float(getattr(args, "retry_backoff_seconds", 0)),
+            retry_count + 1,
+        )
+        row["original_status"] = row.get("status")
+        row["status"] = "retry_pending"
+        row["backoff_seconds"] = delay
+        row["retry_at"] = retry_at(delay)
+        history[-1]["backoff_seconds"] = delay
+        history[-1]["retry_at"] = row["retry_at"]
+        row["attempt_history"] = list(history)
+        record_result(row)
+        if stop_event is not None and stop_event.wait(delay):
+            return row
+        if stop_event is None and delay:
+            time.sleep(delay)
 
 
 def execute_designs(
@@ -405,26 +687,44 @@ def execute_designs(
 ) -> None:
     """Run designs through run_design, in parallel when --workers > 1.
 
-    record_result is invoked exactly once per executed design, serialized by a
-    lock here so callers can append/write without their own locking. With
-    --stop-on-fail, a non-pass result stops scheduling; already-running designs
-    still finish and are recorded.
+    Every retry checkpoint is persisted through record_result. Calls are
+    serialized so callers may safely append JSONL rows. With --stop-on-fail, a
+    terminal non-pass result stops queued work; in-flight work checkpoints before
+    returning.
     """
+    write_lock = threading.Lock()
+
+    def record_locked(row: dict[str, Any]) -> None:
+        with write_lock:
+            record_result(row)
+
     if args.workers <= 1:
         for design in designs:
-            row = run_design_row(vitis_hls, design, args)
-            record_result(row)
+            row = run_design_with_retry_policy(
+                vitis_hls,
+                design,
+                args,
+                record_locked,
+            )
             if args.stop_on_fail and row["status"] != "pass":
                 break
         return
 
     stop = threading.Event()
-    lock = threading.Lock()
 
     def run_one(design: dict[str, Any]) -> dict[str, Any] | None:
         if stop.is_set():
             return None
-        return run_design_row(vitis_hls, design, args)
+        row = run_design_with_retry_policy(
+            vitis_hls,
+            design,
+            args,
+            record_locked,
+            stop,
+        )
+        if args.stop_on_fail and row["status"] not in {"pass", "retry_pending"}:
+            stop.set()
+        return row
 
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         futures = [pool.submit(run_one, design) for design in designs]
@@ -433,10 +733,6 @@ def execute_designs(
                 row = future.result()
                 if row is None:
                     continue
-                with lock:
-                    record_result(row)
-                if args.stop_on_fail and row["status"] != "pass":
-                    stop.set()
         except BaseException:
             # Ctrl-C etc.: don't drain the queue — cancel everything not yet
             # started; already-recorded rows are on disk for --resume.
@@ -470,6 +766,8 @@ def load_config(args: argparse.Namespace) -> argparse.Namespace:
         "timeout_seconds": "timeout_seconds",
         "log_tail_lines": "log_tail_lines",
         "workers": "workers",
+        "max_retries": "max_retries",
+        "retry_backoff_seconds": "retry_backoff_seconds",
     }
     for key, attr in value_fields.items():
         if getattr(args, attr) is None and key in raw:
@@ -501,7 +799,19 @@ def finalize_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> 
     args.clock = args.clock or "10"
     args.timeout_seconds = 900 if args.timeout_seconds is None else args.timeout_seconds
     args.log_tail_lines = 80 if args.log_tail_lines is None else args.log_tail_lines
-    args.workers = 1 if args.workers is None else max(1, args.workers)
+    args.workers = 1 if args.workers is None else args.workers
+    args.max_retries = 2 if args.max_retries is None else args.max_retries
+    args.retry_backoff_seconds = 5.0 if args.retry_backoff_seconds is None else args.retry_backoff_seconds
+    if args.timeout_seconds < 1:
+        parser.error("--timeout-seconds must be at least 1")
+    if args.log_tail_lines < 0:
+        parser.error("--log-tail-lines cannot be negative")
+    if not 1 <= args.workers <= MAX_VITIS_WORKERS:
+        parser.error(f"--workers must be between 1 and {MAX_VITIS_WORKERS}")
+    if args.max_retries < 0:
+        parser.error("--max-retries cannot be negative")
+    if args.retry_backoff_seconds < 0:
+        parser.error("--retry-backoff-seconds cannot be negative")
     return args
 
 
@@ -520,6 +830,12 @@ def main() -> int:
     parser.add_argument("--timeout-seconds", type=int, help="Per-record Vitis timeout")
     parser.add_argument("--log-tail-lines", type=int, help="Vitis log tail lines stored per result; 0 disables")
     parser.add_argument("--workers", type=int, help="Concurrent Vitis runs (default 1; each worker needs ~2-6GB RAM)")
+    parser.add_argument("--max-retries", type=int, help="Retryable infrastructure failures per record (default 2)")
+    parser.add_argument(
+        "--retry-backoff-seconds",
+        type=float,
+        help="Initial retry backoff; doubles to a 60-second cap (default 5)",
+    )
     parser.add_argument("--resume", action="store_true", help="Skip record_ids already present in the out-dir vitis_batch_results.jsonl and append new rows to it")
     parser.add_argument("--generate-only", action="store_true", help="Only generate project folders; do not run Vitis")
     parser.add_argument("--run-full-cosim", action="store_true", help="Run CSim, CSynth, and CoSim instead of CSim+CSynth only")
@@ -530,6 +846,7 @@ def main() -> int:
     vitis_hls = resolve_vitis_hls(args.vitis_hls_bin, args.generate_only)
     designs, skipped = generate_designs(args)
     results: list[dict[str, Any]] = []
+    latest_by_id: dict[Any, dict[str, Any]] = {}
     status_counts: dict[str, int] = {}
 
     results_path = args.out_dir / "vitis_batch_results.jsonl"
@@ -538,12 +855,34 @@ def main() -> int:
     pending = designs
     if args.resume and not args.generate_only:
         check_resume_compatibility(args.out_dir, args, corpus_digest)
-        prior_results = load_prior_results(results_path)
+        prior_states = load_latest_results(results_path)
+        latest_by_id = {
+            normalize_record_id(row["record_id"]): row
+            for row in prior_states
+        }
+        prior_results = [
+            row for row in prior_states if _is_terminal_result(row)
+        ]
         done_ids = {normalize_record_id(row["record_id"]) for row in prior_results}
-        pending = [design for design in designs if normalize_record_id(design["record_id"]) not in done_ids]
-        results.extend(prior_results)
-        for row in prior_results:
-            status_counts[row.get("status", "unknown")] = status_counts.get(row.get("status", "unknown"), 0) + 1
+        pending = []
+        for design in designs:
+            record_id = normalize_record_id(design["record_id"])
+            if record_id in done_ids:
+                continue
+            prior = latest_by_id.get(record_id)
+            if prior:
+                for key, current in (
+                    ("max_retries", args.max_retries),
+                    ("retry_backoff_seconds", args.retry_backoff_seconds),
+                ):
+                    previous = prior.get(key)
+                    if previous is not None and float(previous) != float(current):
+                        message = f"--resume {key} mismatch for record {record_id}: prior={previous}, current={current}"
+                        raise SystemExit(message)
+                design = dict(design)
+                design["_attempt_count"] = int(prior.get("attempt_count", 0))
+                design["_attempt_history"] = list(prior.get("attempt_history", []))
+            pending.append(design)
         print(f"resume: {len(prior_results)} records already done, {len(pending)} to run")
 
     if args.generate_only:
@@ -555,8 +894,7 @@ def main() -> int:
         for design in designs:
             row = dict(design)
             row["status"] = "generated_only"
-            results.append(row)
-            status_counts[row["status"]] = status_counts.get(row["status"], 0) + 1
+            latest_by_id[normalize_record_id(row["record_id"])] = row
     else:
         assert vitis_hls is not None
         # Append each row as it completes so an interrupted sweep loses at most
@@ -570,8 +908,7 @@ def main() -> int:
         with results_path.open("a" if args.resume else "w", encoding="utf-8") as results_file:
 
             def record_result(row: dict[str, Any]) -> None:
-                results.append(row)
-                status_counts[row["status"]] = status_counts.get(row["status"], 0) + 1
+                latest_by_id[normalize_record_id(row["record_id"])] = row
                 results_file.write(json.dumps(row, sort_keys=True) + "\n")
                 results_file.flush()
                 print(
@@ -582,6 +919,11 @@ def main() -> int:
 
             execute_designs(vitis_hls, pending, args, record_result)
 
+    results = list(latest_by_id.values())
+    status_counts = {}
+    for row in results:
+        status = str(row.get("status", "unknown"))
+        status_counts[status] = status_counts.get(status, 0) + 1
     for row in skipped:
         status_counts[row["status"]] = status_counts.get(row["status"], 0) + 1
 
@@ -597,11 +939,13 @@ def main() -> int:
             "mode": "full_cosim" if args.run_full_cosim else "verilog_csynth",
             "input_sha256": corpus_digest,
             "workers": args.workers,
+            "max_retries": args.max_retries,
+            "retry_backoff_seconds": args.retry_backoff_seconds,
             "resumed": len(prior_results),
             "generated": len(designs),
             "skipped": len(skipped),
             "status_counts": status_counts,
-            "pass_definition": "vitis_hls returns 0 and at least one .v/.sv file exists under hls_nl_project/solution1/syn/verilog; in full_cosim mode the TCL also requires cosim_design to pass",
+            "pass_definition": "every required Vitis phase returns 0, the shared CoSim log verdict contains no failure marker, and at least one .v/.sv file exists under hls_nl_project/solution1/syn/verilog",
         },
         "results": results,
         "skipped": skipped,

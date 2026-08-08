@@ -52,6 +52,42 @@ class HlsNlVitisBatchTests(unittest.TestCase):
             self.assertEqual(row["phases"]["csim"]["status"], "pass")
             self.assertEqual(row["phases"]["csynth"]["status"], "timeout")
 
+    def test_zero_exit_with_cosim_failure_marker_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            design = {
+                "record_id": 44,
+                "top": "tiny_add",
+                "path": tmp,
+            }
+            original_run = batch.run_vitis_command
+
+            def fake_run(command, cwd, timeout):
+                del cwd, timeout
+                if command[-1] == "run_cosim.tcl":
+                    return batch.VitisProcessResult(
+                        0,
+                        "INFO: C/RTL co-simulation finished: FAIL",
+                    )
+                return batch.VitisProcessResult(0, "phase passed")
+
+            batch.run_vitis_command = fake_run
+            try:
+                row = batch.run_design(
+                    "vitis_hls",
+                    design,
+                    timeout=1,
+                    run_full_cosim=True,
+                    log_tail_lines=20,
+                )
+            finally:
+                batch.run_vitis_command = original_run
+
+            self.assertEqual(row["status"], "fail")
+            self.assertEqual(row["failed_phase"], "cosim")
+            self.assertIn("exited 0", row["failure_reason"])
+            self.assertEqual(row["phases"]["cosim"]["status"], "fail")
+            self.assertIsNotNone(row["failure_fingerprint"])
+
     def test_full_cosim_uses_split_phase_tcls(self):
         plan = batch.phase_plan(run_full_cosim=True)
         self.assertEqual(plan, [("csim", "run_csim.tcl"), ("csynth", "run_csynth.tcl"), ("cosim", "run_cosim.tcl")])
@@ -161,8 +197,9 @@ class ExecuteDesignsTests(unittest.TestCase):
 
         by_id = {row["record_id"]: row for row in rows}
         self.assertEqual(set(by_id), {0, 1, 2, 3})
-        self.assertEqual(by_id[2]["status"], "error")
+        self.assertEqual(by_id[2]["status"], "exhausted")
         self.assertIn("disk full", by_id[2]["error"])
+        self.assertTrue(by_id[2]["dead_letter"])
         self.assertTrue(all(by_id[i]["status"] == "pass" for i in (0, 1, 3)))
 
     def test_stop_on_fail_sequential_stops_at_first_failure(self):
@@ -179,6 +216,125 @@ class ExecuteDesignsTests(unittest.TestCase):
         finally:
             batch.run_design = original
         self.assertEqual([row["record_id"] for row in rows], [0, 1])
+
+
+class RetryPolicyTests(unittest.TestCase):
+    def _args(self, max_retries: int):
+        return type("Args", (), {
+            "timeout_seconds": 1,
+            "run_full_cosim": True,
+            "log_tail_lines": 20,
+            "max_retries": max_retries,
+            "retry_backoff_seconds": 0.0,
+        })()
+
+    def test_retryable_timeouts_persist_then_pass(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            design = {"record_id": 7, "top": "t", "path": tmp}
+            calls = 0
+            rows: list[dict] = []
+            original = batch.run_design
+
+            def fake_run(*unused):
+                nonlocal calls
+                calls += 1
+                status = "timeout" if calls < 3 else "pass"
+                return {**design, "status": status, "failed_phase": "cosim"}
+
+            batch.run_design = fake_run
+            try:
+                final = batch.run_design_with_retry_policy(
+                    "vitis_hls",
+                    design,
+                    self._args(2),
+                    rows.append,
+                )
+            finally:
+                batch.run_design = original
+
+            self.assertEqual([row["status"] for row in rows], [
+                "retry_pending",
+                "retry_pending",
+                "pass",
+            ])
+            self.assertEqual(final["attempt_count"], 3)
+            self.assertEqual(len(final["attempt_history"]), 3)
+            self.assertIn("backoff_seconds", final["attempt_history"][0])
+            self.assertTrue(all(row.get("source_fingerprint") for row in rows))
+
+    def test_retry_budget_ends_in_exhausted_dead_letter(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            design = {"record_id": 8, "top": "t", "path": tmp}
+            rows: list[dict] = []
+            original = batch.run_design
+            batch.run_design = lambda *unused: {
+                **design,
+                "status": "timeout",
+                "failed_phase": "cosim",
+            }
+            try:
+                final = batch.run_design_with_retry_policy(
+                    "vitis_hls",
+                    design,
+                    self._args(1),
+                    rows.append,
+                )
+            finally:
+                batch.run_design = original
+
+            self.assertEqual([row["status"] for row in rows], [
+                "retry_pending",
+                "exhausted",
+            ])
+            self.assertTrue(final["dead_letter"])
+            self.assertFalse(final["retryable"])
+            self.assertEqual(final["attempt_count"], 2)
+
+    def test_non_retryable_configuration_error_is_blocked_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            design = {"record_id": 9, "top": "t", "path": tmp}
+            rows: list[dict] = []
+            original = batch.run_design
+
+            def bad_config(*unused):
+                raise ValueError("invalid Vitis configuration")
+
+            batch.run_design = bad_config
+            try:
+                final = batch.run_design_with_retry_policy(
+                    "vitis_hls",
+                    design,
+                    self._args(2),
+                    rows.append,
+                )
+            finally:
+                batch.run_design = original
+
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(final["status"], "blocked")
+            self.assertEqual(final["failure_class"], "configuration_error")
+            self.assertTrue(final["dead_letter"])
+
+
+class BatchArgumentSafetyTests(unittest.TestCase):
+    def test_worker_count_above_cap_is_rejected(self):
+        parser = batch.argparse.ArgumentParser()
+        args = batch.argparse.Namespace(
+            config=None,
+            input=Path("input.jsonl"),
+            out_dir=Path("out"),
+            offset=0,
+            part=None,
+            clock=None,
+            timeout_seconds=1,
+            log_tail_lines=0,
+            workers=batch.MAX_VITIS_WORKERS + 1,
+            max_retries=0,
+            retry_backoff_seconds=0.0,
+        )
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                batch.finalize_args(parser, args)
 
 
 class LoadPriorResultsTests(unittest.TestCase):
@@ -226,6 +382,21 @@ class LoadPriorResultsTests(unittest.TestCase):
             rows = batch.load_prior_results(path)
             self.assertEqual(len(rows), 1)
             self.assertEqual(batch.normalize_record_id(rows[0]["record_id"]), 7)
+
+    def test_retry_checkpoint_is_loaded_but_not_terminal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "vitis_batch_results.jsonl"
+            checkpoint = {
+                "record_id": 4,
+                "status": "retry_pending",
+                "attempt_count": 1,
+                "source_fingerprint": "source-a",
+                "failure_fingerprint": "failure-a",
+                "retryable": True,
+            }
+            path.write_text(json.dumps(checkpoint) + "\n", encoding="utf-8")
+            self.assertEqual(batch.load_latest_results(path), [checkpoint])
+            self.assertEqual(batch.load_prior_results(path), [])
 
 
 class ResumeCompatibilityTests(unittest.TestCase):

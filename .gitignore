@@ -14,6 +14,9 @@ c2hlsc_project/
 c2hlsc_tb
 vitis_hls_bin_path.txt
 
+# Machine/runtime state written by the bounded run controller (run_control.py).
+run_ledger.jsonl
+
 # Benchmark checkouts. The docs clone these to ~/RTLLM, ~/CHStone, ~/rosetta;
 # ignore them at the repo root so an accidental in-tree clone is never committed.
 /RTLLM/

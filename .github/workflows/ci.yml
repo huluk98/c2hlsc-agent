@@ -2,22 +2,63 @@ name: CI
 
 on:
   push:
-    branches: ["**"]
+    branches: [main]
   pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   unittest:
-    runs-on: ubuntu-latest
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.11", "3.12"]
+        include:
+          - os: ubuntu-latest
+            python-version: '3.10'
+            label: Ubuntu / Python 3.10
+          - os: ubuntu-latest
+            python-version: '3.11'
+            label: Ubuntu / Python 3.11
+          - os: ubuntu-latest
+            python-version: '3.12'
+            label: Ubuntu / Python 3.12
+          - os: windows-latest
+            python-version: '3.12'
+            label: Windows / Python 3.12
     steps:
       - uses: actions/checkout@v4
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+      - name: Validate Bash helper syntax
+        if: runner.os == 'Linux' && matrix.python-version == '3.12'
+        run: bash -n scripts/team_preflight.sh
+      - name: Validate PowerShell helper syntax
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $parseErrors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path 'scripts/team_preflight.ps1'),
+            [ref]$null,
+            [ref]$parseErrors
+          ) | Out-Null
+          if ($parseErrors.Count -gt 0) {
+            $parseErrors | Format-List
+            exit 1
+          }
+      - name: Validate Python helper syntax
+        run: python -m py_compile scripts/verify_github_guardrails.py
       - name: Install package
         run: python -m pip install -e .
       - name: Run unit tests
@@ -25,3 +66,15 @@ jobs:
         # pass fully offline, exercising the deterministic generator/repair and the
         # LLM-unavailable fallback paths.
         run: python -m unittest discover -s tests
+
+  ci:
+    name: ci
+    if: ${{ always() }}
+    needs: unittest
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Require every Python job to pass
+        env:
+          MATRIX_RESULT: ${{ needs.unittest.result }}
+        run: test "$MATRIX_RESULT" = "success"
