@@ -155,14 +155,52 @@ class OpenAICompatibleLLMClient:
 #: successors are still denied below, so removing the two stale names loses no coverage.
 #: If you upgrade the CLI and the sweep turns into all-`llm_error`, check here first.
 _CLI_DISALLOWED_TOOLS = (
-    "Task,Bash,Glob,Grep,Read,Edit,Write,NotebookEdit,WebFetch,WebSearch,"
+    "Task,Bash,PowerShell,Glob,Grep,Read,Edit,Write,NotebookEdit,WebFetch,WebSearch,"
     "TodoWrite,BashOutput,KillShell,Artifact,SendUserFile,Skill"
 )
 
 #: The subset that actually carries the oracle-isolation claim: anything that can read a file
 #: or reach the network. If a CLI upgrade makes one of these unnameable, the deny list must be
 #: repaired rather than trimmed -- trimming it would silently void the measurement.
-_ORACLE_CRITICAL_DENIALS = ("Task", "Bash", "Glob", "Grep", "Read", "WebFetch", "WebSearch")
+#:
+#: ``PowerShell`` is on this list because it was MISSING from the deny list while ``Bash`` was
+#: present: on a Windows host the CLI exposes it as a separate tool, so the "sandboxed" model
+#: could have read the staged testbench by absolute path. That is precisely the open-ended-deny-
+#: list failure the note above warns about, having actually happened -- which is why the empty
+#: allow-list below, not this tuple, is now the primary control.
+_ORACLE_CRITICAL_DENIALS = (
+    "Task", "Bash", "PowerShell", "Glob", "Grep", "Read", "WebFetch", "WebSearch",
+)
+
+def _missing_oracle_critical_denials(deny_list: str, critical=_ORACLE_CRITICAL_DENIALS) -> list:
+    """Which oracle-critical tools ``deny_list`` fails to name.
+
+    A free function rather than an inline import-time block so a test can exercise the guard
+    without mutating module globals or reloading the module — reloading rebinds every class in
+    here, which breaks ``isinstance`` for anything imported earlier in the same process.
+    """
+
+    named = {tool.strip() for tool in deny_list.split(",")}
+    return [tool for tool in critical if tool not in named]
+
+
+# Enforced, not documented. A deny list that silently loses an entry voids every measurement
+# taken through this backend, and the failure is invisible in the results. Import-time so a
+# bad edit cannot reach a sweep.
+_missing_denials = _missing_oracle_critical_denials(_CLI_DISALLOWED_TOOLS)
+if _missing_denials:  # pragma: no cover - guards an edit, not a runtime path
+    raise AssertionError(
+        "_CLI_DISALLOWED_TOOLS is missing oracle-critical denials %r; repair the list rather "
+        "than trimming it, or every score from this backend is unsound." % (_missing_denials,)
+    )
+
+#: The PRIMARY sandbox control: an explicit empty allow-list. ``claude --help`` documents
+#: ``--tools`` as "Specify the list of available tools from the built-in set. Use \"\" to
+#: disable all tools". Unlike a deny list this is fail-CLOSED -- a CLI version that adds a new
+#: file-reading tool is covered automatically, whereas the deny list can only name tools that
+#: existed when it was written (see PowerShell above). The deny list is kept as defense in
+#: depth, not as the control.
+_CLI_EMPTY_TOOLSET = ""
 
 
 class ClaudeCLIClient:
@@ -192,7 +230,12 @@ class ClaudeCLIClient:
 
         self._base = shlex.split(cli_cmd) + ["-p", "--model", model]
         if sandbox:
-            self._base += ["--disallowedTools", _CLI_DISALLOWED_TOOLS, "--permission-mode", "plan"]
+            self._base += [
+                # Fail-closed first, then the (open-ended) deny list, then the permission mode.
+                "--tools", _CLI_EMPTY_TOOLSET,
+                "--disallowedTools", _CLI_DISALLOWED_TOOLS,
+                "--permission-mode", "plan",
+            ]
         self.model = model
         self._timeout = timeout
         self.sandboxed = bool(sandbox)

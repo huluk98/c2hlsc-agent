@@ -556,11 +556,17 @@ def classify_failure(
 #: not a scoring hazard, but it is forbidden by the generator prompt for the same reason.
 #: Deliberately NOT listed: ``$signed``/``$unsigned``/``$clog2``/``$bits``/``$time``/
 #: ``$random``, which are legitimate in RTL and cannot reach stdout.
+#: The severity tasks are here because IVERILOG_STANDARD is ``-g2012``, which enables
+#: ``$info``/``$warning``/``$error``/``$fatal``. They write to the SAME stdout the oracle reads,
+#: and the oracle is a substring test (PASS_MARKERS = ("Pass", "pass")), so a candidate
+#: containing ``$info("Your Design Passed");`` scores a strict pass on arbitrary RTL. ``$fatal``
+#: is additionally a control task -- it terminates -- so it appears in both patterns.
 _ILLEGAL_TASK_RE = re.compile(
-    r"\$(?:display|write|monitor|strobe|fdisplay|fwrite|fmonitor|fstrobe|dump)\w*",
+    r"\$(?:display|write|monitor|strobe|fdisplay|fwrite|fmonitor|fstrobe|dump"
+    r"|info|warning|error|fatal)\w*",
     re.IGNORECASE,
 )
-_ILLEGAL_CONTROL_RE = re.compile(r"\$(?:finish|stop)\w*", re.IGNORECASE)
+_ILLEGAL_CONTROL_RE = re.compile(r"\$(?:finish|stop|fatal)\w*", re.IGNORECASE)
 
 #: Stamped into ``compile_log`` when a candidate is refused, so ``classify_failure`` can
 #: recover the ``illegal_system_task`` label from the stored result alone.
