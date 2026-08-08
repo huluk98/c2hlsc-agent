@@ -348,6 +348,11 @@ class SimResult:
             "failure_family": self.failure_family,
             "shim_applied": self.shim_applied,
             "runaway_output": self.runaway_output,
+            # Serialized so classify_failure can be re-run on a stored row and reproduce the
+            # same label. Without it a simulator_launch_failed row is indistinguishable from a
+            # no_output row after the fact, because the distinguishing evidence -- a loader exit
+            # code with both streams empty -- is exactly what an empty sim_log cannot carry.
+            "sim_returncode": self.sim_returncode,
         }
 
 

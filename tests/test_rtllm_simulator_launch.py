@@ -119,6 +119,39 @@ class ReproducibilityTests(unittest.TestCase):
             result.failure_family,
         )
 
+    def test_to_dict_carries_the_returncode(self):
+        """It must survive serialization, or a stored simulator_launch_failed row is
+        indistinguishable from a no_output row -- the distinguishing evidence is a loader exit
+        code with both streams empty, which an empty sim_log by definition cannot carry."""
+
+        result = SimResult(
+            design="d",
+            syntax_pass=True,
+            func_pass=False,
+            func_pass_strict=False,
+            timed_out=False,
+            compile_log="",
+            sim_log="",
+            duration_s=0.0,
+            failure_family="simulator_launch_failed",
+            sim_returncode=STATUS_DLL_NOT_FOUND,
+        )
+        payload = result.to_dict()
+        self.assertIn("sim_returncode", payload)
+        self.assertEqual(payload["sim_returncode"], STATUS_DLL_NOT_FOUND)
+        # Replay straight off the serialized dict.
+        self.assertEqual(
+            classify_failure(
+                payload["compile_log"],
+                payload["sim_log"],
+                payload["syntax_pass"],
+                payload["timed_out"],
+                payload["runaway_output"],
+                sim_returncode=payload["sim_returncode"],
+            ),
+            payload["failure_family"],
+        )
+
     def test_default_returncode_preserves_legacy_behaviour(self):
         """Older records have no returncode; an empty log must not become a launch failure
         just because the field defaults to None -- so callers that omit it keep no_output."""
