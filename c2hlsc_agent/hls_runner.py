@@ -4,6 +4,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
+from .cosim_verdict import evaluate_cosim_verdict
 from .equivalence import PhaseResult, VerificationState, parse_mismatches, run_command
 from .remote import RemoteVitis
 
@@ -136,14 +137,6 @@ def run_vitis(
                 pass  # best-effort artifact pull; phase logs are already local
 
 
-_COSIM_FAILURE_MARKERS = (
-    "co-simulation finished: fail",
-    "cosim design failed",
-    "co-simulation failed",
-    "aborting cosim",
-)
-
-
 def _gate_cosim_on_log(result: PhaseResult) -> PhaseResult:
     """Vitis can exit 0 while the CoSim log reports a mismatch. Downgrade pass->fail when
     the log carries an explicit co-simulation failure marker, so a zero exit code cannot
@@ -157,7 +150,8 @@ def _gate_cosim_on_log(result: PhaseResult) -> PhaseResult:
             haystack += "\n" + result.log_path.read_text(encoding="utf-8", errors="replace").lower()
         except OSError:
             pass
-    if any(marker in haystack for marker in _COSIM_FAILURE_MARKERS):
+    verdict = evaluate_cosim_verdict(result.status, haystack)
+    if verdict.status == "fail":
         return PhaseResult(
             result.name,
             "fail",
@@ -165,7 +159,7 @@ def _gate_cosim_on_log(result: PhaseResult) -> PhaseResult:
             result.stdout,
             result.stderr,
             result.log_path,
-            summary="Vitis exited 0 but the CoSim log reports a co-simulation failure",
+            summary=verdict.reason,
         )
     return result
 
