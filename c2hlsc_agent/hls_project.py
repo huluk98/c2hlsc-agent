@@ -137,8 +137,8 @@ clean:
 \trm -f $(TB_EXE) $(LEVERI_GOLDEN_EXE) $(LEVERI_HLS_EXE) $(RTL_VECTORS_EXE)
 \trm -f leveri_golden_trace.csv leveri_hls_trace.csv
 \trm -rf coverage rtl_vectors
-\trm -f tb/*_tb.sv
-\trm -f *.gcda *.gcno *.gcov
+\trm -f $(wildcard tb/*_tb.sv)
+\trm -f $(wildcard *.gcda) $(wildcard *.gcno) $(wildcard *.gcov)
 \trm -rf c2hlsc_project
 """
 
