@@ -840,6 +840,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import signal
 import shutil
 import subprocess
 from pathlib import Path
@@ -848,6 +849,7 @@ ROOT = Path(__file__).resolve().parents[1]
 COVERAGE_DIR = ROOT / "coverage"
 REPORT_PATH = COVERAGE_DIR / "rtl_tb_report.json"
 MANIFEST = ROOT / "tb" / "rtl_tb_manifest.json"
+DEFAULT_TIMEOUT_SECONDS = 120
 
 
 def rtl_sources(rtl_dir: Path) -> list[Path]:
@@ -859,8 +861,82 @@ def write_report(payload: dict) -> None:
     REPORT_PATH.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
+def command_timeout_seconds() -> int:
+    try:
+        value = int(os.environ.get("C2HLSC_RTL_TIMEOUT_SECONDS", DEFAULT_TIMEOUT_SECONDS))
+    except ValueError:
+        return DEFAULT_TIMEOUT_SECONDS
+    return value if value > 0 else DEFAULT_TIMEOUT_SECONDS
+
+
+def output_text(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value
+
+
+def terminate_process_tree(proc) -> None:
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+            capture_output=True,
+            check=False,
+        )
+        if proc.poll() is None:
+            proc.kill()
+        return
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        if proc.poll() is None:
+            proc.kill()
+
+
+def kill_process_tree(proc) -> None:
+    if os.name == "nt":
+        terminate_process_tree(proc)
+        return
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        if proc.poll() is None:
+            proc.kill()
+
+
 def run(cmd, **kwargs):
-    return subprocess.run(cmd, cwd=ROOT, text=True, capture_output=True, **kwargs)
+    timeout = kwargs.pop("timeout", command_timeout_seconds())
+    group_args = (
+        {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)}
+        if os.name == "nt"
+        else {"start_new_session": True}
+    )
+    proc = subprocess.Popen(
+        cmd,
+        cwd=ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        **group_args,
+        **kwargs,
+    )
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+        return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
+    except subprocess.TimeoutExpired as exc:
+        partial_stdout = output_text(exc.stdout)
+        partial_stderr = output_text(exc.stderr)
+        terminate_process_tree(proc)
+        try:
+            stdout, stderr = proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            kill_process_tree(proc)
+            stdout, stderr = proc.communicate()
+        stdout = partial_stdout + output_text(stdout)
+        stderr = partial_stderr + output_text(stderr)
+        stderr += f"\nprocess tree timed out after {timeout}s"
+        return subprocess.CompletedProcess(cmd, 124, stdout, stderr)
 
 
 def find_rtl_dir() -> Path | None:

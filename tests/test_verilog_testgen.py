@@ -1,3 +1,5 @@
+import importlib.util
+import os
 import shutil
 import subprocess
 import sys
@@ -324,6 +326,33 @@ class VerilogTestgenTests(unittest.TestCase):
         self.assertEqual(len((vdir / "rtl_scalar_n.mem").read_text().split()), 8)
         self.assertEqual(len((vdir / "rtl_exp_out.mem").read_text().split()), 8 * 4)
         self.assertEqual(len((vdir / "rtl_cmp_out.mem").read_text().split()), 8)
+
+    def test_generated_runner_times_out_and_terminates_host_process(self):
+        project = self._write_project()
+        runner_path = project / "tb" / "run_rtl_sim.py"
+        spec = importlib.util.spec_from_file_location(
+            "generated_run_rtl_sim_timeout_test",
+            runner_path,
+        )
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        previous = os.environ.get("C2HLSC_RTL_TIMEOUT_SECONDS")
+        os.environ["C2HLSC_RTL_TIMEOUT_SECONDS"] = "1"
+        try:
+            result = module.run([
+                sys.executable,
+                "-c",
+                "import time; time.sleep(30)",
+            ])
+        finally:
+            if previous is None:
+                os.environ.pop("C2HLSC_RTL_TIMEOUT_SECONDS", None)
+            else:
+                os.environ["C2HLSC_RTL_TIMEOUT_SECONDS"] = previous
+        self.assertEqual(result.returncode, 124)
+        self.assertIn("process tree timed out after 1s", result.stderr)
 
     @unittest.skipUnless(_tools("python3", "g++"), "python3 and g++ required")
     def test_rtl_cosim_skips_without_synthesized_rtl(self):
