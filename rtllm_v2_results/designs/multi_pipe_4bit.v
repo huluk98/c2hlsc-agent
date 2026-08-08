@@ -1,64 +1,79 @@
+//======================================================================
+// 4-bit unsigned pipelined multiplier
+//   - partial products generated combinationally (generate block)
+//   - two levels of registers:
+//       level 1 : pairwise sums of the partial products
+//       level 2 : final product register (mul_out)
+//   - latency = 2 clock cycles, throughput = 1 result/cycle
+//   - asynchronous active-low reset
+//======================================================================
+
 module multi_pipe_4bit #(
     parameter size = 4
-) (
+)(
     input                     clk,
     input                     rst_n,
-    input      [size-1:0]     mul_a,
-    input      [size-1:0]     mul_b,
+    input  [size-1:0]         mul_a,
+    input  [size-1:0]         mul_b,
     output reg [2*size-1:0]   mul_out
 );
 
-    // Zero-extend inputs to 2*size bits
-    wire [2*size-1:0] mul_a_extended;
-    wire [2*size-1:0] mul_b_extended;
+    // ------------------------------------------------------------------
+    // Zero-extension of the inputs to 2*size bits
+    // ------------------------------------------------------------------
+    wire [2*size-1:0] mul_a_ext = {{size{1'b0}}, mul_a};
+    wire [2*size-1:0] mul_b_ext = {{size{1'b0}}, mul_b};
 
-    assign mul_a_extended = {{size{1'b0}}, mul_a};
-    assign mul_b_extended = {{size{1'b0}}, mul_b};
-
-    // Partial products
+    // ------------------------------------------------------------------
+    // Partial products : temp[i] = mul_b[i] ? (mul_a_ext << i) : 0
+    // ------------------------------------------------------------------
     wire [2*size-1:0] temp [size-1:0];
 
     genvar i;
     generate
         for (i = 0; i < size; i = i + 1) begin : gen_partial_product
-            assign temp[i] = mul_b_extended[i] ? (mul_a_extended << i)
-                                               : {(2*size){1'b0}};
+            assign temp[i] = mul_b_ext[i] ? (mul_a_ext << i) : {(2*size){1'b0}};
         end
     endgenerate
 
-    // Stage 1 pipeline registers: pairwise sums of adjacent partial products
-    reg [2*size-1:0] sum [size/2-1:0];
+    // ------------------------------------------------------------------
+    // Pipeline level 1 : pairwise addition of the partial products
+    //   sum[0] <= temp[0] + temp[1]
+    //   sum[1] <= temp[2] + temp[3]
+    // ------------------------------------------------------------------
+    reg  [2*size-1:0] sum [(size/2)-1:0];
 
-    integer j;
+    integer k;
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            for (j = 0; j < size/2; j = j + 1) begin
-                sum[j] <= {(2*size){1'b0}};
-            end
-        end else begin
-            for (j = 0; j < size/2; j = j + 1) begin
-                sum[j] <= temp[2*j] + temp[2*j+1];
-            end
+            for (k = 0; k < size/2; k = k + 1)
+                sum[k] <= {(2*size){1'b0}};
+        end
+        else begin
+            for (k = 0; k < size/2; k = k + 1)
+                sum[k] <= temp[2*k] + temp[2*k+1];
         end
     end
 
-    // Stage 2: final product
-    integer k;
+    // ------------------------------------------------------------------
+    // Combinational sum of the level-1 registers
+    // ------------------------------------------------------------------
     reg [2*size-1:0] sum_total;
-
+    integer m;
     always @(*) begin
         sum_total = {(2*size){1'b0}};
-        for (k = 0; k < size/2; k = k + 1) begin
-            sum_total = sum_total + sum[k];
-        end
+        for (m = 0; m < size/2; m = m + 1)
+            sum_total = sum_total + sum[m];
     end
 
+    // ------------------------------------------------------------------
+    // Pipeline level 2 : final product register
+    // ------------------------------------------------------------------
     always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
+        if (!rst_n)
             mul_out <= {(2*size){1'b0}};
-        end else begin
+        else
             mul_out <= sum_total;
-        end
     end
 
 endmodule

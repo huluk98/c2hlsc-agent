@@ -1,87 +1,10 @@
-//==========================================================================
-// 4-bit carry-lookahead unit
-//   Produces the internal carries, plus group generate/propagate.
-//==========================================================================
-module cla_4bit (
-    input  [4:1] A,
-    input  [4:1] B,
-    input        Cin,
-    output [4:1] S,
-    output       Gout,   // group generate
-    output       Pout    // group propagate
-);
+//======================================================================
+// adder_32bit : 32-bit Carry-Lookahead Adder
+//   Built from two 16-bit CLA blocks, each built from four 4-bit CLA
+//   blocks with group generate/propagate lookahead logic.
+//   Purely combinational, unsigned, carry-in hardwired to 0.
+//======================================================================
 
-    wire [4:1] g;        // bit generate
-    wire [4:1] p;        // bit propagate (XOR form, used for the sum)
-    wire [4:1] c;        // carry into each bit position
-
-    assign g = A & B;
-    assign p = A ^ B;
-
-    assign c[1] = Cin;
-    assign c[2] = g[1] | (p[1] & c[1]);
-    assign c[3] = g[2] | (p[2] & g[1]) | (p[2] & p[1] & c[1]);
-    assign c[4] = g[3] | (p[3] & g[2]) | (p[3] & p[2] & g[1]) |
-                  (p[3] & p[2] & p[1] & c[1]);
-
-    assign S = p ^ c;
-
-    // Group terms: generate/propagate for the whole nibble.
-    assign Gout = g[4] | (p[4] & g[3]) | (p[4] & p[3] & g[2]) |
-                  (p[4] & p[3] & p[2] & g[1]);
-    assign Pout = p[4] & p[3] & p[2] & p[1];
-
-endmodule
-
-
-//==========================================================================
-// 16-bit CLA block
-//   Four 4-bit CLA units joined by a second-level lookahead stage, so the
-//   block carries come from lookahead logic rather than a ripple chain.
-//==========================================================================
-module cla_16bit (
-    input  [16:1] A,
-    input  [16:1] B,
-    input         Cin,
-    output [16:1] S,
-    output        Cout
-);
-
-    wire [4:1] G;        // group generate  from each nibble
-    wire [4:1] P;        // group propagate from each nibble
-    wire [4:1] C;        // carry into each nibble
-
-    // Second-level lookahead over the four nibbles.
-    assign C[1] = Cin;
-    assign C[2] = G[1] | (P[1] & C[1]);
-    assign C[3] = G[2] | (P[2] & G[1]) | (P[2] & P[1] & C[1]);
-    assign C[4] = G[3] | (P[3] & G[2]) | (P[3] & P[2] & G[1]) |
-                  (P[3] & P[2] & P[1] & C[1]);
-
-    assign Cout = G[4] | (P[4] & G[3]) | (P[4] & P[3] & G[2]) |
-                  (P[4] & P[3] & P[2] & G[1]) |
-                  (P[4] & P[3] & P[2] & P[1] & C[1]);
-
-    cla_4bit u0 (.A(A[4:1]),   .B(B[4:1]),   .Cin(C[1]),
-                 .S(S[4:1]),   .Gout(G[1]),  .Pout(P[1]));
-
-    cla_4bit u1 (.A(A[8:5]),   .B(B[8:5]),   .Cin(C[2]),
-                 .S(S[8:5]),   .Gout(G[2]),  .Pout(P[2]));
-
-    cla_4bit u2 (.A(A[12:9]),  .B(B[12:9]),  .Cin(C[3]),
-                 .S(S[12:9]),  .Gout(G[3]),  .Pout(P[3]));
-
-    cla_4bit u3 (.A(A[16:13]), .B(B[16:13]), .Cin(C[4]),
-                 .S(S[16:13]), .Gout(G[4]),  .Pout(P[4]));
-
-endmodule
-
-
-//==========================================================================
-// 32-bit carry-lookahead adder
-//   Two 16-bit CLA blocks; lower block takes carry-in 0 and its carry-out
-//   feeds the upper block.  {C32, S} = A + B.
-//==========================================================================
 module adder_32bit (
     input  [32:1] A,
     input  [32:1] B,
@@ -89,22 +12,115 @@ module adder_32bit (
     output        C32
 );
 
-    wire c16;            // carry between the two 16-bit blocks
+    wire c16;          // carry between the two 16-bit blocks
+    wire pg_lo, gg_lo; // unused group terms of block 0
+    wire pg_hi, gg_hi; // unused group terms of block 1
 
-    cla_16bit lower (
-        .A   (A[16:1]),
-        .B   (B[16:1]),
-        .Cin (1'b0),
-        .S   (S[16:1]),
-        .Cout(c16)
+    // Low block : bits 1..16, carry-in = 0
+    cla_16bit u_cla_lo (
+        .a    (A[16:1]),
+        .b    (B[16:1]),
+        .cin  (1'b0),
+        .s    (S[16:1]),
+        .cout (c16),
+        .pg   (pg_lo),
+        .gg   (gg_lo)
     );
 
-    cla_16bit upper (
-        .A   (A[32:17]),
-        .B   (B[32:17]),
-        .Cin (c16),
-        .S   (S[32:17]),
-        .Cout(C32)
+    // High block : bits 17..32, carry-in = carry-out of low block
+    cla_16bit u_cla_hi (
+        .a    (A[32:17]),
+        .b    (B[32:17]),
+        .cin  (c16),
+        .s    (S[32:17]),
+        .cout (C32),
+        .pg   (pg_hi),
+        .gg   (gg_hi)
     );
+
+endmodule
+
+module cla_16bit (
+    input  [15:0] a,
+    input  [15:0] b,
+    input         cin,
+    output [15:0] s,
+    output        cout,
+    output        pg,   // group propagate of the whole 16-bit block
+    output        gg    // group generate  of the whole 16-bit block
+);
+
+    wire [3:0] blk_p;  // per-nibble group propagate
+    wire [3:0] blk_g;  // per-nibble group generate
+    wire       c4, c8, c12;
+
+    // Second-level lookahead across the four 4-bit blocks
+    assign c4   = blk_g[0] | (blk_p[0] & cin);
+    assign c8   = blk_g[1] | (blk_p[1] & blk_g[0])
+                           | (blk_p[1] & blk_p[0] & cin);
+    assign c12  = blk_g[2] | (blk_p[2] & blk_g[1])
+                           | (blk_p[2] & blk_p[1] & blk_g[0])
+                           | (blk_p[2] & blk_p[1] & blk_p[0] & cin);
+    assign cout = blk_g[3] | (blk_p[3] & blk_g[2])
+                           | (blk_p[3] & blk_p[2] & blk_g[1])
+                           | (blk_p[3] & blk_p[2] & blk_p[1] & blk_g[0])
+                           | (blk_p[3] & blk_p[2] & blk_p[1] & blk_p[0] & cin);
+
+    // Group terms of the entire 16-bit slice
+    assign pg = blk_p[3] & blk_p[2] & blk_p[1] & blk_p[0];
+    assign gg = blk_g[3] | (blk_p[3] & blk_g[2])
+                         | (blk_p[3] & blk_p[2] & blk_g[1])
+                         | (blk_p[3] & blk_p[2] & blk_p[1] & blk_g[0]);
+
+    cla_4bit u_n0 (
+        .a   (a[3:0]),   .b (b[3:0]),   .cin (cin),
+        .s   (s[3:0]),   .pg (blk_p[0]), .gg (blk_g[0])
+    );
+
+    cla_4bit u_n1 (
+        .a   (a[7:4]),   .b (b[7:4]),   .cin (c4),
+        .s   (s[7:4]),   .pg (blk_p[1]), .gg (blk_g[1])
+    );
+
+    cla_4bit u_n2 (
+        .a   (a[11:8]),  .b (b[11:8]),  .cin (c8),
+        .s   (s[11:8]),  .pg (blk_p[2]), .gg (blk_g[2])
+    );
+
+    cla_4bit u_n3 (
+        .a   (a[15:12]), .b (b[15:12]), .cin (c12),
+        .s   (s[15:12]), .pg (blk_p[3]), .gg (blk_g[3])
+    );
+
+endmodule
+
+module cla_4bit (
+    input  [3:0] a,
+    input  [3:0] b,
+    input        cin,
+    output [3:0] s,
+    output       pg,
+    output       gg
+);
+
+    wire [3:0] p, g;
+    wire       c1, c2, c3;
+
+    assign p = a ^ b;   // bit propagate
+    assign g = a & b;   // bit generate
+
+    assign c1 = g[0] | (p[0] & cin);
+    assign c2 = g[1] | (p[1] & g[0])
+                     | (p[1] & p[0] & cin);
+    assign c3 = g[2] | (p[2] & g[1])
+                     | (p[2] & p[1] & g[0])
+                     | (p[2] & p[1] & p[0] & cin);
+
+    assign s = p ^ {c3, c2, c1, cin};
+
+    assign pg = p[3] & p[2] & p[1] & p[0];
+    assign gg = g[3] | (p[3] & g[2])
+                     | (p[3] & p[2] & g[1])
+                     | (p[3] & p[2] & p[1] & g[0]);
 
 endmodule

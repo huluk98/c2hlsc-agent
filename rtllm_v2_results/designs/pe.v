@@ -8,7 +8,7 @@ module pe (
 
     always @(posedge clk or posedge rst) begin
         if (rst) begin
-            c <= 32'b0;
+            c <= 32'd0;
         end else begin
             c <= c + (a * b);
         end

@@ -1,6 +1,6 @@
 module traffic_light (
-    input  wire       clk,
     input  wire       rst_n,
+    input  wire       clk,
     input  wire       pass_request,
     output wire [7:0] clock,
     output reg        red,
@@ -18,7 +18,7 @@ module traffic_light (
     reg       p_red, p_yellow, p_green;
 
     // ---------------------------------------------------------------
-    // State transition / next-output logic
+    // State transition / next-lamp-value logic
     // ---------------------------------------------------------------
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -36,42 +36,45 @@ module traffic_light (
                     state    <= s1_red;
                 end
                 s1_red: begin
-                    p_red    <= 1'b1;
-                    p_yellow <= 1'b0;
-                    p_green  <= 1'b0;
                     if (cnt == 8'd3) begin
                         state    <= s3_green;
                         p_red    <= 1'b0;
+                        p_yellow <= 1'b0;
                         p_green  <= 1'b1;
                     end
                     else begin
-                        state <= s1_red;
-                    end
-                end
-                s2_yellow: begin
-                    p_red    <= 1'b0;
-                    p_yellow <= 1'b1;
-                    p_green  <= 1'b0;
-                    if (cnt == 8'd3) begin
                         state    <= s1_red;
-                        p_yellow <= 1'b0;
                         p_red    <= 1'b1;
-                    end
-                    else begin
-                        state <= s2_yellow;
+                        p_yellow <= 1'b0;
+                        p_green  <= 1'b0;
                     end
                 end
                 s3_green: begin
-                    p_red    <= 1'b0;
-                    p_yellow <= 1'b0;
-                    p_green  <= 1'b1;
                     if (cnt == 8'd3) begin
                         state    <= s2_yellow;
-                        p_green  <= 1'b0;
+                        p_red    <= 1'b0;
                         p_yellow <= 1'b1;
+                        p_green  <= 1'b0;
                     end
                     else begin
-                        state <= s3_green;
+                        state    <= s3_green;
+                        p_red    <= 1'b0;
+                        p_yellow <= 1'b0;
+                        p_green  <= 1'b1;
+                    end
+                end
+                s2_yellow: begin
+                    if (cnt == 8'd3) begin
+                        state    <= s1_red;
+                        p_red    <= 1'b1;
+                        p_yellow <= 1'b0;
+                        p_green  <= 1'b0;
+                    end
+                    else begin
+                        state    <= s2_yellow;
+                        p_red    <= 1'b0;
+                        p_yellow <= 1'b1;
+                        p_green  <= 1'b0;
                     end
                 end
                 default: begin
@@ -90,7 +93,7 @@ module traffic_light (
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n)
             cnt <= 8'd10;
-        else if (pass_request && green)
+        else if (pass_request && green && (cnt > 8'd10))
             cnt <= 8'd10;
         else if (!green && p_green)
             cnt <= 8'd60;
@@ -105,7 +108,7 @@ module traffic_light (
     assign clock = cnt;
 
     // ---------------------------------------------------------------
-    // Output register
+    // Output register logic
     // ---------------------------------------------------------------
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin

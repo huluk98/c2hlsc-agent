@@ -28,57 +28,48 @@ module alu (
     parameter SRAV = 6'b000111;
     parameter LUI  = 6'b001111;
 
-    wire signed [31:0] a_signed = a;
-    wire signed [31:0] b_signed = b;
+    // signed views of the operands
+    wire signed [31:0] a_signed;
+    wire signed [31:0] b_signed;
 
+    assign a_signed = a;
+    assign b_signed = b;
+
+    // 33-bit internal result: bit 32 carries out of the 32-bit datapath
     reg [32:0] res;
-    reg        overflow_r;
 
     assign r        = res[31:0];
-    assign carry    = res[32];
     assign zero     = (r == 32'b0);
+    assign carry    = res[32];
     assign negative = r[31];
-    assign overflow = overflow_r;
-    assign flag     = (aluc == SLT)  ? (a_signed < b_signed) :
-                      (aluc == SLTU) ? (a < b)               : 1'bz;
+
+    // signed overflow only makes sense for the signed add / subtract
+    assign overflow = ((aluc == ADD) && (a[31] == b[31]) && (res[31] != a[31])) ||
+                      ((aluc == SUB) && (a[31] != b[31]) && (res[31] != a[31]));
+
+    // flag is driven only by the set-less-than instructions
+    assign flag = ((aluc == SLT) || (aluc == SLTU)) ? 1'b1 : 1'bz;
 
     always @(*) begin
-        res        = 33'b0;
-        overflow_r = 1'b0;
         case (aluc)
-            ADD: begin
-                res        = {a[31], a} + {b[31], b};
-                overflow_r = (a[31] == b[31]) && (res[31] != a[31]);
-            end
-            ADDU: begin
-                res        = {1'b0, a} + {1'b0, b};
-                overflow_r = 1'b0;
-            end
-            SUB: begin
-                res        = {a[31], a} - {b[31], b};
-                overflow_r = (a[31] != b[31]) && (res[31] != a[31]);
-            end
-            SUBU: begin
-                res        = {1'b0, a} - {1'b0, b};
-                overflow_r = 1'b0;
-            end
-            AND:  res = {1'b0, a & b};
-            OR:   res = {1'b0, a | b};
-            XOR:  res = {1'b0, a ^ b};
-            NOR:  res = {1'b0, ~(a | b)};
-            SLT:  res = {32'b0, (a_signed < b_signed)};
-            SLTU: res = {32'b0, (a < b)};
-            SLL:  res = {1'b0, (b << a)};
-            SRL:  res = {1'b0, (b >> a)};
-            SRA:  res = {1'b0, (b_signed >>> a)};
-            SLLV: res = {1'b0, (b << a[4:0])};
-            SRLV: res = {1'b0, (b >> a[4:0])};
-            SRAV: res = {1'b0, (b_signed >>> a[4:0])};
-            LUI:  res = {1'b0, a[15:0], 16'b0};
-            default: begin
-                res        = 33'bz;
-                overflow_r = 1'b0;
-            end
+            ADD  : res = a_signed + b_signed;
+            ADDU : res = a + b;
+            SUB  : res = a_signed - b_signed;
+            SUBU : res = a - b;
+            AND  : res = a & b;
+            OR   : res = a | b;
+            XOR  : res = a ^ b;
+            NOR  : res = ~(a | b);
+            SLT  : res = (a_signed < b_signed) ? 33'd1 : 33'd0;
+            SLTU : res = (a < b) ? 33'd1 : 33'd0;
+            SLL  : res = b << a;
+            SRL  : res = b >> a;
+            SRA  : res = b_signed >>> a;
+            SLLV : res = b << a[4:0];
+            SRLV : res = b >> a[4:0];
+            SRAV : res = b_signed >>> a[4:0];
+            LUI  : res = {a[15:0], 16'h0000};
+            default : res = 33'bz;
         endcase
     end
 

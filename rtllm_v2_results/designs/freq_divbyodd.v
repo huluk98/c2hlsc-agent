@@ -1,3 +1,16 @@
+//------------------------------------------------------------------------------
+// freq_divbyodd : divide the input clock by an odd number (NUM_DIV, default 5)
+//
+//   Two modulo-NUM_DIV counters run off the two edges of clk:
+//     cnt1 / clk_div1  -> posedge domain
+//     cnt2 / clk_div2  -> negedge domain
+//   Each half-clock rises on the edge where its counter is 0 and falls on the
+//   edge where it reaches (NUM_DIV-1)/2, giving a period of exactly NUM_DIV clk
+//   cycles that starts right after reset is released.
+//   OR-ing the two (clk_div2 lags clk_div1 by half a clk period) yields a
+//   50% duty cycle output at f(clk)/NUM_DIV.
+//------------------------------------------------------------------------------
+
 module freq_divbyodd #(
     parameter NUM_DIV = 5
 ) (
@@ -6,61 +19,52 @@ module freq_divbyodd #(
     output wire clk_div
 );
 
-    // Width sufficient to hold values up to NUM_DIV-1
-    localparam CNT_W = (NUM_DIV <= 2)   ? 1 :
-                       (NUM_DIV <= 4)   ? 2 :
-                       (NUM_DIV <= 8)   ? 3 :
-                       (NUM_DIV <= 16)  ? 4 :
-                       (NUM_DIV <= 32)  ? 5 :
-                       (NUM_DIV <= 64)  ? 6 :
-                       (NUM_DIV <= 128) ? 7 :
-                       (NUM_DIV <= 256) ? 8 : 32;
-
-    localparam HALF = (NUM_DIV - 1) / 2;
+    localparam CNT_W = (NUM_DIV > 1) ? $clog2(NUM_DIV) : 1;
 
     reg [CNT_W-1:0] cnt1;
     reg [CNT_W-1:0] cnt2;
     reg             clk_div1;
     reg             clk_div2;
 
-    // Rising-edge domain
+    // ---------------- positive edge domain ----------------
     always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
+        if (!rst_n)
             cnt1 <= {CNT_W{1'b0}};
-        end else if (cnt1 == NUM_DIV - 1) begin
+        else if (cnt1 == NUM_DIV - 1)
             cnt1 <= {CNT_W{1'b0}};
-        end else begin
+        else
             cnt1 <= cnt1 + 1'b1;
-        end
     end
 
     always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
+        if (!rst_n)
             clk_div1 <= 1'b0;
-        end else if ((cnt1 == {CNT_W{1'b0}}) || (cnt1 == HALF)) begin
+        else if ((cnt1 == {CNT_W{1'b0}}) || (cnt1 == (NUM_DIV - 1) / 2))
             clk_div1 <= ~clk_div1;
-        end
+        else
+            clk_div1 <= clk_div1;
     end
 
-    // Falling-edge domain
+    // ---------------- negative edge domain ----------------
     always @(negedge clk or negedge rst_n) begin
-        if (!rst_n) begin
+        if (!rst_n)
             cnt2 <= {CNT_W{1'b0}};
-        end else if (cnt2 == NUM_DIV - 1) begin
+        else if (cnt2 == NUM_DIV - 1)
             cnt2 <= {CNT_W{1'b0}};
-        end else begin
+        else
             cnt2 <= cnt2 + 1'b1;
-        end
     end
 
     always @(negedge clk or negedge rst_n) begin
-        if (!rst_n) begin
+        if (!rst_n)
             clk_div2 <= 1'b0;
-        end else if ((cnt2 == {CNT_W{1'b0}}) || (cnt2 == HALF)) begin
+        else if ((cnt2 == {CNT_W{1'b0}}) || (cnt2 == (NUM_DIV - 1) / 2))
             clk_div2 <= ~clk_div2;
-        end
+        else
+            clk_div2 <= clk_div2;
     end
 
+    // ---------------- output combination ----------------
     assign clk_div = clk_div1 | clk_div2;
 
 endmodule

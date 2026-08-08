@@ -40,8 +40,12 @@ Design notes, in the order they matter:
       family, and the *corrected* p decides the verdict.
     * A **paired bootstrap** (seeded, deterministic) gives a CI on the delta itself.
     * The report states, computed rather than asserted, the **minimum number of discordant
-      designs** any arm would need in order to reach significance at all. At alpha=0.05 that
-      is 6 -- an arm that flips 5 designs one way and 0 the other is still not significant.
+      designs** any arm would need in order to reach significance at all. That floor is
+      computed against the **Holm-corrected** p, since the corrected p is what decides the
+      verdict: for the default 7 non-baseline arms at alpha=0.05 it is **9**. (The
+      uncorrected floor is 6; quoting 6 beside a corrected verdict understates the bar by
+      three designs.) An arm that flips 8 designs one way and 0 the other is still not
+      significant in a 7-arm family.
       Every arm below that bar is labelled ``NOT SIGNIFICANT`` and no direction word
       ("better", "worse", "helps", "hurts") is emitted for it anywhere.
 
@@ -91,7 +95,7 @@ DRIVER_PATH = SCRIPTS_DIR / "run_rtllm_v2.py"
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from c2hlsc_agent import rtllm_bench  # noqa: E402
+from c2hlsc_agent import rtllm_agent, rtllm_bench  # noqa: E402
 
 
 RESULTS_FILE = "results.jsonl"
@@ -222,7 +226,10 @@ ARM_SPECS: "tuple[ArmSpec, ...]" = (
     ArmSpec(
         "evidence=self",
         {FACTOR_EVIDENCE: "self"},
-        "Repair sees only evidence the agent derived itself. The strict, self-derived track.",
+        "Repair sees the log tail PLUS a trace of the candidate's own signals. Despite the "
+        "name this is NOT the strict track: the policy is 'logs' plus that channel, so it "
+        "still forwards the benchmark testbench's transcript. Measures what a self-derived "
+        "trace adds ON TOP of the log tail.",
     ),
     ArmSpec(
         "evidence=oracle",
@@ -260,10 +267,105 @@ UNCLASSIFIED = "unclassified"
 
 EVIDENCE_TRACKS: "dict[str, tuple[str, str]]" = {
     "none": (SELF_DERIVED, "the repair agent sees no tool output at all"),
-    "self": (SELF_DERIVED, "the repair agent sees only evidence it derived itself"),
     "logs": (ORACLE_DERIVED, "the repair agent sees the BENCHMARK testbench's simulation output"),
+    "self": (
+        ORACLE_DERIVED,
+        "logs PLUS a trace the agent derived itself. The extra channel is genuinely "
+        "self-derived, but the policy is implemented as a strict SUPERSET of 'logs' and "
+        "forwards the same benchmark-testbench transcript, so it cannot be filed as strict",
+    ),
     "oracle": (ORACLE_DERIVED, "the repair agent sees benchmark-oracle output"),
 }
+
+
+def testbench_fed_policies() -> "frozenset[str]":
+    """Policies under which the repair agent is shown the BENCHMARK testbench's output.
+
+    Derived by *calling* :func:`rtllm_agent.build_evidence` with a probe transcript and
+    checking whether the probe's marker survives into the prompt -- not restated here as a
+    second name list. A name list is precisely how ``self`` came to be misfiled: the policy
+    *sounds* self-derived, its extra channel really is self-derived, and its one-line
+    description in the ablation write-up says "logs, plus a trace of the candidate's own
+    ports" -- but "logs, plus" means it forwards the testbench transcript verbatim. Reading
+    the name instead of the behaviour put a testbench-fed policy in the strict headline
+    track. Asking the implementation cannot drift from the implementation.
+    """
+
+    probe = "ZZ_PROBE_TESTBENCH_TRANSCRIPT_ZZ"
+    sim = rtllm_bench.SimResult(
+        design="probe",
+        syntax_pass=True,
+        func_pass=False,
+        func_pass_strict=False,
+        timed_out=False,
+        compile_log="",
+        sim_log=f"{probe}\nFAIL",
+        duration_s=0.0,
+        failure_family="functional_mismatch",
+    )
+    fed = set()
+    for policy in getattr(rtllm_agent, "EVIDENCE_POLICIES", ()):
+        try:
+            text = rtllm_agent.build_evidence(sim, rtllm_agent.RtllmAgentConfig(evidence_policy=policy))
+        except Exception:  # pragma: no cover - a policy the probe cannot exercise
+            continue
+        if probe in text:
+            fed.add(policy)
+    return frozenset(fed)
+
+
+def validate_track_classification(overrides: "dict[str, str] | None" = None) -> None:
+    """The driver's oracle stamp must never land in this report's self-derived track.
+
+    Two modules answer "is this oracle-derived?" and they answer *different questions*:
+
+    * ``rtllm_agent.ORACLE_DERIVED_POLICIES`` is the narrow one -- policies that show the
+      model something derived from the **reference RTL**, i.e. the answer key's own
+      implementation. Today: ``oracle`` only. That set drives the
+      ``oracle_derived_evidence`` stamp on every row, report and driver warning.
+    * ``EVIDENCE_TRACKS`` here is the broad one -- policies that show the model anything the
+      **benchmark's own testbench** produced. That includes ``logs``, because the testbench
+      *is* the oracle: its verdict is a judgement made with the answer key, and on 13 of the
+      50 RTLLM v2 testbenches the failing ``$display`` prints the expected value outright.
+      It also includes ``self``, which is ``logs`` plus an extra channel and so forwards the
+      same transcript -- see :func:`testbench_fed_policies`.
+
+    Broad must contain narrow. If it ever does not, some policy is stamped an upper bound by
+    the driver while this report files it under the strict headline track -- exactly the
+    confusion the two-track split exists to prevent. Fail loudly instead.
+
+    Containment is checked against **two** narrow sets, because the name-list check alone
+    missed a real misfiling:
+
+    1. ``rtllm_agent.ORACLE_DERIVED_POLICIES`` -- declared reference-RTL-derived.
+    2. :func:`testbench_fed_policies` -- *observed* to forward the benchmark testbench's
+       transcript. This is the one that catches ``self``, which the driver does not stamp
+       (its extra channel is the candidate's own signals, not the reference's) and which a
+       reader of the name would file as strict, but which is built as ``logs`` plus that
+       channel and therefore shows the testbench transcript in full.
+    """
+
+    checks = (
+        (
+            set(getattr(rtllm_agent, "ORACLE_DERIVED_POLICIES", frozenset())),
+            "rtllm_agent stamps {policies} as reference-RTL-derived evidence",
+        ),
+        (
+            set(testbench_fed_policies()),
+            "build_evidence forwards the benchmark testbench transcript under {policies}",
+        ),
+    )
+    for narrow, claim in checks:
+        misfiled = sorted(p for p in narrow if classify_track(p, overrides)[0] != ORACLE_DERIVED)
+        if misfiled:
+            raise SystemExit(
+                "track classification is inconsistent: "
+                + claim.format(policies=misfiled)
+                + f", but this report would file {'them' if len(misfiled) > 1 else 'it'} under "
+                f"{[classify_track(p, overrides)[0] for p in misfiled]}. An upper bound must "
+                "never be reported in the strict track. Fix EVIDENCE_TRACKS or drop the "
+                "--track-override that caused this."
+            )
 
 
 def classify_track(policy: str, overrides: "dict[str, str] | None" = None) -> "tuple[str, str]":
@@ -538,16 +640,29 @@ def mcnemar_exact_p(b: int, c: int) -> float:
     return min(1.0, 2.0 * tail)
 
 
-def min_discordant_for_significance(alpha: float = 0.05, max_n: int = 400) -> "int | None":
+def min_discordant_for_significance(
+    alpha: float = 0.05, max_n: int = 400, n_tests: int = 1
+) -> "int | None":
     """Smallest discordant count that could reach ``alpha`` even if every flip agrees.
 
-    Computed, not asserted. At alpha=0.05 this is 6: an arm that flips 5 designs one way and
-    none the other still has p=0.0625 and is not significant. Printing this number is the
-    single most effective guard against reading a one- or two-design delta as an effect.
+    Computed, not asserted. Two versions of this number exist and they differ a lot:
+
+    * ``n_tests=1`` -- the uncorrected floor. At alpha=0.05 this is 6: an arm that flips 5
+      designs one way and none the other still has p=0.0625.
+    * ``n_tests=m`` -- the floor that actually applies, because
+      :func:`significance_verdict` tests the **Holm-corrected** p, not the raw one. Holm
+      multiplies the smallest p in a family of ``m`` by ``m``, so the bar rises with the
+      number of arms. For the 7 non-baseline arms of the default RTLLM matrix the floor is
+      **9**, not 6.
+
+    Reporting the uncorrected floor next to a corrected verdict is how a table quietly
+    understates its own bar: it tells the reader 6 flips would settle the question when the
+    rule being applied needs 9. Pass the real family size.
     """
 
+    m = max(1, int(n_tests))
     for n in range(1, max_n + 1):
-        if 2.0 * (0.5**n) <= alpha:
+        if min(1.0, m * 2.0 * (0.5**n)) <= alpha:
             return n
     return None
 
@@ -938,7 +1053,8 @@ def build_report(
     for name, adjusted in zip(names, holm_adjust([comparisons[n].p_exact for n in names])):
         comparisons[name].p_holm = adjusted
 
-    floor = min_discordant_for_significance(alpha)
+    # The verdict tests the Holm-corrected p, so the floor must be the corrected one.
+    floor = min_discordant_for_significance(alpha, n_tests=len(comparisons))
     n_primary = len(base_outcomes)
     rows: "list[dict[str, Any]]" = []
     for arm in arms:
@@ -1084,10 +1200,21 @@ def render_markdown(report: "dict[str, Any]") -> str:
     lines.append(
         f"Arms whose repair agent can see output produced by the benchmark's own testbench are "
         f"**{ORACLE_DERIVED}**: their numbers are an upper bound and are **not comparable to "
-        f"published single-shot pass@1**. Arms that never see the oracle are **{SELF_DERIVED}** "
-        "and are the honest headline. The baseline arm is "
-        f"**{baseline_track}**, so a delta between it and a {SELF_DERIVED} arm crosses tracks; "
-        "those rows are marked &Dagger; and measure what oracle feedback is worth, nothing else."
+        f"published single-shot pass@1**. Every evidence policy except `none` is in that "
+        f"track, including `self`, which is `logs` plus an extra channel and so forwards the "
+        f"same transcript. Arms that never see the oracle are **{SELF_DERIVED}**. The baseline "
+        f"arm is **{baseline_track}**, so a delta between it and a {SELF_DERIVED} arm crosses "
+        "tracks; those rows are marked &Dagger; and measure what oracle feedback is worth, "
+        "nothing else."
+    )
+    lines.append("")
+    lines.append(
+        f"**The {SELF_DERIVED} track is not a headline candidate.** It contains exactly one "
+        "arm -- the blind retry -- which is the deliberately crippled floor of the matrix, not "
+        "a configuration anyone would ship. The genuinely uncontaminated number in this table "
+        "is the **round-0 column**: round 0 is produced before any evidence is shown, so it is "
+        "identical in construction across every arm and has had no contact with the oracle. "
+        "That is the column to compare against a published single-shot pass@1."
     )
     lines.append("")
 
@@ -1495,12 +1622,14 @@ def print_plan(plan: "Sequence[dict[str, Any]]", subset: HardSubset, args: argpa
     if subset.excluded_backend_failed:
         print(f"  excluded, backend errored  : {', '.join(subset.excluded_backend_failed)}")
     print()
-    floor = min_discordant_for_significance(args.alpha)
+    n_tests = max(0, len(plan) - 1)  # every arm but the baseline is one test
+    floor = min_discordant_for_significance(args.alpha, n_tests=n_tests or 1)
     n = len(subset.selected)
     if n and floor:
         print(
-            f"power note: n={n}, so one design = {100.0 / n:.1f} pp, and no arm can reach "
-            f"alpha={args.alpha:g} with fewer than {floor} discordant designs."
+            f"power note: n={n}, so one design = {100.0 / n:.1f} pp, and with Holm across "
+            f"{n_tests} test(s) no arm can reach alpha={args.alpha:g} with fewer than "
+            f"{floor} discordant designs."
         )
         print()
     print(f"{len(plan)} arm(s):")
@@ -1522,6 +1651,7 @@ def main(argv: "list[str] | None" = None) -> int:
     validate_arms(ARM_SPECS)
     specs = select_arms(args.arms, args.skip_arms)
     track_overrides = parse_track_overrides(args.track_override)
+    validate_track_classification(track_overrides)
     out_dir = Path(args.out_dir)
     check_out_dir(out_dir)
     subset = resolve_subset(args)

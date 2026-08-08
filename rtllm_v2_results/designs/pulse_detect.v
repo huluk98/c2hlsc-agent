@@ -1,55 +1,71 @@
 module pulse_detect (
-    input  wire clk,
-    input  wire rst_n,
-    input  wire data_in,
-    output reg  data_out
+    input      clk,
+    input      rst_n,
+    input      data_in,
+    output reg data_out
 );
 
     // State encoding
-    localparam S_IDLE = 2'd0;  // no valid leading 0 seen yet
-    localparam S_ZERO = 2'd1;  // leading 0 observed
-    localparam S_ONE  = 2'd2;  // 0 followed by 1 observed
+    localparam S_IDLE   = 2'b00;  // last sample was 0, waiting for the rising edge
+    localparam S_DETECT = 2'b01;  // saw 0 then 1, waiting for trailing 0
+    localparam S_DONE   = 2'b10;  // trailing 0 seen, pulse reported this cycle
+    localparam S_HIGH   = 2'b11;  // data_in held high for more than one cycle
 
     reg [1:0] state;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            state <= S_IDLE;
-        end else begin
+            state    <= S_IDLE;
+            data_out <= 1'b0;
+        end
+        else begin
             case (state)
                 S_IDLE: begin
-                    // wait for the leading 0 of a pulse
-                    if (data_in == 1'b0)
-                        state <= S_ZERO;
+                    // after reset the line is already known to be 0, so a 1
+                    // here immediately starts a pulse
+                    if (data_in == 1'b1)
+                        state <= S_DETECT;
                     else
                         state <= S_IDLE;
+                    data_out <= 1'b0;
                 end
 
-                S_ZERO: begin
-                    // 0 seen; a 1 advances the pulse
+                S_DETECT: begin
+                    if (data_in == 1'b0) begin
+                        state    <= S_DONE;
+                        data_out <= 1'b1;    // 0-1-0 seen in exactly 3 cycles
+                    end
+                    else begin
+                        // the 1 lasts longer than one cycle: not a pulse
+                        state    <= S_HIGH;
+                        data_out <= 1'b0;
+                    end
+                end
+
+                S_DONE: begin
+                    // the trailing 0 doubles as the leading 0 of the next pulse
                     if (data_in == 1'b1)
-                        state <= S_ONE;
+                        state <= S_DETECT;
                     else
-                        state <= S_ZERO;
+                        state <= S_IDLE;
+                    data_out <= 1'b0;
                 end
 
-                S_ONE: begin
-                    // 0 -> 1 seen; a 0 now completes the pulse and also
-                    // serves as the leading 0 of the next pulse
-                    if (data_in == 1'b0)
-                        state <= S_ZERO;
+                S_HIGH: begin
+                    // wait for the line to fall; that 0 becomes the leading 0
+                    if (data_in == 1'b1)
+                        state <= S_HIGH;
                     else
-                        state <= S_IDLE;  // 1 held too long: not a pulse
+                        state <= S_IDLE;
+                    data_out <= 1'b0;
                 end
 
-                default: state <= S_IDLE;
+                default: begin
+                    state    <= S_IDLE;
+                    data_out <= 1'b0;
+                end
             endcase
         end
-    end
-
-    // Output asserted on the final cycle of the pulse (0 -> 1 -> 0)
-    always @(*) begin
-        data_out = (state == S_ONE) && (data_in == 1'b0);
     end
 
 endmodule

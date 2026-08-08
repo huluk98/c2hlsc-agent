@@ -4,9 +4,7 @@ module right_shifter (
     output reg  [7:0] q
 );
 
-    initial begin
-        q = 8'b0;
-    end
+    initial q = 8'b0;
 
     always @(posedge clk) begin
         q <= {d, q[7:1]};

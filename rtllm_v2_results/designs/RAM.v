@@ -1,44 +1,43 @@
 module RAM #(
     parameter WIDTH = 6,
     parameter DEPTH = 8
-) (
-    input  wire                 clk,
-    input  wire                 rst_n,
-    input  wire                 write_en,
-    input  wire [WIDTH-1:0]     write_addr,
-    input  wire [WIDTH-1:0]     write_data,
-    input  wire                 read_en,
-    input  wire [WIDTH-1:0]     read_addr,
-    output reg  [WIDTH-1:0]     read_data
+)(
+    input                      clk,
+    input                      rst_n,
+    input                      write_en,
+    input  [WIDTH-1:0]         write_addr,
+    input  [DEPTH-1:0]         write_data,
+    input                      read_en,
+    input  [WIDTH-1:0]         read_addr,
+    output reg [DEPTH-1:0]     read_data
 );
 
-    // 2**WIDTH = 64 locations, each WIDTH = 6 bits wide
-    reg [WIDTH-1:0] mem [0:(2**WIDTH)-1];
+    reg [DEPTH-1:0] RAM [2**WIDTH-1:0];
 
     integer i;
 
     // Write port
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            for (i = 0; i < (2**WIDTH); i = i + 1) begin
-                mem[i] <= {WIDTH{1'b0}};
+            for (i = 0; i < 2**WIDTH; i = i + 1) begin
+                RAM[i] <= {DEPTH{1'b0}};
             end
         end
         else if (write_en) begin
-            mem[write_addr] <= write_data;
+            RAM[write_addr] <= write_data;
         end
     end
 
     // Read port
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            read_data <= {WIDTH{1'b0}};
+            read_data <= {DEPTH{1'b0}};
         end
         else if (read_en) begin
-            read_data <= mem[read_addr];
+            read_data <= RAM[read_addr];
         end
         else begin
-            read_data <= {WIDTH{1'b0}};
+            read_data <= {DEPTH{1'b0}};
         end
     end
 

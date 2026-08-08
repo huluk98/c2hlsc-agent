@@ -391,7 +391,7 @@ def stage_project(
 
     ref = golden_symbol(top)
     tb_text = testbench.read_text(encoding="utf-8")
-    already = f'extern "C"' in tb_text and f" {ref}(void);" in tb_text
+    already = 'extern "C"' in tb_text and f" {ref}(void);" in tb_text
     if not already:
         new_tb, changed = rewrite_testbench(tb_text, top)
         if not changed:

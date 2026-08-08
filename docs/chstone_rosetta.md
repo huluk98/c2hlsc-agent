@@ -75,9 +75,33 @@ constructs; the default (`--keep-going`) matches CHStone's own Vitis flow, which
 | rung | result |
 | --- | --- |
 | native self-check (calibration) | **12/12 pass** |
-| deterministic converter, **with repair** | **0/12** |
-| LLM generator, **with repair** | **6/12** (`aes`, `dfadd`, `dfdiv`, `dfmul`, `dfsin`, `gsm`) |
+| deterministic converter, **with repair** | **6/12** (`adpcm`, `aes`, `dfadd`, `dfdiv`, `dfmul`, `dfsin`) |
+| LLM generator, **with repair** | **8/12** (the six above, plus `gsm`, `sha`) |
 | Vitis CSim / CSynth / CoSim | not attempted (no `vitis_hls`) |
+
+> **These numbers replace an earlier 0/12 and 6/12, and the difference is almost entirely a
+> harness fix, not a better agent.** Under the previous staging the equivalence testbench
+> `#include`d the golden reference `input.c` into itself; CHStone is C89 and the testbench is
+> C++, so for most benchmarks that build failed *before the candidate was ever exercised*.
+> Those rows were zeros recorded for a defect in the harness — measurements that never
+> happened — and reporting the change as "+6 passes" would badly understate what moved.
+> The honest framing is reachability:
+>
+> | staging | repair rounds | benchmarks that reached the oracle at all | passed |
+> | --- | :-: | :-: | :-: |
+> | `legacy_inline` | 0 | 8/12 | 0 |
+> | `legacy_inline` | 1 | **3/12** | 0 |
+> | `golden_c_tu` (current) | 0 | 12/12 | 0 |
+> | `golden_c_tu` (current) | 1 | **12/12** | 6 |
+>
+> Note the second row. Under the old staging, **turning repair on made things worse**:
+> enabling a repair round pulled the original C into the candidate as well, so the link
+> failed with `multiple definition of 'main_result'` and reachability collapsed from 8 to 3.
+> The current staging compiles the golden reference **as C, in its own translation unit**,
+> which removes both the C-as-C++ failure and the symbol collision.
+>
+> Measured with `scripts/run_chstone.py --legacy-staging` if you want to reproduce the old
+> behaviour; the arms are in `runs/abl_det_legacy_r{0,1,2,3}` and `runs/abl_det_staged_r{0,1,2,3}`.
 
 **Run the repair loop.** `--auto-repair --max-iterations N` is independent of `--use-llm`:
 `hlsc_repair_agent` applies deterministic mechanical repairs (missing includes,
@@ -87,28 +111,29 @@ of this harness gated `--auto-repair` behind `--use-llm`, so the first determini
 published here measured single-shot generation and called it the agent. Both numbers above
 now include repair.
 
-The LLM generator is the headline: **6/12**, against 0/12 for the deterministic converter
-under identical repair settings. On `dfmul` it emitted a self-contained 566-line translation
-— the SoftFloat call graph inlined into a namespace, `printf` guarded behind
+The LLM generator is the headline: **8/12**, against 6/12 for the deterministic converter
+under identical repair and staging settings. On `dfmul` it emitted a self-contained 566-line
+translation — the SoftFloat call graph inlined into a namespace, `printf` guarded behind
 `#ifndef __SYNTHESIS__`, the 256-entry `countLeadingZeros32` table replaced by a branchless
 cascade — and passed with `all 100 tests passed`. `gsm` (714 lines) and `aes` (659 lines)
-likewise pass, each after 2 repair iterations. Runs take 8–20 minutes per benchmark.
+likewise pass. Runs take 8–20 minutes per benchmark.
 
-Read the 6/12 against what the flow can actually score. Four benchmarks
-(`adpcm`, `blowfish`, `jpeg`, `motion`) fail because CHStone's C is not valid C++ and never
-reach the model's output, and one (`mips`) fails on the golden-vs-candidate symbol
-collision. **On the 7 benchmarks where the flow itself works, the LLM generator passes 6**
-— `sha` is the single genuine generation failure.
+Now that all 12 reach the oracle, the generator gap is directly readable: the LLM passes the
+same six the deterministic converter does, **plus `gsm` and `sha`**. That +2 is the only part
+of the CHStone result that is an agent-quality difference; everything else the staging fix
+moved was a measurement that had not previously been taken.
 
-The two LLM failures are **not** wrong logic. Both are link-time symbol collisions: the
-golden reference and the generated HLS-C are compiled into one binary, and both define the
-same file-scope globals (`sha_info_count_lo`, `sha_info_data`, `main_result`), so the link
-fails with `multiple definition of ...`. The repo's equivalence testbench macro-renames the
-golden *function* but not its globals. `dfadd` and `dfmul` passed precisely because the
-model chose to wrap its output in a namespace; nothing instructs it to. Two clean fixes:
-tell the generator to namespace unconditionally, or compile the golden as a separate
-translation unit with renamed symbols. Until one lands, treat `mips`/`sha` as a harness
-limitation, not a model result.
+The four remaining failures split into two families, and neither is wrong logic:
+
+| family | n | benchmarks | whose defect |
+| --- | :-: | --- | --- |
+| `candidate_includes_original_c` | 2 | `blowfish`, `motion` | the generator re-includes the original C, reintroducing K&R definitions `g++` rejects |
+| `generated_hlsc_does_not_compile` | 2 | `jpeg`, `mips` | the generated HLS-C itself |
+
+`jpeg` is the largest benchmark in the suite and `mips` the one whose top closes over the
+most file-scope state; both are genuine generation failures, not harness artifacts. For the
+deterministic converter the same two families cover its six failures, with `gsm` and `sha`
+additionally failing to compile.
 
 ### Where the deterministic path actually stops
 
@@ -119,33 +144,37 @@ undeclared symbols (`test_compressed`, `IN_END`, `float64`, `N`, `x1`).
 
 With repair on, that is no longer the whole story. `hlsc_repair_agent` applies exactly the
 right mechanical fix — *"include original source with renamed top to supply helper
-definitions"* — and the wall moves. The 0/12 is now **three distinct causes**:
+definitions"* — and the wall moves. Under the **old** `legacy_inline` staging that fix
+immediately collided with the harness, and the 0/12 decomposed into three causes:
 
-| family | n | benchmarks | whose defect |
+| family (legacy staging) | n | benchmarks | whose defect |
 | --- | :-: | --- | --- |
 | `golden_candidate_symbol_collision` | 5 | `aes`, `dfadd`, `dfdiv`, `dfmul`, `dfsin` | the equivalence harness |
 | `original_c_not_valid_cpp` | 4 | `adpcm`, `blowfish`, `jpeg`, `motion` | the C-vs-C++ flow |
 | `generated_hlsc_does_not_compile` | 3 | `gsm`, `mips`, `sha` | the converter |
 
-Note which five the symbol collision blocks: `aes`, `dfadd`, `dfdiv`, `dfmul`, `dfsin` are
-exactly the five the LLM generator goes on to pass. It sidesteps the collision by putting
-its translation in a namespace — something nothing in the prompt asks it to do.
+Only the last three were the converter's own reach. The other nine were properties of the
+flow, and both causes have since been fixed at the source by the `golden_c_tu` staging:
 
-Only the last three are the converter's reach. The other nine are properties of the flow:
-
-- **Symbol collision.** Once the repair includes the original source to supply helpers, the
-  golden reference TU and the HLS-C TU both define the original's file-scope globals
-  (`float_rounding_mode`, `float_exception_flags`, `sha_info_data`, `main_result`), and the
-  link fails with `multiple definition of`. This is the *same* defect that blocks the LLM
-  path on `mips`/`sha`. The equivalence testbench macro-renames the golden *function* but
-  not its globals.
+- **Symbol collision.** The repair included the original source to supply helpers, so the
+  golden TU and the HLS-C TU both defined the original's file-scope globals
+  (`float_rounding_mode`, `float_exception_flags`, `sha_info_data`, `main_result`) and the
+  link failed with `multiple definition of`. Compiling the golden reference as a **separate
+  C translation unit** removes the collision outright.
 - **C compiled as C++.** CHStone is C; the equivalence testbench is C++. Narrowing
   conversions, K&R parameter declarations and tentative-definition redeclarations are legal
-  C that `g++` rejects outright.
+  C that `g++` rejects. Compiling the golden **as C** removes this for the reference side.
 
-Both are fixable in the repo rather than in the benchmark, and fixing the symbol collision
-alone would unblock 5 deterministic benchmarks and 2 LLM ones. That is the highest-value
-next change this exercise surfaced.
+With both fixed, all 12 benchmarks reach the oracle and the deterministic converter scores
+6/12. What remains — `blowfish`/`motion` re-including the original C, `jpeg`/`mips` failing
+to compile — is on the generated side, which is where a converter result belongs.
+
+The prediction this document made before the fix ("fixing the symbol collision alone would
+unblock 5 deterministic benchmarks and 2 LLM ones") is worth scoring honestly: the
+deterministic converter gained **6** (the predicted 5, plus `adpcm`, which was blocked by
+the C-as-C++ cause rather than the collision), and the LLM path gained **2** (`mips` was
+predicted and did *not* unblock; `sha` and `adpcm` did). The direction was right, the
+per-benchmark attribution was not.
 
 Running with `--strict-diagnostics` instead stops one rung earlier, at
 `static_source_rejected` with a `file-io` diagnostic (console I/O in the top).
@@ -167,11 +196,22 @@ this harness attributed that to the generated HLS-C — reporting the LLM path a
 re-runs host equivalence, and treats the equivalence log as authoritative over
 `conversion_report.json`'s phase field, which records the state from before staging.
 
-The deterministic converter's 0/12 survived the fix unchanged, and its failures are
+The deterministic converter's 0/12 survived *that* fix unchanged, and its failures were
 provably on the generated side (`hls_top.cpp` referencing `float64`, `N`, `x1`). `adpcm` is
 single-file, so it had no siblings to stage and failed that way all along — which is why
 the original result looked coherent enough to trust. Calibration is what catches this: if
 the reference cannot build, no candidate result from that run means anything.
+
+**This happened twice.** The sibling-staging bug above is one instance; the
+`legacy_inline` staging described earlier in this section is a second, larger one, and it
+survived the first fix because calibration only proves the *reference* builds — it says
+nothing about whether the reference and the candidate can be linked into one binary, which
+is where the second bug lived. The deterministic converter's 0/12 was, in the end, mostly
+that second bug: it reads 6/12 once the golden reference is compiled as its own C
+translation unit. Two lessons, both cheap: a rung that scores zero for every benchmark is
+far more likely to be a harness defect than a uniformly incapable generator, and
+"reached the oracle at all" deserves to be a reported metric in its own right — it is now
+`reachable` in `report.json`.
 
 ---
 

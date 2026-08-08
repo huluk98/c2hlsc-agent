@@ -1,33 +1,39 @@
+//
+// multi_16bit : unsigned 16x16 shift-and-accumulate multiplier
+//
+
 module multi_16bit (
-    input             clk,
-    input             rst_n,
-    input             start,
-    input      [15:0] ain,
-    input      [15:0] bin,
-    output     [31:0] yout,
-    output            done
+    input  wire        clk,
+    input  wire        rst_n,
+    input  wire        start,
+    input  wire [15:0] ain,
+    input  wire [15:0] bin,
+    output wire [31:0] yout,
+    output wire        done
 );
 
+    // shift counter: must be able to hold 17 -> 5 bits
     reg [4:0]  i;
+    reg        done_r;
     reg [15:0] areg;
     reg [15:0] breg;
     reg [31:0] yout_r;
-    reg        done_r;
 
-    assign yout = yout_r;
-    assign done = done_r;
-
-    // Data bit control: shift count register
+    // ---------------------------------------------------------------
+    // Data bit control : shift count register
+    // ---------------------------------------------------------------
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n)
             i <= 5'd0;
-        else if (start && i < 5'd17)
+        else if (start && (i < 5'd17))
             i <= i + 5'd1;
         else if (!start)
             i <= 5'd0;
     end
 
-    // Multiplication completion flag generation
+    // ---------------------------------------------------------------
+    // Multiplication completion flag
+    // ---------------------------------------------------------------
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n)
             done_r <= 1'b0;
@@ -37,7 +43,9 @@ module multi_16bit (
             done_r <= 1'b0;
     end
 
-    // Shift and accumulate operation
+    // ---------------------------------------------------------------
+    // Shift and accumulate
+    // ---------------------------------------------------------------
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             areg   <= 16'd0;
@@ -56,5 +64,11 @@ module multi_16bit (
             end
         end
     end
+
+    // ---------------------------------------------------------------
+    // Output assignment
+    // ---------------------------------------------------------------
+    assign yout = yout_r;
+    assign done = done_r;
 
 endmodule

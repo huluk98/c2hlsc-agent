@@ -1,3 +1,9 @@
+//======================================================================
+// radix2_div : simplified radix-2 (restoring) divider
+//   8-bit signed / unsigned division
+//   result = { remainder[7:0], quotient[7:0] }
+//======================================================================
+
 module radix2_div (
     input  wire        clk,
     input  wire        rst,
@@ -5,93 +11,96 @@ module radix2_div (
     input  wire [7:0]  dividend,
     input  wire [7:0]  divisor,
     input  wire        opn_valid,
-    input  wire        res_ready,
     output reg         res_valid,
+    input  wire        res_ready,
     output wire [15:0] result
 );
 
     // ------------------------------------------------------------------
-    // State
+    // state
     // ------------------------------------------------------------------
-    reg  [16:0] SR;            // {partial_remainder[8:0], quotient[7:0]}
-    reg  [8:0]  NEG_DIVISOR;   // two's complement of |divisor|
-    reg  [8:0]  cnt;           // one-hot iteration counter
-    reg         start_cnt;
+    reg  [16:0] SR;             // {partial remainder , shifted dividend/quotient}
+    reg  [8:0]  NEG_DIVISOR;    // two's complement of |divisor| (9-bit)
+    reg  [3:0]  cnt;            // 1..8, done flagged by cnt[3]
+    reg         start_cnt;      // busy
+    reg  [7:0]  dividend_r;     // raw operands kept for the sign fix-up
+    reg  [7:0]  divisor_r;
     reg         sign_r;
-    reg         dividend_sign_r;
-    reg         divisor_sign_r;
+    reg  [15:0] result_r;       // holds the last completed result
 
     // ------------------------------------------------------------------
-    // Operand conditioning (magnitudes when signed)
+    // absolute values of the operands (magnitude only when sign = 1)
     // ------------------------------------------------------------------
-    wire [7:0] abs_dividend = (sign && dividend[7]) ? (~dividend + 8'd1) : dividend;
-    wire [7:0] abs_divisor  = (sign && divisor[7])  ? (~divisor  + 8'd1) : divisor;
+    wire [7:0] abs_dividend = (sign & dividend[7]) ? (~dividend + 8'd1) : dividend;
+    wire [7:0] abs_divisor  = (sign & divisor[7])  ? (~divisor  + 8'd1) : divisor;
 
     // ------------------------------------------------------------------
-    // Shift / subtract datapath
+    // iteration datapath : compare / subtract / mux
+    //   rem_win is the current partial remainder (9 bits so that
+    //   2*rem + next_bit never overflows, even for divisors > 128)
     // ------------------------------------------------------------------
-    wire [9:0] sub_ext  = {1'b0, SR[16:8]} + {1'b0, NEG_DIVISOR};
-    wire       carry    = sub_ext[9];
-    wire [8:0] mux_out  = carry ? sub_ext[8:0] : SR[16:8];
-    wire [16:0] SR_next = {mux_out[7:0], SR[7:0], carry};
+    wire [8:0] rem_win = SR[16:8];
+    wire [9:0] sub_res = {1'b0, rem_win} + {1'b0, NEG_DIVISOR};
+    wire       q_bit   = sub_res[9];                                // carry-out
+    wire [7:0] mux_out = q_bit ? sub_res[7:0] : rem_win[7:0];
 
     // ------------------------------------------------------------------
-    // Sign correction of the final quotient / remainder
+    // final quotient / remainder with sign correction (truncate toward zero,
+    // remainder takes the dividend's sign)
     // ------------------------------------------------------------------
-    wire        quot_neg = sign_r & (dividend_sign_r ^ divisor_sign_r);
-    wire        rem_neg  = sign_r & dividend_sign_r;
-    wire [7:0]  final_quotient  = quot_neg ? (~SR[7:0]  + 8'd1) : SR[7:0];
-    wire [7:0]  final_remainder = rem_neg  ? (~SR[16:9] + 8'd1) : SR[16:9];
+    wire [7:0] quo_raw = {SR[6:0], q_bit};
+    wire       quo_neg = sign_r & (dividend_r[7] ^ divisor_r[7]);
+    wire       rem_neg = sign_r &  dividend_r[7];
+    wire [7:0] quo_fix = quo_neg ? (~quo_raw + 8'd1) : quo_raw;
+    wire [7:0] rem_fix = rem_neg ? (~mux_out + 8'd1) : mux_out;
+
+    // a new request is taken only while idle and with no pending result
+    wire accept = opn_valid & ~res_valid & ~start_cnt;
 
     // ------------------------------------------------------------------
-    // Sequential control
+    // control / sequencing
     // ------------------------------------------------------------------
-    always @(posedge clk) begin
+    always @(posedge clk or posedge rst) begin
         if (rst) begin
-            SR              <= 17'd0;
-            NEG_DIVISOR     <= 9'd0;
-            cnt             <= 9'd0;
-            start_cnt       <= 1'b0;
-            sign_r          <= 1'b0;
-            dividend_sign_r <= 1'b0;
-            divisor_sign_r  <= 1'b0;
+            SR          <= 17'd0;
+            NEG_DIVISOR <= 9'd0;
+            cnt         <= 4'd0;
+            start_cnt   <= 1'b0;
+            res_valid   <= 1'b0;
+            dividend_r  <= 8'd0;
+            divisor_r   <= 8'd0;
+            sign_r      <= 1'b0;
+            result_r    <= 16'd0;
         end
         else if (start_cnt) begin
-            if (cnt[8]) begin
-                // Division finished: park the sign-corrected result in SR
-                cnt       <= 9'd0;
+            if (cnt[3]) begin                       // cnt == 8 : division done
+                cnt       <= 4'd0;
                 start_cnt <= 1'b0;
-                SR        <= {1'b0, final_remainder, final_quotient};
+                SR        <= {1'b0, rem_fix, quo_fix};
+                result_r  <= {rem_fix, quo_fix};
+                res_valid <= 1'b1;
             end
-            else begin
-                cnt <= {cnt[7:0], 1'b0};
-                SR  <= SR_next;
+            else begin                              // one radix-2 step
+                cnt <= cnt + 4'd1;
+                SR  <= {mux_out, SR[7:0], q_bit};
             end
         end
-        else if (opn_valid && !res_valid) begin
-            // Latch operands, preload SR with |dividend| << 1
-            SR              <= {8'd0, abs_dividend, 1'b0};
-            NEG_DIVISOR     <= 9'd0 - {1'b0, abs_divisor};
-            cnt             <= 9'd1;
-            start_cnt       <= 1'b1;
-            sign_r          <= sign;
-            dividend_sign_r <= dividend[7];
-            divisor_sign_r  <= divisor[7];
+        else if (res_valid) begin
+            // hold the result until the consumer takes it
+            if (res_ready)
+                res_valid <= 1'b0;
+        end
+        else if (accept) begin
+            dividend_r  <= dividend;
+            divisor_r   <= divisor;
+            sign_r      <= sign;
+            SR          <= {8'd0, abs_dividend, 1'b0};
+            NEG_DIVISOR <= (~{1'b0, abs_divisor}) + 9'd1;
+            cnt         <= 4'd1;
+            start_cnt   <= 1'b1;
         end
     end
 
-    // ------------------------------------------------------------------
-    // Result valid handshake
-    // ------------------------------------------------------------------
-    always @(posedge clk) begin
-        if (rst)
-            res_valid <= 1'b0;
-        else if (start_cnt && cnt[8])
-            res_valid <= 1'b1;
-        else if (res_valid && res_ready)
-            res_valid <= 1'b0;
-    end
-
-    assign result = SR[15:0];
+    assign result = result_r;
 
 endmodule

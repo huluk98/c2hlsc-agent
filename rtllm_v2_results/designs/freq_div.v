@@ -9,7 +9,7 @@ module freq_div (
     reg [2:0] cnt_10;
     reg [5:0] cnt_100;
 
-    // Divide-by-2: toggle every input clock edge
+    // 50 MHz: divide by 2
     always @(posedge CLK_in or posedge RST) begin
         if (RST)
             CLK_50 <= 1'b0;
@@ -17,7 +17,7 @@ module freq_div (
             CLK_50 <= ~CLK_50;
     end
 
-    // Divide-by-10: toggle every 5 input clock cycles
+    // 10 MHz: divide by 10 (toggle every 5 input cycles)
     always @(posedge CLK_in or posedge RST) begin
         if (RST) begin
             CLK_10 <= 1'b0;
@@ -32,7 +32,7 @@ module freq_div (
         end
     end
 
-    // Divide-by-100: toggle every 50 input clock cycles
+    // 1 MHz: divide by 100 (toggle every 50 input cycles)
     always @(posedge CLK_in or posedge RST) begin
         if (RST) begin
             CLK_1   <= 1'b0;

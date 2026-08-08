@@ -1,3 +1,7 @@
+// edge_detect: registered rising/falling edge detector for a slowly changing
+// 1-bit input. Each detected edge produces a single-clock-wide pulse on the
+// corresponding output, one clock after the edge is captured.
+
 module edge_detect (
     input  wire clk,
     input  wire rst_n,
@@ -6,17 +10,19 @@ module edge_detect (
     output reg  down
 );
 
-    reg a_d;
+    // Value of a sampled at the previous positive clock edge.
+    reg a_prev;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            a_d  <= 1'b0;
-            rise <= 1'b0;
-            down <= 1'b0;
-        end else begin
-            a_d  <= a;
-            rise <= ~a_d &  a;
-            down <=  a_d & ~a;
+            a_prev <= 1'b0;
+            rise   <= 1'b0;
+            down   <= 1'b0;
+        end
+        else begin
+            a_prev <= a;
+            rise   <= ( a & ~a_prev);   // 0 -> 1 transition
+            down   <= (~a &  a_prev);   // 1 -> 0 transition
         end
     end
 

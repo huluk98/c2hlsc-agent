@@ -374,9 +374,17 @@ class ArmConstructionTests(unittest.TestCase):
 
     def test_track_classification_separates_oracle_from_self_derived(self):
         self.assertEqual(ablation.classify_track("none")[0], ablation.SELF_DERIVED)
-        self.assertEqual(ablation.classify_track("self")[0], ablation.SELF_DERIVED)
         self.assertEqual(ablation.classify_track("logs")[0], ablation.ORACLE_DERIVED)
         self.assertEqual(ablation.classify_track("oracle")[0], ablation.ORACLE_DERIVED)
+        # 'self' is NOT strict. It reads as though it were -- the extra channel really is
+        # the candidate's own signals -- but the policy is implemented as 'logs' plus that
+        # channel, so it forwards the benchmark testbench transcript verbatim. Only 'none'
+        # is genuinely self-derived.
+        self.assertEqual(ablation.classify_track("self")[0], ablation.ORACLE_DERIVED)
+        self.assertEqual(
+            {p for p in ablation.EVIDENCE_TRACKS if ablation.classify_track(p)[0] == ablation.SELF_DERIVED},
+            {"none"},
+        )
         # An unknown policy is never quietly filed under a track that would flatter it.
         track, reason = ablation.classify_track("brand-new-policy")
         self.assertEqual(track, ablation.UNCLASSIFIED)
@@ -385,6 +393,50 @@ class ArmConstructionTests(unittest.TestCase):
         forced, reason = ablation.classify_track("logs", {"logs": ablation.SELF_DERIVED})
         self.assertEqual(forced, ablation.SELF_DERIVED)
         self.assertIn("--track-override", reason)
+
+    def test_driver_oracle_stamp_cannot_land_in_the_self_derived_track(self):
+        # Two modules answer "oracle-derived?" for different questions: rtllm_agent means
+        # "derived from the reference RTL", this report means "derived from the benchmark
+        # testbench". Broad must contain narrow, or a stamped upper bound gets reported as
+        # a strict headline.
+        ablation.validate_track_classification()  # the shipped classification agrees
+
+        from c2hlsc_agent import rtllm_agent as agent_mod
+
+        # Mutation 1: the driver starts stamping a policy this report calls self-derived.
+        # It must be 'none' -- the only remaining strict policy -- because 'self' is now
+        # correctly filed oracle-derived and stamping it would be *consistent*, not a
+        # violation.
+        original = agent_mod.ORACLE_DERIVED_POLICIES
+        try:
+            agent_mod.ORACLE_DERIVED_POLICIES = frozenset({"oracle", "none"})
+            with self.assertRaises(SystemExit) as caught:
+                ablation.validate_track_classification()
+            self.assertIn("none", str(caught.exception))
+            self.assertIn("never be reported in the strict track", str(caught.exception))
+        finally:
+            agent_mod.ORACLE_DERIVED_POLICIES = original
+
+        # Mutation 2: a --track-override demotes the one genuinely oracle-derived policy.
+        with self.assertRaises(SystemExit):
+            ablation.validate_track_classification({"oracle": ablation.SELF_DERIVED})
+
+        # Mutation 3: 'self' promoted back to strict. The driver does NOT stamp 'self', so
+        # the ORACLE_DERIVED_POLICIES check cannot see this one -- only the behavioural
+        # probe can. This is the mutation that was live in the shipped classification.
+        with self.assertRaises(SystemExit) as caught:
+            ablation.validate_track_classification({"self": ablation.SELF_DERIVED})
+        self.assertIn("testbench transcript", str(caught.exception))
+
+        # Mutation 4: same for 'logs', the policy the baseline arm itself uses.
+        with self.assertRaises(SystemExit):
+            ablation.validate_track_classification({"logs": ablation.SELF_DERIVED})
+
+    def test_testbench_fed_policies_is_probed_not_asserted(self):
+        # Derived by calling build_evidence, so it cannot drift from the implementation.
+        # Every policy except the blind retry forwards the testbench transcript.
+        self.assertEqual(ablation.testbench_fed_policies(), frozenset({"logs", "self", "oracle"}))
+        self.assertNotIn("none", ablation.testbench_fed_policies())
 
     def test_track_override_parsing_rejects_junk(self):
         self.assertEqual(
@@ -941,8 +993,25 @@ class DryRunTests(unittest.TestCase):
         output = buffer.getvalue()
 
         self.assertIn("power note", output)
-        self.assertIn("fewer than 6 discordant designs", output)
+        # The stated floor must be the Holm-CORRECTED one, because the corrected p is what
+        # significance_verdict tests. With the full 8-arm matrix that is 7 tests -> 9, not
+        # the uncorrected 6. Quoting 6 next to a corrected verdict understates the bar.
+        self.assertIn("fewer than 9 discordant designs", output)
+        self.assertIn("Holm across 7 test(s)", output)
         self.assertIn("one design = 50.0 pp", output)  # n=2 in this fixture
+
+    def test_significance_floor_rises_with_the_size_of_the_test_family(self):
+        # Uncorrected: 6 flips all one way gives p=0.031.
+        self.assertEqual(ablation.min_discordant_for_significance(0.05, n_tests=1), 6)
+        # But Holm multiplies the smallest p by the family size, so 6 flips across 7 tests
+        # is p=0.219 -- nowhere near alpha. The floor must reflect that.
+        self.assertEqual(ablation.min_discordant_for_significance(0.05, n_tests=7), 9)
+        self.assertEqual(ablation.min_discordant_for_significance(0.05, n_tests=5), 8)
+        for n_tests, floor in ((1, 6), (5, 8), (7, 9)):
+            below = min(1.0, n_tests * ablation.mcnemar_exact_p(0, floor - 1))
+            at = min(1.0, n_tests * ablation.mcnemar_exact_p(0, floor))
+            self.assertGreater(below, 0.05, f"floor {floor} for {n_tests} tests is too low")
+            self.assertLessEqual(at, 0.05, f"floor {floor} for {n_tests} tests is too high")
 
     def test_dry_run_shows_each_arms_command_verbatim(self):
         buffer = io.StringIO()

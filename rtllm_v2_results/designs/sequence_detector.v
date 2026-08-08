@@ -5,26 +5,31 @@ module sequence_detector (
     output reg  sequence_detected
 );
 
-    // State encoding
-    localparam [2:0] IDLE = 3'd0,
-                     S1   = 3'd1,
-                     S2   = 3'd2,
-                     S3   = 3'd3,
-                     S4   = 3'd4;
+    // State encoding: tracks the longest matched prefix of the pattern 1001
+    localparam [2:0] IDLE = 3'd0,  // ""
+                     S1   = 3'd1,  // "1"
+                     S2   = 3'd2,  // "10"
+                     S3   = 3'd3,  // "100"
+                     S4   = 3'd4;  // "1001" -> match
 
     reg [2:0] state;
     reg [2:0] next_state;
 
-    // Next-state combinational logic: detect 1001 MSB-first
+    // Next-state decode (overlapping detection)
     always @(*) begin
         case (state)
-            IDLE: next_state = data_in ? S1   : IDLE;
-            S1:   next_state = data_in ? S1   : S2;
-            S2:   next_state = data_in ? S1   : S3;
-            S3:   next_state = data_in ? S4   : IDLE;
-            S4:   next_state = data_in ? S1   : IDLE;
+            IDLE:    next_state = data_in ? S1   : IDLE;
+            S1:      next_state = data_in ? S1   : S2;
+            S2:      next_state = data_in ? S1   : S3;
+            S3:      next_state = data_in ? S4   : IDLE;
+            S4:      next_state = data_in ? S1   : S2;
             default: next_state = IDLE;
         endcase
+    end
+
+    // Moore output decode
+    always @(*) begin
+        sequence_detected = (state == S4);
     end
 
     // State register with asynchronous active-low reset
@@ -33,14 +38,6 @@ module sequence_detector (
             state <= IDLE;
         else
             state <= next_state;
-    end
-
-    // Registered output: high only while in S4
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n)
-            sequence_detected <= 1'b0;
-        else
-            sequence_detected <= (next_state == S4);
     end
 
 endmodule

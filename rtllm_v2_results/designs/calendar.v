@@ -6,38 +6,41 @@ module calendar (
     output reg  [5:0] Secs
 );
 
-    // Seconds counter: 0..59, increments every clock cycle
+    // Seconds counter: 0 -> 59 -> 0
     always @(posedge CLK or posedge RST) begin
-        if (RST)
+        if (RST) begin
             Secs <= 6'd0;
-        else if (Secs == 6'd59)
+        end else if (Secs == 6'd59) begin
             Secs <= 6'd0;
-        else
+        end else begin
             Secs <= Secs + 6'd1;
+        end
     end
 
-    // Minutes counter: advances when Secs == 59, wraps 59 -> 0
+    // Minutes counter: advances when Secs == 59
     always @(posedge CLK or posedge RST) begin
-        if (RST)
+        if (RST) begin
             Mins <= 6'd0;
-        else if ((Mins == 6'd59) && (Secs == 6'd59))
+        end else if ((Mins == 6'd59) && (Secs == 6'd59)) begin
             Mins <= 6'd0;
-        else if (Secs == 6'd59)
+        end else if (Secs == 6'd59) begin
             Mins <= Mins + 6'd1;
-        else
+        end else begin
             Mins <= Mins;
+        end
     end
 
-    // Hours counter: advances at Mins == 59 && Secs == 59, wraps 23 -> 0
+    // Hours counter: advances when Mins == 59 && Secs == 59, wraps at 23
     always @(posedge CLK or posedge RST) begin
-        if (RST)
+        if (RST) begin
             Hours <= 6'd0;
-        else if ((Hours == 6'd23) && (Mins == 6'd59) && (Secs == 6'd59))
+        end else if ((Hours == 6'd23) && (Mins == 6'd59) && (Secs == 6'd59)) begin
             Hours <= 6'd0;
-        else if ((Mins == 6'd59) && (Secs == 6'd59))
+        end else if ((Mins == 6'd59) && (Secs == 6'd59)) begin
             Hours <= Hours + 6'd1;
-        else
+        end else begin
             Hours <= Hours;
+        end
     end
 
 endmodule

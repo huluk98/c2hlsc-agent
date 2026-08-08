@@ -1,7 +1,7 @@
 module ring_counter (
-    input  wire       clk,
-    input  wire       reset,
-    output reg  [7:0] out
+    input        clk,
+    input        reset,
+    output reg [7:0] out
 );
 
     always @(posedge clk) begin

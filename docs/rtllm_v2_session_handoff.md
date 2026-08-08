@@ -20,10 +20,12 @@ Branch: `claude/c2hlsc-agent-rtllmv2-f7apxo`
 | `e48a7ad` | `--external-rtl` comparison mode + this handoff |
 | `+1` | `scripts/triage_rtllm_run.py` and §6 below |
 
-Test suite: `python -m pytest tests -q` → **377 passed, 15 subtests passed**.
+Test suite: `python -m pytest tests -q` → **724 passed, 86 subtests passed**.
 
-The one thing still outstanding: `rtllm_v2_results/` in the repo holds the superseded first-run
-numbers. Regenerate it from your own run before quoting anything out of it (§10, item 1).
+`rtllm_v2_results/` is now **generated, not hand-written**: `scripts/make_rtllm_v2_results.py`
+rebuilds it from a completed run directory, so a stale figure cannot survive an update. It
+currently holds the confirmed full-suite run in `runs/confirm` (§9). See also
+[`loop_ablation.md`](loop_ablation.md), which asks what each part of the loop is worth.
 
 ---
 
@@ -43,7 +45,7 @@ export RTLLM_ROOT=~/RTLLM    # --benchmark defaults to this
 # 3. This repo
 cd /path/to/c2hlsc-agent
 python3 -m pip install -e .
-python3 -m pytest tests -q   # expect 377 passed
+python3 -m pytest tests -q   # expect 724 passed
 ```
 
 The harness can fetch the benchmark itself if you prefer:
@@ -285,21 +287,21 @@ Measured on the run in §9:
 free (empty stub passes -- vacuous oracle)                   4  comparator_3bit, comparator_4bit, sequence_detector, square_wave
 unscorable (neither reference nor you pass)                  1  ring_counter
 reference wrong (you pass a testbench the reference fails)   2  clkgenerator, radix2_div
-real signal -- passed                                       42
-REAL FAILURE                                                 1  serial2parallel
+real signal -- passed                                       40
+REAL FAILURE                                                 3  asyn_fifo, pulse_detect, serial2parallel
 
 signal basis: 45/50 designs (5 excluded as uninformative)
-functional pass, signal basis: 44/45 (97.8%)
-first-round pass (no repair):   30/45 (66.7%)
-lifted by the repair loop:      14
+functional pass, signal basis: 42/45 (93.3%)
+first-round pass (no repair):   31/45 (68.9%)
+lifted by the repair loop:      11
 ```
 
 ### Why this differs from `report.json → adjusted`
 
-`adjusted` (42/43) excludes all three `KNOWN_ORACLE_ISSUES`, which drops `clkgenerator` and
+`adjusted` (40/43) excludes all three `KNOWN_ORACLE_ISSUES`, which drops `clkgenerator` and
 `radix2_div` — two designs you *passed* and the reference failed. The triage keeps them, because a
 satisfiable testbench is a real test even when the shipped reference RTL is wrong. Both are
-defensible; **44/45 is the one that does not throw away wins over the benchmark**, and 42/43 is the
+defensible; **42/45 is the one that does not throw away wins over the benchmark**, and 40/43 is the
 more conservative. Quote whichever you like, but say which, and never quote the bare 50-design
 number.
 
@@ -364,20 +366,30 @@ All numbers below are from this harness: iverilog 12.0 `-g2012`, identical oracl
 
 ### All 50 designs
 
+The confirmed run is `runs/confirm`, published to `rtllm_v2_results/`. Its configuration is the
+baseline confirmed by the ablation study (`plan=on`, `evidence=logs`, `max_repair_rounds=2`,
+`samples=1`) — see [`loop_ablation.md`](loop_ablation.md) for why no other configuration was
+adopted.
+
 | | syntax | func (official) | func (strict) | round 0 | adjusted (43) |
 | --- | :-: | :-: | :-: | :-: | :-: |
-| **this agent** (Claude Opus, 1 sample, ≤2 repairs) | 50/50 | **48/50** | 48/50 | 33/50 | **42/43 (97.7%)** |
+| **this agent** (Claude Opus, 1 sample, ≤2 repairs) | 50/50 | **46/50** | 46/50 | 34/50 | **40/43 (93.0%)** |
 | reference `verified_*.v` | 50/50 | 47/50 | 47/50 | — | 43/43 |
 | empty stub (floor) | 50/50 | 4/50 | 4/50 | — | 0/43 |
 
-The agent's two failures: `ring_counter` (unpassable oracle) and `serial2parallel` (**genuine** —
-hangs vvp on all rounds). It passes `clkgenerator` and `radix2_div`, both of which the benchmark's
-own reference RTL fails.
+The agent's four failures: `ring_counter` (unpassable oracle — the banner is unreachable under
+iverilog's scheduling, so nothing can pass it), `serial2parallel` (**genuine** — hangs vvp on all
+rounds), and `asyn_fifo` and `pulse_detect` (**genuine** functional mismatches). It passes
+`clkgenerator` and `radix2_div`, both of which the benchmark's own reference RTL fails.
 
-The repair loop rescued 15 designs (33/50 → 48/50): `LFSR`, `LIFObuffer`, `adder_pipe_64bit`,
-`alu`, `asyn_fifo`, `barrel_shifter`, `clkgenerator`, `fixed_point_substractor`, `freq_divbyeven`,
-`freq_divbyfrac`, `freq_divbyodd`, `pulse_detect`, `radix2_div`, `sequence_detector`,
-`signal_generator`.
+The repair loop rescued 12 designs (34/50 → 46/50): `LFSR`, `adder_pipe_64bit`, `alu`,
+`barrel_shifter`, `clkgenerator`, `fixed_point_substractor`, `freq_divbyeven`, `freq_divbyfrac`,
+`freq_divbyodd`, `radix2_div`, `sequence_detector`, `signal_generator`.
+
+**On run-to-run variance.** The same configuration scored 45/50 in `runs/agent` and 46/50 here.
+The generator is sampled at `--samples 1`, so a one- or two-design swing between runs of an
+identical configuration is normal and is the reason the ablation study treats a one-design
+difference as noise. Do not read the difference between these two runs as a change in anything.
 
 ### The 29 designs the shipped GPT sets cover
 
@@ -386,15 +398,19 @@ None of the 4 vacuous designs are in this subset, so the floor here is a true 0/
 | | samples | syntax | pass@1 | pass@5 | note |
 | --- | :-: | :-: | :-: | :-: | --- |
 | this agent — **round 0, one-shot** | 1 | 29/29 | **0.759** (22/29) | — | the one-shot comparison |
-| this agent — after ≤2 repairs | 1 | 29/29 | **0.966** (28/29) | — | closed verifier loop |
+| this agent — after ≤2 repairs | 1 | 29/29 | 0.897 (26/29) | — | closed verifier loop |
 | gpt-4 (shipped) | 5 | 27/29 | 0.414 | 0.621 (18/29) | one-shot |
 | gpt-3.5 (shipped) | 5 | 25/29 | 0.255 | 0.379 (11/29) | one-shot |
 | reference `verified_*.v` | 1 | 29/29 | 0.966 (28/29) | — | ceiling |
 | empty stub | 1 | 29/29 | 0.000 (0/29) | — | floor |
 
 Like-for-like, single sample, no repair: **0.759 vs 0.414 (gpt-4) vs 0.255 (gpt-3.5)**. Even against
-gpt-4's 5-sample pass@5 of 0.621, the agent's one-shot pass@1 is higher — and its after-repair 28/29
-matches the benchmark's own reference RTL on this subset.
+gpt-4's 5-sample pass@5 of 0.621, the agent's one-shot pass@1 is higher. After repair it reaches
+26/29, two short of the benchmark's own reference RTL on this subset.
+
+This table is generated into [`../rtllm_v2_results/comparison.md`](../rtllm_v2_results/comparison.md)
+by `scripts/make_rtllm_v2_results.py`, with the caveats stated before the table rather than after
+it. Regenerate rather than hand-editing either copy.
 
 The illegal-system-task gate rejected **0 samples** in both GPT sets, so it costs them nothing and
 the comparison is not distorted by it.
@@ -404,24 +420,67 @@ Reproduce the GPT rows with the §4b External RTL commands.
 **Fairness caveats — state these whenever you quote the comparison:**
 
 - The GPT sets are **one-shot with no repair loop and no tool feedback**. The honest head-to-head is
-  against the agent's **round-0 row (22/29)**; the 28/29 row shows what the closed loop adds.
+  against the agent's **round-0 row (22/29)**; the 26/29 row shows what the closed loop adds.
 - The GPT sets are **5 samples**, this agent's run is **1**. pass@5 flatters a 5-sample method
   relative to a single-sample run. Run `--samples 5` if you want a symmetric comparison.
 - The GPT generations were produced years earlier against RTLLM v1.1 prompts.
+
+### Which configuration this is, and why no other
+
+The configuration above is the one the ablation study confirmed. Eight arms were run over the
+13 designs that failed at round 0 in `runs/agent`, varying one factor each
+([`loop_ablation.md`](loop_ablation.md)):
+
+| arm | func | verdict |
+| --- | :-: | --- |
+| `baseline` (`plan=on, evidence=logs, rounds=2`) | 10/13 | reference |
+| `evidence=self` | 11/13 | not significant (1 discordant) |
+| `evidence=oracle` | 10/13 | **identical outcomes on all 13 designs** |
+| `rounds=3` | 10/13 | not significant (2 discordant) |
+| `no-plan` | 9/13 | not significant (1 discordant) |
+| `rounds=1` | 8/13 | not significant (2 discordant) |
+| `evidence=none` | 5/13 | not significant (7 discordant, Holm p=0.750) |
+| `rounds=0` | 1/13 | **significant, below baseline** (9 discordant, Holm p=0.027) |
+
+**No arm scored significantly above the baseline**, so the baseline was confirmed rather than
+replaced. `evidence=self` is nominally highest at 11/13, but that is a one-design difference on a
+13-design subset — 7.7 pp, well inside noise, against a corrected significance floor of 9
+discordant designs. Promoting it would be exactly the one-design over-read the study exists to
+avoid.
+
+Two results are worth carrying forward anyway:
+
+- **The repair loop is the one demonstrated ingredient.** `rounds=0` is significantly below
+  baseline. Whatever the loop scores, the generator alone does not.
+- **Richer failure evidence has an upper bound of zero.** `evidence=oracle` may see where the
+  candidate diverges from the *reference RTL* — an advantage no deployable system has — and it
+  produced the identical result on every design. Do not invest in richer repair evidence on the
+  strength of this benchmark.
 
 ---
 
 ## 10. Open items and known limits
 
-1. **`rtllm_v2_results/` in the repo is stale.** It holds the superseded first-run numbers (43/50)
-   and, in the older `report.md` text, a claim that the benchmark's golden data files are missing.
-   **That claim is false** — the files ship inside each design directory; the original run failed to
-   copy them into the simulation working directory. Regenerate the directory from a current run.
+1. ~~**`rtllm_v2_results/` in the repo is stale.**~~ **Closed.** The directory is regenerated by
+   `scripts/make_rtllm_v2_results.py --run runs/confirm` and now carries the confirmed run plus a
+   `comparison.md` against the shipped GPT archives. The old text also claimed the benchmark's
+   golden data files were missing; **that claim was false** — the files ship inside each design
+   directory, and the original run simply failed to copy them into the simulation working
+   directory. Both the stale numbers and the false claim are gone. Never edit that directory by
+   hand; the publisher refuses to publish an interrupted or partial run.
 2. **`serial2parallel` is a real agent failure.** All rounds hang vvp with empty output. Worth a
    look: the repair agent gets no evidence from an empty log, so it cannot converge.
-3. **Repair evidence is thin.** Many RTLLM testbenches print only `===========Error===========` with
-   no per-vector detail, so `functional_mismatch` repair is under-informed. Richer evidence
-   (PMLC-style mismatch localisation, per the repo's existing blueprint) is the obvious next step.
+3. **Repair evidence is thin — and the ablation says enriching it is not the fix.** Many RTLLM
+   testbenches print only `===========Error===========` with no per-vector detail, so
+   `functional_mismatch` repair is under-informed. That was the obvious next step until it was
+   measured: the `evidence=oracle` arm, which is shown *where the candidate's output first diverges
+   from the reference RTL* — strictly more than any PMLC-style localisation could recover without
+   the answer key — produced **outcomes identical to the plain log tail on all 13 designs**
+   ([`loop_ablation.md`](loop_ablation.md) §3). On this benchmark the ceiling for richer failure
+   evidence is zero. What the same study *does* show paying is the existence of the repair loop at
+   all. Treat richer evidence as a hypothesis that has been tested and failed here, not as pending
+   work — and note the scope: 13 designs, one sample each, so this bounds the effect on RTLLM v2
+   rather than on repair evidence in general.
 4. **`--samples > 1` has not been run for the agent.** All agent pass@k figures are from n=1.
 5. **iverilog is not VCS.** The paper's numbers use Synopsys VCS. Two designs
    (`ring_counter`, `asyn_fifo`) needed documented, semantics-preserving testbench shims to run at

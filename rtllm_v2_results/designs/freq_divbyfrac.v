@@ -1,54 +1,67 @@
+//////////////////////////////////////////////////////////////////////////////
+// freq_divbyfrac : fractional (3.5x) clock divider using double-edge clocking
+//
+//   MUL2_DIV_CLK = 7 = 2 * 3.5
+//   cnt      : free running 0..6 counter on posedge clk
+//   clk_div1 : posedge register, high during cnt==1 and cnt==5
+//              -> two uneven periods, one of 4 and one of 3 source cycles
+//   clk_div2 : negedge register, high during cnt==1.5..2.5 and cnt==4.5..5.5
+//              -> one pulse delayed by half a source period, the other
+//                 advanced by half a source period
+//   clk_div  : clk_div1 | clk_div2 -> uniform period of 3.5 source cycles
+//              (1.5 cycles high, 2 cycles low)
+//////////////////////////////////////////////////////////////////////////////
+
 module freq_divbyfrac (
     input  wire clk,
     input  wire rst_n,
     output wire clk_div
 );
 
-    parameter MUL2_DIV_CLK = 7;          // 2 * 3.5
-    localparam HALF = (MUL2_DIV_CLK - 1) / 2;
+    parameter MUL2_DIV_CLK = 7;
 
-    reg [3:0] cnt;                       // counts 0 .. MUL2_DIV_CLK-1
-    reg       clk_div1;                  // posedge-generated intermediate clock
-    reg       clk_div2;                  // negedge-generated intermediate clock
+    reg [3:0] cnt;
+    reg       clk_div1;
+    reg       clk_div2;
 
-    // ------------------------------------------------------------------
-    // Modulo-MUL2_DIV_CLK counter on the rising edge of the source clock
-    // ------------------------------------------------------------------
+    // ---------------------------------------------------------------------
+    // Free running counter : 0 .. MUL2_DIV_CLK-1
+    // ---------------------------------------------------------------------
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n)
             cnt <= 4'd0;
-        else if (cnt == MUL2_DIV_CLK - 1)
+        else if (cnt == (MUL2_DIV_CLK - 1))
             cnt <= 4'd0;
         else
             cnt <= cnt + 4'd1;
     end
 
-    // ------------------------------------------------------------------
-    // Intermediate clock 1 (rising edge domain): two uneven periods inside
-    // the 7-cycle window -- one 4 source cycles long, one 3 source cycles
-    // long, so the average period is 3.5 source cycles.
-    // ------------------------------------------------------------------
+    // ---------------------------------------------------------------------
+    // First intermediate clock : two pulses per 7 source cycles, giving the
+    // uneven 4 / 3 cycle periods, posedge clocked
+    //   high during cnt == 1 and cnt == 5
+    // ---------------------------------------------------------------------
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n)
             clk_div1 <= 1'b0;
         else
-            clk_div1 <= (cnt == 4'd0) || (cnt == HALF + 1);
+            clk_div1 <= (cnt == 4'd0) || (cnt == ((MUL2_DIV_CLK + 1) / 2));
     end
 
-    // ------------------------------------------------------------------
-    // Intermediate clock 2 (falling edge domain): the same two pulses, one
-    // delayed by half a source period, the other advanced by half a period.
-    // ------------------------------------------------------------------
+    // ---------------------------------------------------------------------
+    // Second intermediate clock : same two pulses, one delayed and one
+    // advanced by half a source period, negedge clocked
+    // ---------------------------------------------------------------------
     always @(negedge clk or negedge rst_n) begin
         if (!rst_n)
             clk_div2 <= 1'b0;
         else
-            clk_div2 <= (cnt == 4'd1) || (cnt == HALF + 1);
+            clk_div2 <= (cnt == 4'd1) || (cnt == ((MUL2_DIV_CLK + 1) / 2));
     end
 
-    // ------------------------------------------------------------------
-    // OR of the two half-period-offset clocks evens out the 4/3 imbalance
-    // ------------------------------------------------------------------
+    // ---------------------------------------------------------------------
+    // Final fractional divided clock
+    // ---------------------------------------------------------------------
     assign clk_div = clk_div1 | clk_div2;
 
 endmodule

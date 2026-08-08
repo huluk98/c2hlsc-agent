@@ -28,11 +28,13 @@ Staging: why the agent rung has two flows
 -----------------------------------------
 
 The equivalence testbench is C++ and used to ``#include`` the golden reference ``input.c``
-into itself. CHStone is C89, so for five of the twelve benchmarks that build failed *before
-the candidate was ever exercised* -- ``adpcm``/``jpeg`` on narrowed initialisers,
-``blowfish``/``motion`` on K&R parameter definitions, and (once repair pulled the original
-sources into the candidate too) ``aes``/``dfadd``/``dfdiv``/``dfmul``/``dfsin``/``mips`` on
-``multiple definition of``. Those rows were zeros for a defect in the harness.
+into itself. CHStone is C89, so the build failed *before the candidate was ever exercised*
+in two ways: ``adpcm``/``jpeg`` on narrowed initialisers and a tentative definition,
+``blowfish``/``motion`` on K&R parameter definitions; and then, once a repair round put the
+original sources into the candidate as well, ``aes``/``dfadd``/``dfdiv``/``dfmul``/
+``dfsin`` on ``multiple definition of 'main_result'``. Measured: the deterministic arm
+reached the oracle on 3 of 12 benchmarks, the LLM arm on 7 of 12. The other rows were zeros
+recorded for a defect in the harness.
 
 The default flow (:func:`run_agent_staged`) fixes that in
 :mod:`c2hlsc_agent.chstone_staging`: the golden reference is compiled **as C, by a C

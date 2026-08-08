@@ -1,6 +1,6 @@
 module counter_12 (
-    input  wire       clk,
     input  wire       rst_n,
+    input  wire       clk,
     input  wire       valid_count,
     output reg  [3:0] out
 );
@@ -13,7 +13,10 @@ module counter_12 (
             if (out == 4'd11)
                 out <= 4'b0000;
             else
-                out <= out + 1'b1;
+                out <= out + 4'd1;
+        end
+        else begin
+            out <= out;
         end
     end
 

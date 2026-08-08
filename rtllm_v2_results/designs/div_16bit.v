@@ -1,3 +1,10 @@
+//-----------------------------------------------------------------------------
+// div_16bit : 16-bit dividend / 8-bit divisor restoring divider (combinational)
+//   result = A / B   (16-bit quotient)
+//   odd    = A % B   (16-bit remainder, upper bits zero when B != 0)
+//   B == 0 : algorithm runs naturally -> result = 16'hFFFF, odd = A
+//-----------------------------------------------------------------------------
+
 module div_16bit (
     input  wire [15:0] A,
     input  wire [7:0]  B,
@@ -5,34 +12,40 @@ module div_16bit (
     output reg  [15:0] odd
 );
 
+    // ---- combinational input capture -------------------------------------
     reg [15:0] a_reg;
     reg [7:0]  b_reg;
 
-    // First combinational block: capture the inputs into internal registers
     always @(*) begin
         a_reg = A;
         b_reg = B;
     end
 
-    // Second combinational block: restoring division
-    integer i;
-    reg [8:0]  rem;      // partial remainder (one extra bit for the shifted-in dividend bit)
-    reg [15:0] quot;
+    // ---- restoring division ----------------------------------------------
+    reg [15:0] rem;      // partial remainder
+    reg [15:0] quo;      // quotient accumulator
+    reg [15:0] den;      // zero-extended divisor
+    integer    i;
 
     always @(*) begin
-        rem  = 9'd0;
-        quot = 16'd0;
+        rem = 16'd0;
+        quo = 16'd0;
+        den = {8'd0, b_reg};
+
         for (i = 15; i >= 0; i = i - 1) begin
-            rem = {rem[7:0], a_reg[i]};
-            if (rem >= {1'b0, b_reg}) begin
-                rem     = rem - {1'b0, b_reg};
-                quot[i] = 1'b1;
+            // shift in the next (highest remaining) dividend bit
+            rem = {rem[14:0], a_reg[i]};
+
+            if (rem >= den) begin
+                rem    = rem - den;
+                quo[i] = 1'b1;
             end else begin
-                quot[i] = 1'b0;
+                quo[i] = 1'b0;
             end
         end
-        result = quot;
-        odd    = {7'd0, rem};
+
+        result = quo;
+        odd    = rem;
     end
 
 endmodule
