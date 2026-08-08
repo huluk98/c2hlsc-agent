@@ -147,10 +147,22 @@ class OpenAICompatibleLLMClient:
 #: the empty per-call working directory in :meth:`ClaudeCLIClient._workdir`. A backend that
 #: gains a new file-reading tool is not covered by either -- re-verify before trusting a
 #: number produced through a CLI you have not checked.
+#: NOTE ON VERSION COUPLING: the CLI rejects the WHOLE invocation when a deny rule names a
+#: tool it does not know ("Permission deny rule \"X\" matches no known tool"), exiting rc=1.
+#: So this list is coupled to the installed CLI, and the sandbox does not degrade gracefully
+#: -- it hard-fails every design in the sweep as `llm_error`. Observed with CLI 2.1.226, which
+#: no longer has `MultiEdit` (folded into `Edit`) or `SlashCommand` (now `Skill`). Both
+#: successors are still denied below, so removing the two stale names loses no coverage.
+#: If you upgrade the CLI and the sweep turns into all-`llm_error`, check here first.
 _CLI_DISALLOWED_TOOLS = (
-    "Task,Bash,Glob,Grep,Read,Edit,MultiEdit,Write,NotebookEdit,WebFetch,WebSearch,"
-    "TodoWrite,BashOutput,KillShell,SlashCommand,Artifact,SendUserFile,Skill"
+    "Task,Bash,Glob,Grep,Read,Edit,Write,NotebookEdit,WebFetch,WebSearch,"
+    "TodoWrite,BashOutput,KillShell,Artifact,SendUserFile,Skill"
 )
+
+#: The subset that actually carries the oracle-isolation claim: anything that can read a file
+#: or reach the network. If a CLI upgrade makes one of these unnameable, the deny list must be
+#: repaired rather than trimmed -- trimming it would silently void the measurement.
+_ORACLE_CRITICAL_DENIALS = ("Task", "Bash", "Glob", "Grep", "Read", "WebFetch", "WebSearch")
 
 
 class ClaudeCLIClient:
@@ -192,6 +204,14 @@ class ClaudeCLIClient:
                 self._base,
                 input=f"{system}\n\n{user}",
                 text=True,
+                # Pin the codec. Without it Python decodes with the OS locale codec (gbk on a
+                # zh-CN Windows box), and the CLI emits UTF-8 -- one curly quote in the model's
+                # prose raises UnicodeDecodeError inside subprocess's reader thread, which
+                # takes down every design in the sweep as `driver_error`. Reproduced here:
+                # "'gbk' codec can't decode byte 0x94". errors="replace" because a mangled
+                # character in prose must never lose us the RTL in the same response.
+                encoding="utf-8",
+                errors="replace",
                 capture_output=True,
                 timeout=self._timeout,
                 cwd=cwd,

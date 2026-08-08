@@ -19,6 +19,7 @@ from c2hlsc_agent.rtllm_agent import (
     EVIDENCE_LIMIT,
     EVIDENCE_POLICIES,
     FAMILY_REPAIR_INSTRUCTIONS,
+    UNREPAIRABLE_FAMILIES,
     ORACLE_DERIVED_POLICIES,
     RtllmAgentConfig,
     build_evidence,
@@ -806,10 +807,12 @@ class RepairInstructionTests(unittest.TestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def test_every_repairable_family_has_its_own_instructions(self):
-        # missing_golden_data is a harness defect the loop refuses to repair, so it needs no
-        # procedure; everything else the verifier can emit must have one.
+        # A harness defect the loop refuses to repair needs no procedure; everything else the
+        # verifier can emit must have one. Driven off UNREPAIRABLE_FAMILIES rather than a
+        # hardcoded name, so adding a new unrepairable family does not silently require
+        # inventing repair instructions for a failure the repair loop will never see.
         for family in FAILURE_FAMILIES:
-            if family == "missing_golden_data":
+            if family in UNREPAIRABLE_FAMILIES:
                 continue
             with self.subTest(family=family):
                 self.assertIn(family, FAMILY_REPAIR_INSTRUCTIONS)

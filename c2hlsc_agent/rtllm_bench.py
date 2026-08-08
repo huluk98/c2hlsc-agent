@@ -131,7 +131,48 @@ FAILURE_FAMILIES = (
     "missing_golden_data",
     "illegal_system_task",
     "runaway_output",
+    "simulator_launch_failed",
 )
+
+#: Exit codes that mean the simulator process never reached user code, so nothing about the
+#: design under test can be concluded. POSIX loaders use 127; the Windows loader terminates
+#: the process with an NTSTATUS *before* it can write to stderr, which is why these have to
+#: be recognised from the code rather than from a log message:
+#:   0xC0000135 STATUS_DLL_NOT_FOUND, 0xC0000139 STATUS_ENTRYPOINT_NOT_FOUND,
+#:   0xC0000142 STATUS_DLL_INIT_FAILED.
+SIMULATOR_LAUNCH_FAILURE_CODES = frozenset({127, 3221225781, 3221225785, 3221225794})
+
+#: Loader diagnostics that identify the same condition when a code is not conclusive. The
+#: first is what ``_run`` itself writes when Popen raises, so a launch that never happened is
+#: recognised from the stored log rather than from a returncode of None -- ``None`` also means
+#: "this caller did not record one", and conflating the two would relabel legacy records.
+_LOADER_MARKERS = (
+    "failed to launch",
+    "error while loading shared libraries",
+    "cannot open shared object file",
+    "is not a valid Win32 application",
+)
+
+
+def _looks_like_simulator_launch_failure(sim_log: str, sim_returncode: "int | None") -> bool:
+    """True when the simulator never ran, as opposed to running and printing nothing.
+
+    Without this distinction an unusable simulator is indistinguishable from a design that
+    produces no output: every design reports ``no_output`` and the sweep prints a clean
+    ``0/50``, which reads as "the designs are bad" rather than "the toolchain is broken".
+    Observed on native Windows, where ``vvp.exe`` cannot resolve ``libvvp-1.dll`` unless the
+    OSS CAD Suite ``lib`` directory is on PATH: rc=3221225781 with *both* streams empty.
+    """
+
+    if any(marker in sim_log for marker in _LOADER_MARKERS):
+        return True
+    # Guarded on an empty log so a design that genuinely printed something is never
+    # relabelled. Note ``sim_returncode is None`` is deliberately NOT a trigger: it is
+    # indistinguishable from a caller that did not record one, and treating it as a launch
+    # failure would turn every legacy empty-log record into simulator_launch_failed.
+    if sim_log.strip():
+        return False
+    return sim_returncode in SIMULATOR_LAUNCH_FAILURE_CODES
 
 #: Designs whose oracle is broken independently of the RTL under test. Measured on this
 #: checkout by running the benchmark's own ``verified_*.v`` through its own testbench with
@@ -288,6 +329,11 @@ class SimResult:
     failure_family: "str | None"
     shim_applied: bool = False
     runaway_output: bool = False
+    #: vvp's exit code, or None when the process could not be launched at all. Stored so that
+    #: re-running classify_failure on a serialized SimResult reproduces the same label -- the
+    #: Windows loader kills vvp before it can write anything, so an empty log is the only
+    #: other evidence and it is not sufficient.
+    sim_returncode: "int | None" = None
 
     def to_dict(self) -> "dict[str, object]":
         return {
@@ -441,6 +487,7 @@ def classify_failure(
     syntax_pass: bool,
     timed_out: bool,
     runaway: bool = False,
+    sim_returncode: "int | None" = None,
 ) -> "str | None":
     """Bucket one run into a ``FAILURE_FAMILIES`` label, or ``None`` if it truly passed.
 
@@ -479,6 +526,10 @@ def classify_failure(
         return "simulator_unsupported"
     if _looks_like_missing_golden_data(sim_log):
         return "missing_golden_data"
+    # Checked before no_output: a simulator that never started tells us nothing about the
+    # design, and must not be booked as a design failure.
+    if _looks_like_simulator_launch_failure(sim_log, sim_returncode):
+        return "simulator_launch_failed"
     if not sim_log.strip():
         return "no_output"
     return "functional_mismatch"
@@ -1091,8 +1142,10 @@ def _evaluate_rtl(
     sim_log = ""
     sim_timed_out = runaway = False
     func_pass = func_pass_strict = False
+    sim_returncode: "int | None" = None
     if syntax_pass:
         simulated = _run(["vvp", SIM_BINARY], workdir, sim_timeout)
+        sim_returncode = simulated.returncode
         sim_timed_out, runaway = simulated.timed_out, simulated.runaway
         # stdout and stderr are judged together so that re-running classify_output /
         # classify_failure on the stored SimResult reproduces the verdict exactly. vvp
@@ -1109,7 +1162,9 @@ def _evaluate_rtl(
 
     timed_out = compiled.timed_out or sim_timed_out
 
-    failure_family = classify_failure(compile_log, sim_log, syntax_pass, timed_out, runaway)
+    failure_family = classify_failure(
+        compile_log, sim_log, syntax_pass, timed_out, runaway, sim_returncode=sim_returncode
+    )
 
     return SimResult(
         design=design.name,
@@ -1123,6 +1178,7 @@ def _evaluate_rtl(
         failure_family=failure_family,
         shim_applied=shim_applied,
         runaway_output=runaway,
+        sim_returncode=sim_returncode,
     )
 
 

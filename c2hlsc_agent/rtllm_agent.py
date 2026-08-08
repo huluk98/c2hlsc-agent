@@ -408,7 +408,12 @@ def repair_instructions(design: RtllmDesign, family: "str | None") -> str:
 # Families whose failure lives in the benchmark harness, not in the candidate RTL. Repairing
 # against them burns LLM calls on a design that cannot pass however good the RTL is, so the
 # repair loop stops instead (the failure is still reported, unchanged).
-UNREPAIRABLE_FAMILIES = frozenset({"missing_golden_data"})
+#
+# simulator_launch_failed is the strongest case for this: the simulator process never started
+# (e.g. vvp.exe could not resolve libvvp-1.dll), so there is no evidence about the RTL at all.
+# Sending the model a "fix your design" prompt here would be asking it to repair a toolchain
+# installation, once per design, for the whole sweep.
+UNREPAIRABLE_FAMILIES = frozenset({"missing_golden_data", "simulator_launch_failed"})
 
 
 class StopSignal(Protocol):
