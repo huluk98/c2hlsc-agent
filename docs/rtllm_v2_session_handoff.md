@@ -20,7 +20,7 @@ Branch: `claude/c2hlsc-agent-rtllmv2-f7apxo`
 | `e48a7ad` | `--external-rtl` comparison mode + this handoff |
 | `+1` | `scripts/triage_rtllm_run.py` and §6 below |
 
-Test suite: `python -m pytest tests -q` → **724 passed, 86 subtests passed**.
+Test suite: `python -m pytest tests -q` → **774 passed, 86 subtests passed**.
 
 `rtllm_v2_results/` is now **generated, not hand-written**: `scripts/make_rtllm_v2_results.py`
 rebuilds it from a completed run directory, so a stale figure cannot survive an update. It
@@ -45,7 +45,7 @@ export RTLLM_ROOT=~/RTLLM    # --benchmark defaults to this
 # 3. This repo
 cd /path/to/c2hlsc-agent
 python3 -m pip install -e .
-python3 -m pytest tests -q   # expect 724 passed
+python3 -m pytest tests -q   # expect 774 passed
 ```
 
 The harness can fetch the benchmark itself if you prefer:
