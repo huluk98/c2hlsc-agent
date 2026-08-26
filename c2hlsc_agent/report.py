@@ -39,16 +39,21 @@ def write_reports(
     iterations: int,
     repairs: list[RepairOutcome] | None = None,
     run_control: dict[str, object] | None = None,
+    blocking_errors: bool | None = None,
 ) -> None:
     repairs = repairs or []
-    status = final_status(state, config.run_vitis, analysis.diagnostics.has_errors)
+    # Callers that have judged the *generated* output pass their verdict in; the
+    # input-diagnostic fallback keeps the pre-generation report paths unchanged.
+    if blocking_errors is None:
+        blocking_errors = analysis.diagnostics.has_errors
+    status = final_status(state, config.run_vitis, blocking_errors)
     fn = analysis.function
     arg_rows = [[arg.name, arg.c_type, arg.direction, str(arg.length or ""), arg.interface or config.interface_mode] for arg in fn.args]
     type_rows = [[row["name"], row["original"], row["generated"]] for row in analysis.type_mappings]
     pragma_rows = [[row["argument"], row["pragma"], row["reason"]] for row in generated.interface_pragmas]
     unsupported_rows = [[d.severity, d.code, d.message, d.suggestion or ""] for d in analysis.unsupported_constructs]
     generated_files = [str(path.relative_to(project.root)) for path in project.generated_files]
-    agent_decision = classify_failure(state, config.run_vitis, analysis.diagnostics.has_errors)
+    agent_decision = classify_failure(state, config.run_vitis, blocking_errors)
     repair_rows = [
         [
             str(repair.iteration),

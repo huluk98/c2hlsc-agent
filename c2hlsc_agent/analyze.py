@@ -162,12 +162,38 @@ def _guess_arg_name(raw: str) -> str:
     return raw_no_arrays.replace("*", " * ").split()[-1]
 
 
-def _infer_pointer_directions(function: FunctionInfo, config: AgentConfig) -> None:
+def _pointer_escapes(name: str, body: str) -> bool:
+    """Report whether a pointer argument flows somewhere the write patterns cannot follow.
+
+    ``_infer_pointer_directions`` can only see writes spelled through the argument
+    itself (``p[i] = ...`` or ``*p = ...``). Aliasing the pointer into a local, or
+    handing it to a helper such as ``memcpy``, moves the write under a different name,
+    so a written-to argument would otherwise be classified ``input`` and then silently
+    dropped from the equivalence comparison.
+    """
+
+    bare = rf"(?<![A-Za-z0-9_*&]){re.escape(name)}(?![A-Za-z0-9_])\s*(?!\[)"
+    aliased = re.search(rf"=\s*(?:\([^)]*\)\s*)?{bare}", body)
+    passed = re.search(rf"\b[A-Za-z_]\w*\s*\([^;{{}}]*{bare}", body)
+    return bool(aliased or passed)
+
+
+def _infer_pointer_directions(function: FunctionInfo, config: AgentConfig) -> list[str]:
+    """Assign a direction to every pointer argument, returning the unprovable ones."""
+
     body = strip_comments(function.body)
+    unprovable: list[str] = []
     for arg in function.args:
         if not arg.is_pointer_like:
             continue
         if arg.name in config.arguments and config.arguments[arg.name].direction:
+            continue
+        if not arg.is_const and _pointer_escapes(arg.name, body):
+            # The pointer escapes and nothing in the C type forbids a write, so a
+            # read-only classification cannot be justified. "inout" is the safe
+            # choice: the argument still receives real stimulus and is compared.
+            arg.direction = "inout"
+            unprovable.append(arg.name)
             continue
         name = re.escape(arg.name)
         write_pattern = rf"(?:\*\s*{name}|{name}\s*\[[^\]]+\])\s*(?:=(?!=)|\+=|-=|\*=|/=|%=|&=|\|=|\^=|<<=|>>=|\+\+|--)"
@@ -180,10 +206,28 @@ def _infer_pointer_directions(function: FunctionInfo, config: AgentConfig) -> No
             arg.direction = "output"
         else:
             arg.direction = "input"
+    return unprovable
 
 
-def _unsupported(function: FunctionInfo) -> list[Diagnostic]:
+def _compile_time_constants(source: str) -> set[str]:
+    """Collect names usable as a fixed array bound: macros, const/constexpr, enumerators."""
+
+    names: set[str] = set()
+    for match in re.finditer(r"^[ \t]*#[ \t]*define[ \t]+([A-Za-z_]\w*)[ \t]+\S", source, re.M):
+        names.add(match.group(1))
+    for match in re.finditer(r"\bconst(?:expr)?\s+[\w\s*]*?\b([A-Za-z_]\w*)\s*=", source):
+        names.add(match.group(1))
+    for match in re.finditer(r"\benum\b[^{;]*\{([^}]*)\}", source):
+        for item in match.group(1).split(","):
+            name = item.split("=")[0].strip()
+            if re.fullmatch(r"[A-Za-z_]\w*", name):
+                names.add(name)
+    return names
+
+
+def _unsupported(function: FunctionInfo, full_source: str = "") -> list[Diagnostic]:
     body = strip_comments(function.body)
+    constants = _compile_time_constants(full_source or function.definition)
     checks: list[tuple[str, str, str, str | None]] = [
         ("dynamic-allocation", r"\b(malloc|calloc|realloc|free)\s*\(", "dynamic allocation is not synthesizable", "Use fixed-size caller-managed buffers."),
         ("unsupported-stdlib-call", r"\b(rand|srand|qsort|bsearch|time|clock|exit|abort|setjmp|longjmp)\s*\(", "unsupported standard library call inside the top function", "Move non-deterministic or runtime library calls outside the synthesized top."),
@@ -219,8 +263,47 @@ def _unsupported(function: FunctionInfo) -> list[Diagnostic]:
                 )
             )
     for local_array in re.finditer(r"\b(?:int|char|short|long|float|double|uint\d+_t|int\d+_t)\s+\w+\s*\[([^\]\d][^\]]*)\]", body):
-        diagnostics.append(Diagnostic("error", "variable-length-array", f"variable-length array bound {local_array.group(1)!r} detected", function.source_path.name, "Use fixed compile-time bounds or caller-managed buffers."))
+        bound = local_array.group(1).strip()
+        identifiers = set(re.findall(r"[A-Za-z_]\w*", bound))
+        if identifiers and identifiers <= constants:
+            # Every name in the bound resolves to a compile-time constant, so the array
+            # has a fixed size even though the bound is not spelled as a literal.
+            continue
+        diagnostics.append(Diagnostic("error", "variable-length-array", f"variable-length array bound {bound!r} detected", function.source_path.name, "Use fixed compile-time bounds or caller-managed buffers."))
     return diagnostics
+
+
+def _has_observable_output(function: FunctionInfo) -> bool:
+    """Report whether the testbench will have anything to compare.
+
+    Mirrors the comparison rule in ``testgen``: a non-void return, or at least one
+    pointer argument carrying data back out. With neither, every stimulus trivially
+    agrees and a passing run says nothing about equivalence.
+    """
+
+    if function.return_type != "void":
+        return True
+    return any(arg.direction in {"output", "inout"} for arg in function.args if arg.is_pointer_like)
+
+
+def unsupported_in_generated(source: str, top: str, config: AgentConfig, label: str) -> list[Diagnostic]:
+    """Re-run the synthesizability checks against generated HLS-C.
+
+    Diagnostics from the *input* mean "this source needs transforming"; diagnostics
+    from the *output* mean the transformation did not succeed. Only the latter should
+    decide whether a conversion failed.
+    """
+
+    try:
+        function = _extract_function(source, top, Path(label), config)
+    except Exception:
+        # A top the extractor cannot parse is reported by the verifier instead; the
+        # compile step gives a far better message than a guess from here would.
+        return []
+    return [
+        Diagnostic(diag.severity, diag.code, diag.message, label, diag.suggestion)
+        for diag in _unsupported(function, source)
+    ]
 
 
 def _type_mappings(function: FunctionInfo) -> list[dict[str, str]]:
@@ -234,7 +317,22 @@ def analyze_source(input_file: Path, top: str, config: AgentConfig) -> AnalysisR
     source = input_file.read_text(encoding="utf-8")
     diagnostics = DiagnosticBag()
     function = _extract_function(source, top, input_file, config)
-    _infer_pointer_directions(function, config)
+    for name in _infer_pointer_directions(function, config):
+        diagnostics.add(
+            "warning",
+            "unprovable-pointer-direction",
+            f"argument {name!r} escapes the top function, so a read-only direction cannot be proven; comparing it as 'inout'",
+            input_file.name,
+            "Set arguments.<name>.direction in config.yaml to record the intended direction.",
+        )
+    if not _has_observable_output(function):
+        diagnostics.add(
+            "error",
+            "no-observable-output",
+            "the top function exposes no return value and no output/inout argument, so equivalence cannot be checked",
+            input_file.name,
+            "Declare the written argument with arguments.<name>.direction: output, or give the top a return value.",
+        )
     for arg in function.args:
         if arg.is_pointer_like and arg.length is None:
             arg.length = 16
@@ -245,6 +343,6 @@ def analyze_source(input_file: Path, top: str, config: AgentConfig) -> AnalysisR
                 input_file.name,
                 "Set arguments.<name>.length in config.yaml.",
             )
-    unsupported = _unsupported(function)
+    unsupported = _unsupported(function, source)
     diagnostics.extend(unsupported)
     return AnalysisResult(function, diagnostics, _type_mappings(function), unsupported)

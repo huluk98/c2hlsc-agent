@@ -5,7 +5,7 @@ import json
 import sys
 from pathlib import Path
 
-from .analyze import analyze_source
+from .analyze import AnalysisResult, analyze_source, unsupported_in_generated
 from .candidates import select_best_candidate
 from .config import AgentConfig, load_config, merge_cli_config
 from .convert import ReferenceGenerationError, generate_hls_sources, generate_reference_c
@@ -452,7 +452,7 @@ def run_convert(args: argparse.Namespace) -> int:
             completed_iterations = controller.record.usage.attempts
             break
         state = verify_project(out_dir, config.run_vitis, verbose=args.verbose, remote=remote)
-        status = final_status(state, config.run_vitis, analysis.diagnostics.has_errors)
+        status = final_status(state, config.run_vitis, _blocking_errors(out_dir, analysis, config))
         if status == 'pass':
             controller.record_verification(source_signature, None)
             controller.finish(
@@ -533,6 +533,7 @@ def run_convert(args: argparse.Namespace) -> int:
         seen_signatures.add(signature)
     assert state is not None
     completed_iterations = controller.record.usage.attempts
+    blocking_errors = _blocking_errors(out_dir, analysis, config)
     write_reports(
         project,
         analysis,
@@ -542,11 +543,54 @@ def run_convert(args: argparse.Namespace) -> int:
         completed_iterations,
         repair_history,
         run_control=controller.snapshot(),
+        blocking_errors=blocking_errors,
     )
-    status = final_status(state, config.run_vitis, analysis.diagnostics.has_errors)
-    if args.verbose:
-        print(f"Report: {out_dir / 'conversion_report.md'}")
+    status = final_status(state, config.run_vitis, blocking_errors)
+    print(f"Report: {out_dir / 'conversion_report.md'}", file=sys.stdout if status == "pass" else sys.stderr)
     return 0 if status == "pass" else 1
+
+
+# Input diagnostics the generator is expected to resolve. Their presence in the
+# original C means "this source needs transforming", not "this run failed" -- so they
+# are re-checked against the generated HLS-C instead of failing the run outright.
+# Every other error (an unusable contract, nothing to compare) still gates.
+_TRANSFORMABLE_CODES = frozenset(
+    {
+        "dynamic-allocation",
+        "unsupported-stdlib-call",
+        "system-call",
+        "file-io",
+        "function-pointer",
+        "unbounded-loop",
+        "recursion",
+        "pointer-arithmetic",
+        "variable-length-array",
+    }
+)
+
+
+def _blocking_errors(out_dir: Path, analysis: AnalysisResult, config: AgentConfig) -> bool:
+    """Whether an error should fail this conversion, judged against generated output."""
+
+    residual = [
+        item
+        for item in analysis.diagnostics.items
+        if item.severity.lower() == "error" and item.code not in _TRANSFORMABLE_CODES
+    ]
+    if residual:
+        return True
+    generated_top = out_dir / "src" / "hls_top.cpp"
+    if not generated_top.exists():
+        return analysis.diagnostics.has_errors
+    return any(
+        diag.severity.lower() == "error"
+        for diag in unsupported_in_generated(
+            generated_top.read_text(encoding="utf-8"),
+            analysis.function.name,
+            config,
+            "src/hls_top.cpp",
+        )
+    )
 
 
 def _project_signature(project_dir: Path) -> str:

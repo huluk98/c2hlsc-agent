@@ -5,7 +5,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from c2hlsc_agent.analyze import analyze_source
+from c2hlsc_agent.analyze import analyze_source, unsupported_in_generated
 from c2hlsc_agent.config import AgentConfig, ArgumentConfig
 
 
@@ -108,6 +108,146 @@ class AnalyzeTests(unittest.TestCase):
         codes = {diag.code for diag in result.unsupported_constructs}
         self.assertIn("dynamic-allocation", codes)
         self.assertTrue(result.diagnostics.has_errors)
+
+    def test_output_written_through_alias_is_still_compared(self):
+        # Regression: `out` is written only through the local alias `dst`, which the
+        # write regex cannot see. Classifying it "input" excluded it from the
+        # comparison entirely, so a wrong implementation passed every test.
+        path = self._write(
+            """
+            void scale_kernel(const int *in, int *out, int n) {
+              int *dst = out;
+              for (int i = 0; i < n; ++i) dst[i] = in[i] * 3;
+            }
+            """
+        )
+        cfg = AgentConfig(
+            top="scale_kernel",
+            arguments={"in": ArgumentConfig(length=8), "out": ArgumentConfig(length=8)},
+        )
+        result = analyze_source(path, "scale_kernel", cfg)
+        directions = {arg.name: arg.direction for arg in result.function.args}
+        self.assertIn(directions["out"], {"output", "inout"})
+        self.assertEqual(directions["in"], "input")
+        codes = {diag.code for diag in result.diagnostics.items}
+        self.assertIn("unprovable-pointer-direction", codes)
+
+    def test_output_passed_to_helper_is_still_compared(self):
+        # Same hazard via a different route: the write happens inside memcpy.
+        path = self._write(
+            """
+            #include <string.h>
+            void copy_kernel(const int *in, int *out) {
+              memcpy(out, in, 8 * sizeof(int));
+            }
+            """
+        )
+        cfg = AgentConfig(
+            top="copy_kernel",
+            arguments={"in": ArgumentConfig(length=8), "out": ArgumentConfig(length=8)},
+        )
+        result = analyze_source(path, "copy_kernel", cfg)
+        directions = {arg.name: arg.direction for arg in result.function.args}
+        self.assertIn(directions["out"], {"output", "inout"})
+
+    def test_const_pointer_passed_to_helper_stays_an_input(self):
+        # The const qualifier is a real read-only guarantee, so escaping is not
+        # enough to force a conservative direction.
+        path = self._write(
+            """
+            #include <string.h>
+            void copy_kernel(const int *in, int *out) {
+              memcpy(out, in, 8 * sizeof(int));
+            }
+            """
+        )
+        cfg = AgentConfig(
+            top="copy_kernel",
+            arguments={"in": ArgumentConfig(length=8), "out": ArgumentConfig(length=8)},
+        )
+        result = analyze_source(path, "copy_kernel", cfg)
+        directions = {arg.name: arg.direction for arg in result.function.args}
+        self.assertEqual(directions["in"], "input")
+
+    def test_no_observable_output_fails_closed(self):
+        # With nothing to compare, every stimulus trivially agrees. That must be an
+        # error rather than a silently passing run.
+        path = self._write(
+            """
+            void sink_kernel(const int *in, int n) {
+              volatile int acc = 0;
+              for (int i = 0; i < n; ++i) acc += in[i];
+            }
+            """
+        )
+        cfg = AgentConfig(top="sink_kernel", arguments={"in": ArgumentConfig(length=8)})
+        result = analyze_source(path, "sink_kernel", cfg)
+        codes = {diag.code for diag in result.diagnostics.items if diag.severity == "error"}
+        self.assertIn("no-observable-output", codes)
+        self.assertTrue(result.diagnostics.has_errors)
+
+    def test_return_value_counts_as_observable_output(self):
+        path = self._write(
+            """
+            int sum_kernel(const int *in, int n) {
+              int acc = 0;
+              for (int i = 0; i < n; ++i) acc += in[i];
+              return acc;
+            }
+            """
+        )
+        cfg = AgentConfig(top="sum_kernel", arguments={"in": ArgumentConfig(length=8)})
+        result = analyze_source(path, "sum_kernel", cfg)
+        codes = {diag.code for diag in result.diagnostics.items}
+        self.assertNotIn("no-observable-output", codes)
+
+    def test_macro_array_bound_is_not_a_variable_length_array(self):
+        # A #define'd bound is a compile-time constant; flagging it as a VLA made
+        # correctly transformed output look non-synthesizable.
+        path = self._write(
+            """
+            #define MAX_N 16
+            void k(const int *in, int *out, int n) {
+              int scratch[MAX_N];
+              for (int i = 0; i < MAX_N; ++i) scratch[i] = in[i];
+              for (int i = 0; i < n; ++i) out[i] = scratch[i];
+            }
+            """
+        )
+        cfg = AgentConfig(
+            top="k", arguments={"in": ArgumentConfig(length=16), "out": ArgumentConfig(length=16)}
+        )
+        result = analyze_source(path, "k", cfg)
+        codes = {diag.code for diag in result.unsupported_constructs}
+        self.assertNotIn("variable-length-array", codes)
+
+    def test_runtime_array_bound_is_still_a_variable_length_array(self):
+        path = self._write(
+            """
+            void k(const int *in, int *out, int n) {
+              int scratch[n];
+              for (int i = 0; i < n; ++i) scratch[i] = in[i];
+              for (int i = 0; i < n; ++i) out[i] = scratch[i];
+            }
+            """
+        )
+        cfg = AgentConfig(
+            top="k", arguments={"in": ArgumentConfig(length=16), "out": ArgumentConfig(length=16)}
+        )
+        result = analyze_source(path, "k", cfg)
+        codes = {diag.code for diag in result.unsupported_constructs}
+        self.assertIn("variable-length-array", codes)
+
+    def test_generated_output_is_rescanned_independently_of_the_input(self):
+        # Input diagnostics mean "this needs transforming"; only the generated
+        # output decides whether the transformation succeeded.
+        dirty = "void k(const int *in, int *out, int n) { int *p = malloc(4); free(p); }"
+        clean = "void k(const int *in, int *out, int n) { for (int i=0;i<n;++i) out[i]=in[i]; }"
+        cfg = AgentConfig(top="k")
+        self.assertTrue(
+            any(d.code == "dynamic-allocation" for d in unsupported_in_generated(dirty, "k", cfg, "src/hls_top.cpp"))
+        )
+        self.assertEqual(unsupported_in_generated(clean, "k", cfg, "src/hls_top.cpp"), [])
 
     def test_pointer_arithmetic_and_stdlib_are_reported(self):
         path = self._write(
