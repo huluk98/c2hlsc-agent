@@ -244,6 +244,22 @@ void write_csv_value(std::ofstream& trace, const T& value) {{
   trace << "," << std::setprecision(17) << value;
 }}
 
+// Character-typed values must go out as numbers. Streaming a char writes the *byte*,
+// so a value of 44 emits a comma and 10 emits a newline: that does not merely produce
+// invalid UTF-8, it shifts every column after it and can line a divergent pair up as
+// equal. These non-template overloads win over the template on an exact match.
+void write_csv_value(std::ofstream& trace, const char& value) {{
+  trace << "," << static_cast<int>(value);
+}}
+
+void write_csv_value(std::ofstream& trace, const signed char& value) {{
+  trace << "," << static_cast<int>(value);
+}}
+
+void write_csv_value(std::ofstream& trace, const unsigned char& value) {{
+  trace << "," << static_cast<unsigned int>(value);
+}}
+
 std::mt19937_64 make_trace_rng() {{
   return std::mt19937_64({seed}ULL);
 }}
