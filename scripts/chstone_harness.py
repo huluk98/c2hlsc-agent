@@ -72,13 +72,23 @@ class Sample:
 
     @property
     def passed(self) -> bool:
-        """CHStone's definition: the generated design's chstone_main returns 0.
+        """All three legs, because any one alone can lie.
 
-        The golden leg must also pass, otherwise the adaptation -- not the agent -- is
-        what the run measured, and counting it either way would be dishonest.
+        * ``status`` -- the agent accepted the design. It can write an ``hls_top.cpp``
+          while still reporting failure (mips: the agent refuses the benchmark's
+          ``while(1)``), and scoring a refusal as a success because the leftover file
+          happens to run would overstate what the agent did.
+        * ``selfcheck`` -- CHStone's own criterion: the generated ``chstone_main``
+          returns 0.
+        * ``golden_selfcheck`` -- the control on this harness. If the adapted golden C
+          does not itself return 0, the adaptation is what got measured, not the agent.
         """
 
-        return self.selfcheck == "pass" and self.golden_selfcheck == "pass"
+        return (
+            self.status == "pass"
+            and self.selfcheck == "pass"
+            and self.golden_selfcheck == "pass"
+        )
 
 
 @dataclass
@@ -455,7 +465,9 @@ def run_sample(
         # benchmark that passed would misstate the result.
         sample.blocker, sample.detail = None, ""
     elif not sample.blocker:
-        if sample.golden_selfcheck != "pass":
+        if sample.status != "pass":
+            sample.blocker = f"convert-{sample.status}"
+        elif sample.golden_selfcheck != "pass":
             sample.blocker = "adaptation-broke-golden"
             sample.detail = checks.get("golden_detail", "") or "adapted golden C does not return 0"
         else:
