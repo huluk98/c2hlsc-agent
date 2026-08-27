@@ -162,7 +162,7 @@ def classify_log_family(phase: str, text: str) -> str:
         return "loop_scheduling"
     if re.search(r"\b(not synthesizable|unsupported|cannot synthesize|synthesis failed)\b", lowered):
         return "non_synthesizable_construct"
-    if phase in {"software_equivalence", "csim"}:
+    if phase in {"software_equivalence", "leveri_trace", "csim"}:
         return "testbench_or_c_semantics"
     if phase == "csynth":
         return "synthesis_failure"
@@ -212,6 +212,54 @@ def classify_failure(
             next_action="Run host software equivalence before Vitis phases.",
             evidence_needed=("software equivalence phase status",),
             repair_scope="verification scheduling",
+        )
+
+    if state.status_for("leveri_trace") == "fail":
+        text = _phase_text(state, "leveri_trace")
+        lowered = text.lower()
+        if "behavior mismatch" in lowered:
+            # The paired traces diverge on an output column: the harness alignment held
+            # (identical stimulus), so this is a design defect with the divergence already
+            # localized to a cycle and column -- the PMLC-L1/L3 evidence for the repair.
+            return FailureAnalysis(
+                family="leveri_trace_mismatch",
+                owner_agent="failure_analyst",
+                next_action=(
+                    "Use the paired-trace first divergence (cycle, column, expected/actual) "
+                    "to drive a minimal HLS-C patch; the golden trace is authoritative."
+                ),
+                evidence_needed=(
+                    "first divergent cycle",
+                    "divergent column and role",
+                    "expected/actual values",
+                    "paired golden/HLS traces",
+                ),
+                repair_scope="generated HLS-C only; never the golden trace or testbenches",
+            )
+        harness_markers = (
+            "stimulus mismatch",
+            "static header mismatch",
+            "static role-row mismatch",
+            "cycle-count mismatch",
+            "row width mismatch",
+        )
+        if any(marker in lowered for marker in harness_markers):
+            return FailureAnalysis(
+                family="leveri_harness_misalignment",
+                owner_agent="shift_left_testbench_agent",
+                next_action=(
+                    "Regenerate the paired trace testbenches from the interface contract; "
+                    "the stimulus schedule, headers, roles, or cycle counts have drifted."
+                ),
+                evidence_needed=("comparator failure line", "trace headers and role rows", "testbench provenance"),
+                repair_scope="paired trace testbenches and contract metadata; regenerate, never hand-edit",
+            )
+        return FailureAnalysis(
+            family=classify_log_family("leveri_trace", text),
+            owner_agent="shift_left_testbench_agent",
+            next_action="Repair the paired-trace harness build (compiler errors, missing files) before Vitis phases.",
+            evidence_needed=("leveri_trace log tail", "testbench sources", "argument metadata"),
+            repair_scope="paired trace testbenches and contract metadata",
         )
 
     if not run_vitis_requested:

@@ -25,6 +25,10 @@ def final_status(state: VerificationState, run_vitis: bool, diagnostics_has_erro
     if diagnostics_has_errors:
         return "fail"
     required = ["software_equivalence"]
+    # The LeVeri paired-trace gate is optional; when it ran (anything but "skipped")
+    # it joins the required-pass set so a trace divergence can never be reported "pass".
+    if state.status_for("leveri_trace") != "skipped":
+        required.append("leveri_trace")
     if run_vitis:
         required.extend(["csim", "csynth", "cosim"])
     return "pass" if all(state.status_for(phase) == "pass" for phase in required) else "fail"
@@ -140,6 +144,7 @@ def write_reports(
 ## Phase Results
 
 - Software equivalence: `{state.status_for("software_equivalence")}`
+- LeVeri paired trace: `{state.status_for("leveri_trace")}`
 - C simulation: `{state.status_for("csim")}`
 - C synthesis: `{state.status_for("csynth")}`
 - C/RTL co-simulation: `{state.status_for("cosim")}`
@@ -170,6 +175,7 @@ def write_reports(
         "generator_prompt_id": generated.generator_prompt_id,
         "testbench_policy_id": LEVERI_TESTBENCH_POLICY_ID,
         "software_equivalence": state.status_for("software_equivalence"),
+        "leveri_trace": state.status_for("leveri_trace"),
         "csim": state.status_for("csim"),
         "csynth": state.status_for("csynth"),
         "cosim": state.status_for("cosim"),

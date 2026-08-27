@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 from .cosim_verdict import evaluate_cosim_verdict
@@ -9,12 +11,23 @@ from .equivalence import PhaseResult, VerificationState, parse_mismatches, run_c
 from .remote import RemoteVitis
 
 
-PHASE_ORDER = ("software_equivalence", "csim", "csynth", "cosim")
+PHASE_ORDER = ("software_equivalence", "leveri_trace", "csim", "csynth", "cosim")
 PHASE_TIMEOUTS = {"csim": 600, "csynth": 1200, "cosim": 600}
+LEVERI_TRACE_TIMEOUT = 240
+
+_LEVERI_TB_FILES = (
+    "tb/leveri_golden_tb.cpp",
+    "tb/leveri_hls_tb.cpp",
+    "tb/leveri_compare.py",
+)
 
 
 def earliest_failing_phase(state: VerificationState, run_vitis_requested: bool) -> str | None:
     required = ["software_equivalence"]
+    # The LeVeri paired-trace gate is optional (config/leveri files); a state that
+    # never ran it reports "skipped" and must not surface as the earliest failure.
+    if state.status_for("leveri_trace") != "skipped":
+        required.append("leveri_trace")
     if run_vitis_requested:
         required.extend(["csim", "csynth", "cosim"])
     for phase in required:
@@ -53,12 +66,59 @@ def run_software_equivalence(project_dir: Path, verbose: bool = False) -> PhaseR
     return result
 
 
+def run_leveri_trace(project_dir: Path, verbose: bool = False) -> PhaseResult:
+    """Run the LeVeri paired-trace gate (golden vs HLS trace + dual-tier comparator).
+
+    Uses the project's own ``make leveri-test`` target so the check stays identical to
+    the manual flow. Projects generated without the LeVeri bundle report "skipped".
+    """
+
+    if any(not (project_dir / rel).exists() for rel in _LEVERI_TB_FILES):
+        return PhaseResult("leveri_trace", "skipped", summary="leveri testbenches not present")
+    try:
+        # PYTHON=<current interpreter>: native Windows rarely has a "python3" alias, and
+        # the gated check must not depend on one; the Makefile defaults to python3 for
+        # the manual flow.
+        result = run_command(
+            ["make", "leveri-test", f"PYTHON={sys.executable}"],
+            project_dir,
+            "leveri_trace",
+            timeout=LEVERI_TRACE_TIMEOUT,
+        )
+    except FileNotFoundError:
+        return PhaseResult("leveri_trace", "fail", summary="make not found")
+    except subprocess.TimeoutExpired as exc:
+        return _timeout_result(project_dir, "leveri_trace", exc, "leveri paired-trace check")
+    if verbose and result.stdout:
+        print(result.stdout)
+    return result
+
+
+def vitis_executable() -> str | None:
+    """Resolve the local vitis_hls launcher.
+
+    ``C2HLSC_VITIS_BIN`` overrides PATH lookup — required on native Windows, where the
+    launcher is ``vitis_hls.bat`` (e.g. ``D:\\Xilinx\\Vivado\\2024.2\\bin\\vitis_hls.bat``)
+    and CreateProcess will not resolve a bare ``vitis_hls`` to a batch file. The resolved
+    absolute path is what gets executed, so the .bat works without PATH edits.
+    """
+
+    override = os.environ.get("C2HLSC_VITIS_BIN", "").strip()
+    if override:
+        candidate = Path(override).expanduser()
+        if candidate.exists():
+            return str(candidate)
+        return shutil.which(override)
+    return shutil.which("vitis_hls")
+
+
 def _run_vitis_phase(project_dir: Path, phase: str, remote: RemoteVitis | None) -> PhaseResult:
     timeout = PHASE_TIMEOUTS[phase]
     try:
         if remote is not None:
             return remote.run_phase(project_dir, phase, timeout)
-        return run_command(["vitis_hls", "-f", f"run_{phase}.tcl"], project_dir, phase, timeout=timeout)
+        executable = vitis_executable() or "vitis_hls"
+        return run_command([executable, "-f", f"run_{phase}.tcl"], project_dir, phase, timeout=timeout)
     except subprocess.TimeoutExpired as exc:
         return _timeout_result(project_dir, phase, exc, f"Vitis {phase}")
 
@@ -101,8 +161,12 @@ def run_vitis(
                 "csynth": PhaseResult("csynth", "blocked", summary=message),
                 "cosim": PhaseResult("cosim", "blocked", summary=message),
             }
-    elif shutil.which("vitis_hls") is None:
-        message = "vitis_hls not found on PATH (use --vitis-ssh to run Vitis on a remote Linux host)"
+    elif vitis_executable() is None:
+        message = (
+            "vitis_hls not found on PATH (set C2HLSC_VITIS_BIN to the vitis_hls launcher, "
+            "e.g. D:\\Xilinx\\Vivado\\2024.2\\bin\\vitis_hls.bat on Windows, or use "
+            "--vitis-ssh to run Vitis on a remote Linux host)"
+        )
         return {
             "csim": PhaseResult("csim", "fail", summary=message),
             "csynth": PhaseResult("csynth", "blocked", summary=message),
@@ -169,15 +233,27 @@ def verify_project(
     run_vitis_requested: bool,
     verbose: bool = False,
     remote: RemoteVitis | None = None,
+    leveri: bool = True,
 ) -> VerificationState:
     state = VerificationState()
     software = run_software_equivalence(project_dir, verbose=verbose)
     state.add_phase(software)
     state.mismatches.extend(parse_mismatches(software.stdout + "\n" + software.stderr))
     if software.status != "pass":
+        state.add_phase(PhaseResult("leveri_trace", "blocked", summary="software equivalence failed"))
         state.add_phase(PhaseResult("csim", "blocked", summary="software equivalence failed"))
         state.add_phase(PhaseResult("csynth", "blocked", summary="software equivalence failed"))
         state.add_phase(PhaseResult("cosim", "blocked", summary="software equivalence failed"))
+        return state
+    if leveri:
+        trace = run_leveri_trace(project_dir, verbose=verbose)
+    else:
+        trace = PhaseResult("leveri_trace", "skipped", summary="leveri gate disabled")
+    state.add_phase(trace)
+    if trace.status == "fail":
+        state.add_phase(PhaseResult("csim", "blocked", summary="leveri trace check failed"))
+        state.add_phase(PhaseResult("csynth", "blocked", summary="leveri trace check failed"))
+        state.add_phase(PhaseResult("cosim", "blocked", summary="leveri trace check failed"))
         return state
     for result in run_vitis(project_dir, run_vitis_requested, remote=remote).values():
         state.add_phase(result)

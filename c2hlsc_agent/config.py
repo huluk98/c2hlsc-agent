@@ -32,6 +32,7 @@ class AgentConfig:
     cosim_tool: str | None = None
     rtl: str = "verilog"
     seed: int = 1
+    leveri_gate: bool = True
     max_iterations: int = 1
     max_wall_seconds: int = 14_400
     max_llm_calls: int = 8
@@ -215,6 +216,7 @@ def load_config(path: Path | None) -> AgentConfig:
         keep_going=bool(data.get("keep_going", False)),
         run_vitis=bool(data.get("run_vitis", False)),
         seed=int(data.get("seed", 1)),
+        leveri_gate=bool(data.get("leveri_gate", True)),
         use_llm=bool(data.get("use_llm", False)),
         llm_backend=str(data.get("llm_backend", "auto")),
         llm_model=(str(data["llm_model"]) if data.get("llm_model") is not None else None),
@@ -256,6 +258,8 @@ def merge_cli_config(config: AgentConfig, args: Any) -> AgentConfig:
         config.max_vitis_runs = int(args.max_vitis_runs)
     if getattr(args, 'run_id', None):
         config.run_id = str(args.run_id)
+    if getattr(args, "no_leveri", False):
+        config.leveri_gate = False
     if getattr(args, "auto_repair", False):
         config.auto_repair = True
     if getattr(args, "keep_going", False):

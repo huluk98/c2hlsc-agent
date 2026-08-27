@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -9,10 +12,11 @@ from .analyze import analyze_source
 from .candidates import select_best_candidate
 from .config import AgentConfig, load_config, merge_cli_config
 from .convert import ReferenceGenerationError, generate_hls_sources, generate_reference_c
-from .equivalence import VerificationState
+from .equivalence import PhaseResult, VerificationState, run_command
 from .hlsc_repair_agent import clear_repair_audit, repair_project
 from .hls_project import write_project
 from .hls_runner import verify_project
+from .leveri_testgen import generate_leveri_testbenches
 from .llm import build_llm_client, missing_llm_reason
 from .remote import RemoteVitis
 from .report import final_status, write_reports
@@ -141,10 +145,16 @@ def build_parser() -> argparse.ArgumentParser:
     convert.add_argument("--max-iterations", type=int, help="max verification iterations (default 1); repaired reruns require --auto-repair")
     convert.add_argument("--auto-repair", action="store_true", help="apply mechanical and LLM repairs automatically between verification attempts")
     convert.add_argument("--keep-going", action="store_true", help="emit project even when static diagnostics contain errors")
+    convert.add_argument(
+        "--no-leveri",
+        action="store_true",
+        help="disable the LeVeri shift-left gate (golden-trace smoke before generation and "
+        "the paired-trace check between host equivalence and the Vitis phases)",
+    )
     convert.add_argument("--verbose", action="store_true", help="print command output")
     repair = sub.add_parser("repair", help="apply a repair from externally supplied Vitis/verification evidence")
     repair.add_argument("--project", required=True, help="existing generated project directory")
-    repair.add_argument("--stage", required=True, choices=["software_equivalence", "csim", "csynth", "cosim"], help="earliest failing stage from the external run")
+    repair.add_argument("--stage", required=True, choices=["software_equivalence", "leveri_trace", "csim", "csynth", "cosim"], help="earliest failing stage from the external run")
     repair.add_argument("--evidence", action="append", default=[], help="path to a log/report file from the failing stage; may be repeated")
     repair.add_argument("--evidence-text", default="", help="inline failing-stage evidence text")
     repair.add_argument("--input", help="original input C file; defaults to PROJECT/input.c")
@@ -231,6 +241,7 @@ def _run_identity(config: AgentConfig) -> dict[str, object]:
         'clock': config.clock,
         'seed': config.seed,
         'run_vitis': config.run_vitis,
+        'leveri_gate': config.leveri_gate,
         'arguments': arguments,
         'compiler_flags': list(config.compiler_flags),
         'num_tests': config.num_tests,
@@ -262,6 +273,69 @@ def _start_run_controller(
         max_vitis_runs=config.max_vitis_runs,
     )
     return RunController(out_dir, run_id, budget, identity_fingerprint)
+
+
+def _golden_trace_smoke(out_dir: Path, analysis, config: AgentConfig) -> PhaseResult | None:
+    """Compile and run the LeVeri golden testbench before any generation happens.
+
+    The golden testbench is rendered purely from the interface contract of the original
+    C and executes only ``input.c`` (macro-renamed), so it needs no HLS-C: a failure
+    here means contract extraction is wrong (directions, lengths, ranges) and no
+    generation tokens or Vitis runs should be spent yet. Returns ``None`` when the
+    smoke cannot run (gate disabled, or no host C++ compiler) — a missing toolchain is
+    infrastructure, not a contract error, and is reported by the ladder itself later.
+    """
+
+    if not config.leveri_gate:
+        return None
+    cxx = shutil.which("g++")
+    if cxx is None:
+        return None
+    smoke_dir = out_dir / ".golden_smoke"
+    (smoke_dir / "tb").mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(analysis.function.source_path, smoke_dir / "input.c")
+    bundle = generate_leveri_testbenches(analysis, config)
+    (smoke_dir / "tb" / "leveri_golden_tb.cpp").write_text(bundle.golden_tb, encoding="utf-8")
+    exe = smoke_dir / ("golden_smoke_tb.exe" if os.name == "nt" else "golden_smoke_tb")
+    include_flags = [flag for path in config.include_dirs for flag in ("-I", str(path))]
+    compile_cmd = [cxx, "-std=c++17", *include_flags, *config.compiler_flags, "tb/leveri_golden_tb.cpp", "-o", str(exe)]
+    # Executing the golden testbench is only sound when the stimulus is bounded: every
+    # pointer has a configured length and every scalar a configured range. An unbounded
+    # contract only earns the analyzer's missing-bound warning today, so the smoke must
+    # not hard-block it — it degrades to a compile-only check of the extracted contract.
+    run_is_sound = not any(
+        diag.code == "missing-pointer-bound" for diag in analysis.diagnostics.items
+    ) and all(arg.scalar_range is not None for arg in analysis.function.args if not arg.is_pointer_like)
+    try:
+        compiled = run_command(compile_cmd, smoke_dir, "golden_smoke", timeout=120)
+        if compiled.status != "pass":
+            return compiled
+        if not run_is_sound:
+            return PhaseResult(
+                "golden_smoke",
+                "pass",
+                summary="golden testbench compiled; run skipped (unbounded contract — add lengths/ranges for a full smoke)",
+            )
+        ran = run_command([str(exe)], smoke_dir, "golden_smoke", timeout=120)
+    except FileNotFoundError:
+        return None
+    except subprocess.TimeoutExpired as exc:
+        return PhaseResult(
+            "golden_smoke",
+            "fail",
+            stdout=str(exc.output or ""),
+            stderr=str(exc.stderr or ""),
+            summary=f"golden-trace smoke timed out after {exc.timeout}s",
+        )
+    if ran.status != "pass":
+        return ran
+    if not (smoke_dir / "leveri_golden_trace.csv").exists():
+        return PhaseResult(
+            "golden_smoke",
+            "fail",
+            summary="golden testbench ran but produced no golden trace",
+        )
+    return ran
 
 
 def _permit_optional_llm_fallback(
@@ -367,6 +441,23 @@ def run_convert(args: argparse.Namespace) -> int:
                 "fixed-size arrays, or pass --config with arguments.<name>.length for a sound equivalence check.",
                 file=sys.stderr,
             )
+    smoke = _golden_trace_smoke(out_dir, analysis, config)
+    if smoke is not None and smoke.status != "pass":
+        detail = smoke.summary or (smoke.stderr or smoke.stdout).strip()[-400:] or "see .golden_smoke/golden_smoke.log"
+        controller.finish(
+            RunStatus.BLOCKED,
+            f'golden-trace smoke failed before generation: {detail}',
+        )
+        print(
+            "Golden-trace smoke failed: the interface contract extracted from the original C "
+            f"does not produce a runnable golden testbench ({detail}). "
+            f"Fix the contract (argument directions/lengths/ranges in --config) and rerun; "
+            f"evidence: {out_dir / '.golden_smoke' / 'golden_smoke.log'}",
+            file=sys.stderr,
+        )
+        return 1
+    if smoke is not None and args.verbose:
+        print("Golden-trace smoke passed: contract extraction produces a runnable golden testbench.")
     generated = None
     if llm is not None and config.use_llm and config.llm_candidates > 1:
         try:
@@ -451,7 +542,13 @@ def run_convert(args: argparse.Namespace) -> int:
             state = state or VerificationState()
             completed_iterations = controller.record.usage.attempts
             break
-        state = verify_project(out_dir, config.run_vitis, verbose=args.verbose, remote=remote)
+        state = verify_project(
+            out_dir,
+            config.run_vitis,
+            verbose=args.verbose,
+            remote=remote,
+            leveri=config.leveri_gate,
+        )
         status = final_status(state, config.run_vitis, analysis.diagnostics.has_errors)
         if status == 'pass':
             controller.record_verification(source_signature, None)
@@ -584,7 +681,7 @@ def _external_failure_state(stage: str, evidence: str, run_vitis: bool):
     from .equivalence import PhaseResult, VerificationState
 
     state = VerificationState()
-    phases = ["software_equivalence"]
+    phases = ["software_equivalence", "leveri_trace"]
     if run_vitis:
         phases.extend(["csim", "csynth", "cosim"])
     if stage not in phases:

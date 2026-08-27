@@ -387,6 +387,7 @@ def _klee_driver(analysis: AnalysisResult) -> str:
 #include <klee/klee.h>
 
 extern "C" {{
+#define restrict __restrict__
 #define {fn.name} {fn.name}_ref
 #include "../input.c"
 #undef {fn.name}
@@ -686,6 +687,7 @@ def _manifest(analysis: AnalysisResult, config: AgentConfig) -> str:
 def generate_leveri_testbenches(analysis: AnalysisResult, config: AgentConfig) -> LeVeriTestbenchBundle:
     fn = analysis.function
     golden_include = f"""extern "C" {{
+#define restrict __restrict__
 #define {fn.name} {fn.name}_ref
 #include "../input.c"
 #undef {fn.name}

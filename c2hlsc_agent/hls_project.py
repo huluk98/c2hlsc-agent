@@ -80,6 +80,7 @@ def render_makefile(config: AgentConfig) -> str:
     flags = " ".join(config.compiler_flags)
     return f"""CXX ?= g++
 CXXFLAGS ?= -std=c++17 -Wall -Wextra -I src {flags}
+PYTHON ?= python3
 TB_EXE ?= c2hlsc_tb
 LEVERI_GOLDEN_EXE ?= leveri_golden_tb
 LEVERI_HLS_EXE ?= leveri_hls_tb
@@ -105,13 +106,13 @@ test: $(TB_EXE)
 leveri-test: $(LEVERI_GOLDEN_EXE) $(LEVERI_HLS_EXE)
 \t./$(LEVERI_GOLDEN_EXE)
 \t./$(LEVERI_HLS_EXE)
-\tpython3 tb/leveri_compare.py leveri_golden_trace.csv leveri_hls_trace.csv
+\t"$(PYTHON)" tb/leveri_compare.py leveri_golden_trace.csv leveri_hls_trace.csv
 
 gcov-coverage:
-\tpython3 tb/run_gcov.py
+\t"$(PYTHON)" tb/run_gcov.py
 
 klee-coverage:
-\tpython3 tb/run_klee.py
+\t"$(PYTHON)" tb/run_klee.py
 
 coverage: gcov-coverage klee-coverage
 
@@ -125,10 +126,10 @@ rtl-vectors: $(RTL_VECTORS_EXE)
 \t./$(RTL_VECTORS_EXE)
 
 rtl-testbench:
-\tpython3 tb/gen_rtl_tb.py --from-contract
+\t"$(PYTHON)" tb/gen_rtl_tb.py --from-contract
 
 rtl-cosim:
-\tpython3 tb/run_rtl_sim.py
+\t"$(PYTHON)" tb/run_rtl_sim.py
 
 vitis:
 \tvitis_hls -f run_hls.tcl
