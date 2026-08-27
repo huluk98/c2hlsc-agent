@@ -27,6 +27,7 @@ from .report import final_status, write_reports
 from .toolchain import (
     TIER_PURPOSE,
     TIERS,
+    container_diagnostics,
     check as check_tools,
     install as install_tools,
     missing as missing_tools,
@@ -955,6 +956,12 @@ def run_doctor(args: argparse.Namespace) -> int:
             statuses = check_tools(args.tier)  # re-probe so the report reflects reality
             absent = missing_tools(statuses)
 
+    # The KLEE container route has three independent preconditions that all look the
+    # same from outside when one fails. Probe them whenever KLEE is not native.
+    container: dict[str, object] | None = None
+    if any(s.tool.name == "klee" and not s.present for s in statuses):
+        container = container_diagnostics()
+
     if args.json:
         print(
             json.dumps(
@@ -963,6 +970,7 @@ def run_doctor(args: argparse.Namespace) -> int:
                     "package_manager": manager,
                     "tools": [status.to_dict() for status in statuses],
                     "install_results": results,
+                    "klee_container": container,
                 },
                 indent=2,
             )
@@ -977,6 +985,21 @@ def run_doctor(args: argparse.Namespace) -> int:
         print(f"\n{tier} — {TIER_PURPOSE.get(tier, '')}")
         for status in entries:
             print(summary_line(status))
+
+    if container is not None:
+        print("\nKLEE container route (used only when KLEE is not native):")
+        print(f"  docker cli    : {container.get('cli') or 'not installed'}")
+        print(f"  daemon        : {container.get('daemon')}")
+        # Only meaningful once a daemon answered; an empty OSType from a dead daemon
+        # is not evidence of the wrong container type.
+        if container.get("daemon") == "ok":
+            os_type = container.get("os_type") or "(empty)"
+            note = "" if os_type == "linux" else "  <- klee/klee is a Linux image"
+            print(f"  container type: {os_type}{note}")
+        if "image_present" in container:
+            present = container.get("image_present")
+            hint = "" if present is True else f"  <- docker pull {container.get('image')}"
+            print(f"  image local   : {present}{hint}")
 
     if results:
         print("\nInstall results:")

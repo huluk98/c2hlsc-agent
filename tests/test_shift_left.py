@@ -840,6 +840,32 @@ class ToolchainTests(unittest.TestCase):
         for status in statuses:
             self.assertFalse(status.installable, status.tool.name)
 
+    def test_container_diagnostics_reports_each_precondition_separately(self) -> None:
+        """The container route has three independent preconditions that fail identically
+        from outside; doctor has to distinguish them or a remote diagnosis is guesswork."""
+
+        def fake(command, *args, **kwargs):
+            if command[:2] == ["docker", "info"]:
+                return subprocess.CompletedProcess(command, 0, stdout="windows\n", stderr="")
+            if command[:3] == ["docker", "image", "inspect"]:
+                return subprocess.CompletedProcess(command, 1, stdout="", stderr="No such image")
+            raise AssertionError(f"unexpected probe: {command}")
+
+        with mock.patch.object(toolchain.shutil, "which", return_value="/usr/bin/docker"), mock.patch.object(
+            toolchain.subprocess, "run", side_effect=fake
+        ):
+            diagnostics = toolchain.container_diagnostics()
+        self.assertEqual(diagnostics["daemon"], "ok")
+        self.assertEqual(diagnostics["os_type"], "windows")
+        self.assertIs(diagnostics["image_present"], False)
+
+    def test_container_diagnostics_without_docker(self) -> None:
+        with mock.patch.object(toolchain.shutil, "which", return_value=None):
+            diagnostics = toolchain.container_diagnostics()
+        self.assertIsNone(diagnostics["cli"])
+        self.assertEqual(diagnostics["daemon"], "not installed")
+        self.assertNotIn("os_type", diagnostics)
+
     def test_install_reprobes_instead_of_trusting_the_exit_code(self) -> None:
         tool = next(item for item in toolchain.TOOLS if item.name == "yosys")
         absent = toolchain.ToolStatus(tool=tool, path=None, installable=True, command=["true"])

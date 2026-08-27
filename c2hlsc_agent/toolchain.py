@@ -416,6 +416,62 @@ def install(statuses: Iterable[ToolStatus], dry_run: bool = False, timeout: int 
     return results
 
 
+#: The image the generated tb/run_klee.py falls back to when KLEE is not native.
+KLEE_IMAGE = "klee/klee:latest"
+
+
+def container_diagnostics(image: str = KLEE_IMAGE) -> dict[str, object]:
+    """Probe the three things the KLEE container route depends on.
+
+    `doctor` reports these because the route has three independent preconditions and a
+    failure in any one of them looks the same from outside: the CLI must exist, a daemon
+    must answer, that daemon must run LINUX containers, and the image must already be
+    local (the route never pulls on its own). Surfacing them separately is what makes a
+    "why did it not use the container" question answerable on a machine that is not this
+    one -- notably Windows, where the daemon may be in Windows-container mode.
+    """
+
+    diagnostics: dict[str, object] = {"image": image}
+    cli = shutil.which("docker")
+    diagnostics["cli"] = cli
+    if cli is None:
+        diagnostics["daemon"] = "not installed"
+        return diagnostics
+
+    try:
+        info = subprocess.run(
+            ["docker", "info", "--format", "{{.OSType}}"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        diagnostics["daemon"] = f"unusable: {exc}"
+        return diagnostics
+
+    diagnostics["daemon"] = "ok" if info.returncode == 0 else "not running"
+    diagnostics["info_returncode"] = info.returncode
+    diagnostics["os_type"] = info.stdout.strip()
+    diagnostics["info_stderr"] = info.stderr.strip()[-400:]
+    if info.returncode != 0:
+        return diagnostics
+
+    try:
+        inspect = subprocess.run(
+            ["docker", "image", "inspect", image],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        diagnostics["image_present"] = f"unusable: {exc}"
+        return diagnostics
+    diagnostics["image_present"] = inspect.returncode == 0
+    diagnostics["inspect_returncode"] = inspect.returncode
+    diagnostics["inspect_stderr"] = inspect.stderr.strip()[-400:]
+    return diagnostics
+
+
 def summary_line(status: ToolStatus) -> str:
     if status.present:
         return f"  ok       {status.tool.name:<12} {status.path}  [{status.source}]"
