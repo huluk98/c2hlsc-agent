@@ -79,6 +79,10 @@ exit
 def render_makefile(config: AgentConfig) -> str:
     flags = " ".join(config.compiler_flags)
     return f"""CXX ?= g++
+# The agent passes its OWN interpreter here (PYTHON=$(python -c 'import sys;print(sys.executable)')).
+# Hardcoding python3 breaks Windows, where the interpreter is usually 'python', and breaks
+# virtualenvs where python3 is not the interpreter the project was generated with.
+PYTHON ?= python3
 CXXFLAGS ?= -std=c++17 -Wall -Wextra -I src {flags}
 TB_EXE ?= c2hlsc_tb
 LEVERI_GOLDEN_EXE ?= leveri_golden_tb
@@ -105,20 +109,20 @@ test: $(TB_EXE)
 leveri-test: $(LEVERI_GOLDEN_EXE) $(LEVERI_HLS_EXE)
 \t./$(LEVERI_GOLDEN_EXE)
 \t./$(LEVERI_HLS_EXE)
-\tpython3 tb/leveri_compare.py leveri_golden_trace.csv leveri_hls_trace.csv
+\t$(PYTHON) tb/leveri_compare.py leveri_golden_trace.csv leveri_hls_trace.csv
 
 gcov-coverage:
-\tpython3 tb/run_gcov.py
+\t$(PYTHON) tb/run_gcov.py
 
 klee-coverage:
-\tpython3 tb/run_klee.py
+\t$(PYTHON) tb/run_klee.py
 
 coverage: gcov-coverage klee-coverage
 
 # Coverage-driven stimulus refinement: measure, find what the schedule never reaches,
 # get inputs that reach it (KLEE), fold them back in as directed cases, measure again.
 refine-coverage:
-\tpython3 -m c2hlsc_agent refine --project .
+\t$(PYTHON) -m c2hlsc_agent refine --project .
 
 # Standalone RTL (Verilog) testbench flow. Produces golden expected vectors from the
 # original C, renders a self-checking testbench, and (post-synthesis) simulates the RTL.
@@ -130,10 +134,10 @@ rtl-vectors: $(RTL_VECTORS_EXE)
 \t./$(RTL_VECTORS_EXE)
 
 rtl-testbench:
-\tpython3 tb/gen_rtl_tb.py --from-contract
+\t$(PYTHON) tb/gen_rtl_tb.py --from-contract
 
 rtl-cosim:
-\tpython3 tb/run_rtl_sim.py
+\t$(PYTHON) tb/run_rtl_sim.py
 
 vitis:
 \tvitis_hls -f run_hls.tcl

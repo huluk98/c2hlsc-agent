@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 from .cosim_verdict import evaluate_cosim_verdict
@@ -74,16 +75,13 @@ def run_trace_consistency(project_dir: Path, verbose: bool = False) -> PhaseResu
     followed by dynamic behavioural consistency on the output columns.
     """
 
-    if shutil.which("python3") is None:
-        # The comparator is a Python script; without an interpreter this is a missing
-        # tool, not a design defect, so word it the way classify_log_family reads.
-        return PhaseResult(
-            "trace_consistency",
-            "fail",
-            summary="python3 not found on PATH; trace tooling unavailable",
-        )
+    # Hand make the interpreter running the agent rather than trusting a python3 on PATH:
+    # on Windows it is usually 'python' (or a Store stub that does nothing), and in a
+    # virtualenv python3 may not be this interpreter at all. Since this rung is required,
+    # getting that wrong would fail every conversion on those machines.
+    command = ["make", "leveri-test", f"PYTHON={sys.executable}"]
     try:
-        result = run_command(["make", "leveri-test"], project_dir, "trace_consistency", timeout=180)
+        result = run_command(command, project_dir, "trace_consistency", timeout=180)
     except FileNotFoundError:
         return PhaseResult("trace_consistency", "fail", summary="make not found")
     except subprocess.TimeoutExpired as exc:

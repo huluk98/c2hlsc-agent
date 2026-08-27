@@ -8,6 +8,7 @@ import os
 import shutil
 import struct
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -474,6 +475,72 @@ class TraceConsistencyRungTests(unittest.TestCase):
             classify_log_family("trace_consistency", "HLS-LeVeri dynamic behaviour check failed"),
             "behavioral_mismatch",
         )
+
+
+class InterpreterPortabilityTests(unittest.TestCase):
+    """The trace rung is required, so it must not assume a python3 on PATH.
+
+    On Windows the interpreter is usually ``python`` (or a Store stub that does nothing),
+    and inside a virtualenv ``python3`` may not be the interpreter the project was
+    generated with. Either would fail the rung, and therefore every conversion, on a
+    machine where nothing is actually wrong.
+    """
+
+    def test_makefile_takes_the_interpreter_as_a_variable(self) -> None:
+        from c2hlsc_agent.hls_project import render_makefile
+
+        makefile = render_makefile(AgentConfig())
+        self.assertIn("PYTHON ?= python3", makefile)
+        for recipe in ("tb/leveri_compare.py", "tb/run_gcov.py", "tb/run_klee.py", "-m c2hlsc_agent refine"):
+            line = next(row for row in makefile.splitlines() if recipe in row)
+            self.assertIn("$(PYTHON)", line, recipe)
+            self.assertNotIn("python3 ", line, recipe)
+
+    def test_the_rung_hands_make_its_own_interpreter(self) -> None:
+        from c2hlsc_agent import hls_runner
+
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            (project / "Makefile").write_text("", encoding="utf-8")
+            with mock.patch.object(hls_runner, "run_command") as runner:
+                runner.return_value = PhaseResult("trace_consistency", "pass")
+                hls_runner.run_trace_consistency(project)
+            command = runner.call_args[0][0]
+            self.assertEqual(command[:2], ["make", "leveri-test"])
+            self.assertEqual(command[2], f"PYTHON={sys.executable}")
+
+    @unittest.skipUnless(HAVE_BUILD, "g++ and make are required")
+    def test_the_rung_passes_with_no_python3_on_path(self) -> None:
+        import sys as _sys
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project, _, _ = _project(
+                root,
+                VECTOR_ADD,
+                "vector_add",
+                {
+                    "a": ArgumentConfig(direction="input", length=4),
+                    "b": ArgumentConfig(direction="input", length=4),
+                    "out": ArgumentConfig(direction="output", length=4),
+                    "n": ArgumentConfig(range=(0, 4)),
+                },
+                num_tests=4,
+            )
+            stripped = root / "bin"
+            stripped.mkdir()
+            for tool in ("make", "g++", "as", "ld", "sh", "rm", "mkdir"):
+                found = shutil.which(tool)
+                if found:
+                    (stripped / tool).symlink_to(found)
+            if shutil.which("make", path=str(stripped)) is None:
+                self.skipTest("could not build a PATH containing make")
+            with mock.patch.dict(os.environ, {"PATH": str(stripped)}):
+                self.assertIsNone(shutil.which("python3"))
+                from c2hlsc_agent.hls_runner import run_trace_consistency
+
+                result = run_trace_consistency(project)
+            self.assertEqual(result.status, "pass", result.stdout + result.stderr + (result.summary or ""))
 
 
 class ToolchainTests(unittest.TestCase):
