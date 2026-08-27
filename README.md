@@ -4,6 +4,9 @@
 It shows where every component and every declared agent sits in the real pipeline, what
 each step generates, which artifacts come from a model versus deterministic code, and how
 the verifier ladder, repair loop, run budgets and QoR loop fit together.
+[`docs/workflow_evaluation.md`](docs/workflow_evaluation.md) is the companion quality
+review: ten evidence-backed findings on the loops and generation paths, a readiness
+matrix, and a pre-run checklist.
 
 ## Ubuntu Server Vitis Quick Triage
 

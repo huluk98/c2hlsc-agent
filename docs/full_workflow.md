@@ -886,6 +886,7 @@ then requires every matrix leg to have succeeded. Helper syntax checks cover
 
 ### Related documents
 
+- [`docs/workflow_evaluation.md`](workflow_evaluation.md) — quality review: findings, readiness matrix, pre-run checklist
 - `AGENTS.md` — the invariants and the team workflow rules, normative
 - `AGENT_SUMMARY.md` — per-function reference (predates several subsystems)
 - `docs/continuous_agent_loop.md` — the outer GitHub coordination loop
