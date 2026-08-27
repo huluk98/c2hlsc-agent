@@ -47,6 +47,12 @@ class AgentConfig:
     llm_cli_cmd: str = "claude"
     llm_candidates: int = 1
     nl_spec: str | None = None
+    use_failure_analyst: bool = True
+    use_repair_memory: bool = True
+    memory_dir: str | None = None
+    propose_contract: bool = False
+    tb_augment: bool = False
+    augmented_vectors: list = field(default_factory=list)
     vitis_ssh_host: str | None = None
     vitis_remote_dir: str = "~/c2hlsc_runs"
     vitis_setup: str | None = None
@@ -278,6 +284,16 @@ def merge_cli_config(config: AgentConfig, args: Any) -> AgentConfig:
         config.llm_cli_cmd = args.llm_cli_cmd
     if getattr(args, "candidates", None) is not None:
         config.llm_candidates = max(1, int(args.candidates))
+    if getattr(args, "no_failure_analyst", False):
+        config.use_failure_analyst = False
+    if getattr(args, "no_repair_memory", False):
+        config.use_repair_memory = False
+    if getattr(args, "memory_dir", None):
+        config.memory_dir = args.memory_dir
+    if getattr(args, "propose_contract", False):
+        config.propose_contract = True
+    if getattr(args, "tb_augment", False):
+        config.tb_augment = True
     spec_inline = getattr(args, "spec", None)
     spec_file = getattr(args, "spec_file", None)
     if spec_file:

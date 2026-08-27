@@ -151,20 +151,97 @@ def active_length_map(analysis: AnalysisResult) -> dict[str, str]:
     return clamped
 
 
+def _is_float_type(c_type: str) -> bool:
+    return "float" in c_type or "double" in c_type
+
+
+def _aug_literal(value: object, c_type: str) -> str:
+    if _is_float_type(c_type):
+        return repr(float(value))  # double table; assignment casts to the storage type
+    return f"{int(value)}LL"
+
+
+def _aug_pass_note(vectors: list[dict]) -> str:
+    return f" ({len(vectors)} llm-directed)" if vectors else ""
+
+
+def _aug_tables(arrays: list[FunctionArg], scalars: list[FunctionArg], vectors: list[dict]) -> str:
+    """Constant tables for the LLM-proposed directed vectors.
+
+    Tables are long long (or double for float types) and every use site casts into the
+    argument's storage type on assignment: brace-initializing the storage type directly
+    would trip C++ narrowing rules for perfectly valid values.
+    """
+
+    if not vectors:
+        return ""
+    lines = [
+        "// LLM-proposed directed vectors, validated against the argument contract",
+        f"// (policy shift_left_stimulus_augment_v1; {len(vectors)} vector(s) appended",
+        "// after the deterministic tests -- same values drive golden and HLS).",
+    ]
+    for arg in arrays:
+        if arg.direction == "output":
+            continue
+        table = "double" if _is_float_type(arg.c_type) else "long long"
+        rows = ",\n  ".join(
+            "{" + ", ".join(_aug_literal(v, arg.c_type) for v in vec[arg.name]) + "}"
+            for vec in vectors
+        )
+        lines.append(
+            f"static const {table} aug_vec_{arg.name}[{len(vectors)}][{arg.length}] = {{\n  {rows}\n}};"
+        )
+    for arg in scalars:
+        table = "double" if _is_float_type(arg.c_type) else "long long"
+        values = ", ".join(_aug_literal(vec[arg.name], arg.c_type) for vec in vectors)
+        lines.append(f"static const {table} aug_scalar_{arg.name}[{len(vectors)}] = {{{values}}};")
+    return "\n".join(lines) + "\n\n"
+
+
 def generate_testbench(analysis: AnalysisResult, config: AgentConfig) -> str:
     fn = analysis.function
     arrays = [arg for arg in fn.args if arg.is_pointer_like]
     scalars = [arg for arg in fn.args if not arg.is_pointer_like]
+    aug_vectors = list(getattr(config, "augmented_vectors", None) or [])
+    num_random = config.num_tests
+    total_tests = num_random + len(aug_vectors)
     contract_comment = _contract_comment(fn.args, fn.return_type, arrays, scalars)
+    if aug_vectors:
+        contract_comment += (
+            f"\n// - plus {len(aug_vectors)} validated LLM-proposed directed vector(s), "
+            "appended after the deterministic tests"
+        )
     declarations: list[str] = []
     initializers: list[str] = []
     for arg in arrays:
         storage_type = _storage_type(arg)
         declarations.append(f"    {storage_type} ref_{arg.name}[{arg.length}] = {{}};")
         declarations.append(f"    {storage_type} hls_{arg.name}[{arg.length}] = {{}};")
-        initializers.append("    " + _init_array(arg).replace("\n", "\n    "))
+        init = _init_array(arg)
+        if aug_vectors and arg.direction != "output":
+            # Outputs keep the sentinel fill for EVERY test, augmented ones included,
+            # so a missed write stays visible. Inputs branch: the first num_random
+            # iterations are bit-identical to an unaugmented run (the seeded RNG is
+            # only consumed on that side of the branch), then the constant tables.
+            indented = init.replace("\n", "\n  ")
+            init = f"""if (test_idx < {num_random}) {{
+      {indented}
+    }} else {{
+      for (int i = 0; i < {arg.length}; ++i) {{
+        auto v = static_cast<{storage_type}>(aug_vec_{arg.name}[test_idx - {num_random}][i]);
+        ref_{arg.name}[i] = v;
+        hls_{arg.name}[i] = v;
+      }}
+    }}"""
+        initializers.append("    " + init.replace("\n", "\n    "))
     for arg in scalars:
-        declarations.append(f"    {arg.c_type} {arg.name} = {_scalar_decl(arg)};")
+        if aug_vectors:
+            declarations.append(
+                f"    {arg.c_type} {arg.name} = (test_idx < {num_random}) ? ({_scalar_decl(arg)}) "
+                f": static_cast<{arg.c_type}>(aug_scalar_{arg.name}[test_idx - {num_random}]);"
+            )
+        else:
+            declarations.append(f"    {arg.c_type} {arg.name} = {_scalar_decl(arg)};")
 
     return_compare = ""
     return_capture_ref = ""
@@ -292,9 +369,9 @@ int clamp_count(long long value, int limit) {{
   return static_cast<int>(value);
 }}
 
-int main() {{
+{_aug_tables(arrays, scalars, aug_vectors)}int main() {{
   std::mt19937_64 rng({config.seed}ULL);
-  for (int test_idx = 0; test_idx < {config.num_tests}; ++test_idx) {{
+  for (int test_idx = 0; test_idx < {total_tests}; ++test_idx) {{
 {chr(10).join(declarations)}
 {chr(10).join(initializers)}
 {chr(10).join(compare_declarations)}
@@ -304,7 +381,7 @@ int main() {{
 {return_compare}
 {chr(10).join(comparisons)}
   }}
-  std::cout << "c2hlsc_agent: all {config.num_tests} tests passed, seed={config.seed}\\n";
+  std::cout << "c2hlsc_agent: all {total_tests} tests passed{_aug_pass_note(aug_vectors)}, seed={config.seed}\\n";
   return 0;
 }}
 """

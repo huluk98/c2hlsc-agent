@@ -504,7 +504,8 @@ class RepairUpgradeTests(unittest.TestCase):
 
     def test_llm_repair_feeds_history_and_rejects_oscillation(self):
         with tempfile.TemporaryDirectory() as tmp:
-            config = AgentConfig(use_llm=True)
+            # analyst off: this test inspects the repair prompt itself
+            config = AgentConfig(use_llm=True, use_failure_analyst=False)
             analysis, out_dir = self._seeded_project(Path(tmp), config)
             original = (out_dir / "src" / "hls_top.cpp").read_text(encoding="utf-8")
             state = self._failing_state()
@@ -528,7 +529,9 @@ class RepairUpgradeTests(unittest.TestCase):
 
     def test_repair_prompt_includes_nl_spec(self):
         with tempfile.TemporaryDirectory() as tmp:
-            config = AgentConfig(use_llm=True, nl_spec="keep latency under 100 cycles")
+            config = AgentConfig(
+                use_llm=True, nl_spec="keep latency under 100 cycles", use_failure_analyst=False
+            )
             analysis, out_dir = self._seeded_project(Path(tmp), config)
             llm = SeqLLM([f"```cpp\n{CANDIDATE_B}```"])
             repair_project(out_dir, analysis, config, self._failing_state(), 1, llm=llm)

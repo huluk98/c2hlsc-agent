@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import sys
 from dataclasses import dataclass
 
 from .equivalence import VerificationState
@@ -299,3 +300,95 @@ def leveri_testbench_policy() -> dict[str, object]:
     """Return the HLS-LeVeri-inspired prompt contract for the testbench side."""
 
     return get_leveri_testbench_contract().to_dict()
+
+
+# Every family the regex triage can emit, plus the composed ones classify_failure builds.
+# The LLM analyst may only pick from this vocabulary: an invented family would detach the
+# report from the routing table, so an out-of-vocabulary answer is discarded wholesale.
+FAILURE_FAMILIES: tuple[str, ...] = (
+    "toolchain_unavailable",
+    "timeout_or_deadlock",
+    "behavioral_mismatch",
+    "host_behavior_mismatch",
+    "rtl_cosim_mismatch",
+    "interface_contract",
+    "memory_pointer",
+    "numeric_bitwidth",
+    "loop_scheduling",
+    "non_synthesizable_construct",
+    "testbench_or_c_semantics",
+    "synthesis_failure",
+    "cosim_failure",
+    "unknown",
+)
+
+AGENT_NAMES: tuple[str, ...] = tuple(p.name for p in multi_agent_procedures())
+
+
+def _clean_text(value: object, limit: int) -> str:
+    if not isinstance(value, str):
+        return ""
+    return " ".join(value.split())[:limit]
+
+
+def refine_failure_analysis(
+    decision: FailureAnalysis,
+    state: VerificationState,
+    phase: str | None,
+    llm: object,
+) -> FailureAnalysis | None:
+    """failure_analyst, live: an LLM-sharpened :class:`FailureAnalysis`, or ``None``.
+
+    Zero-risk by construction, in three ways. The output shape is the same dataclass the
+    regex triage produces, so nothing downstream can tell the difference. ``status`` is
+    never model-writable: ``blocked`` and ``pass`` short-circuit before this is called,
+    and the refined result is pinned to ``needs_action`` -- a model can therefore never
+    talk the loop out of a blocked verdict (which is what stops it mutating correct
+    source over a missing toolchain). And any invalid, unparsable, or out-of-vocabulary
+    answer returns ``None``, leaving the regex decision in force.
+    """
+
+    if phase is None or decision.status != "needs_action":
+        return None
+    from .llm import build_failure_analyst_prompt, extract_json_payload
+
+    statuses = {name: result.status for name, result in state.phases.items()}
+    mismatches = [str(item.to_dict()) for item in state.mismatches]
+    system, user = build_failure_analyst_prompt(
+        decision,
+        phase,
+        statuses,
+        _phase_text(state, phase),
+        mismatches,
+        FAILURE_FAMILIES,
+        AGENT_NAMES,
+    )
+    try:
+        payload = extract_json_payload(llm.complete(system, user))
+    except Exception as exc:  # noqa: BLE001 -- optional refinement, never fatal
+        print(
+            f"c2hlsc failure_analyst: refinement call failed ({type(exc).__name__}: {exc}); "
+            "keeping the regex classification.",
+            file=sys.stderr,
+        )
+        return None
+    if not isinstance(payload, dict):
+        return None
+    family = payload.get("family")
+    owner = payload.get("owner_agent")
+    next_action = _clean_text(payload.get("next_action"), 400)
+    if family not in FAILURE_FAMILIES or owner not in AGENT_NAMES or not next_action:
+        return None
+    evidence = tuple(
+        cleaned
+        for item in (payload.get("evidence_needed") or [])
+        if (cleaned := _clean_text(item, 120))
+    )[:8]
+    return FailureAnalysis(
+        family=family,
+        owner_agent=owner,
+        next_action=next_action,
+        evidence_needed=evidence or decision.evidence_needed,
+        repair_scope=_clean_text(payload.get("repair_scope"), 200) or decision.repair_scope,
+        status="needs_action",
+    )

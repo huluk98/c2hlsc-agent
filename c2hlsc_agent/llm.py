@@ -431,6 +431,33 @@ try a genuinely different fix:
 """
 
 
+def _repair_cards_section(cards: list[dict] | None) -> str:
+    """Audited repair-success cards from OTHER verified runs, as prompt context.
+
+    Only cards promoted by audit_memory reach this -- each one was accepted into memory
+    strictly after the full requested verifier ladder passed on the run that produced
+    it, so nothing unaudited can steer the model."""
+
+    if not cards:
+        return ""
+    lines: list[str] = []
+    for card in cards[:2]:
+        family = card.get("family", "?")
+        stage = card.get("stage", "?")
+        summary = str(card.get("summary", ""))[:200]
+        diff = str(card.get("diff_excerpt", "")).strip()[:600]
+        lines.append(f"- [{family} @ {stage}] {summary}")
+        if diff:
+            lines.append(f"```\n{diff}\n```")
+    body = "\n".join(lines)
+    return f"""
+Audited repairs that fixed similar failures in previously VERIFIED runs (each was
+promoted to memory only after the full verifier passed; adapt the idea, do not copy
+blindly -- this design differs):
+{body}
+"""
+
+
 def build_repair_prompt(
     analysis: AnalysisResult,
     decision: object,
@@ -440,6 +467,7 @@ def build_repair_prompt(
     current_text: str,
     history: list[object] | None = None,
     nl_spec: str | None = None,
+    repair_cards: list[dict] | None = None,
 ) -> tuple[str, str]:
     fn = analysis.function
     # Tail slice: Vitis logs put the failure at the end, after the tool banner.
@@ -449,7 +477,7 @@ Failure family: {getattr(decision, 'family', 'unknown')}
 Repair intent: {getattr(decision, 'next_action', '')}
 Repair scope: {getattr(decision, 'repair_scope', '')}
 Must-preserve top-function signature: `{fn.signature}`
-{_nl_spec_section(nl_spec)}{_history_section(history)}
+{_nl_spec_section(nl_spec)}{_history_section(history)}{_repair_cards_section(repair_cards)}
 Earliest-failure evidence (tail of the log):
 ```
 {excerpt}
@@ -462,6 +490,139 @@ Current `{target_rel}` to repair:
 
 Return the full corrected `{target_rel}` in one ```cpp block. Change as little as possible."""
     return REPAIR_SYSTEM_PROMPT, user
+
+
+FAILURE_ANALYST_SYSTEM_PROMPT = """You are failure_analyst in an equivalence-first C-to-HLS-C verifier loop.
+
+You receive the earliest failing verification stage, its evidence, and a preliminary
+regex-based classification. Sharpen it: name the failure family, the concrete next
+action, the minimal evidence the repair needs, and how wide the repair may reach.
+
+Rules:
+- You classify and localize. You NEVER propose code.
+- The original C is the behavioral reference. A mismatch means the generated HLS-C is
+  wrong; the oracle and the testbench are never the thing to change.
+- For a CoSim mismatch, follow PMLC: normalize the mismatch, slice backward from the
+  failed outputs, name the suspect variables and the first failing test.
+- Respond with ONLY one JSON object, exactly these keys:
+  {"family": <one of the allowed families>,
+   "owner_agent": <one of the allowed agents>,
+   "next_action": <string, one concrete step>,
+   "evidence_needed": [<short strings>],
+   "repair_scope": <string, the boundary of what may be edited>}
+"""
+
+
+def build_failure_analyst_prompt(
+    decision: object,
+    phase: str,
+    phase_statuses: dict[str, str],
+    evidence: str,
+    mismatches: list[object],
+    allowed_families: tuple[str, ...],
+    allowed_agents: tuple[str, ...],
+) -> tuple[str, str]:
+    excerpt = (evidence or "").strip()[-_EVIDENCE_LIMIT:] or "(no captured evidence)"
+    mismatch_lines = "\n".join(f"- {item}" for item in mismatches[:5]) or "- (none parsed)"
+    statuses = "\n".join(f"- {name}: {status}" for name, status in phase_statuses.items())
+    user = f"""Earliest failing stage: {phase}
+Phase statuses:
+{statuses}
+
+Preliminary regex classification (refine or confirm it):
+- family: {getattr(decision, 'family', 'unknown')}
+- owner_agent: {getattr(decision, 'owner_agent', 'unknown')}
+- next_action: {getattr(decision, 'next_action', '')}
+- repair_scope: {getattr(decision, 'repair_scope', '')}
+
+Parsed mismatches:
+{mismatch_lines}
+
+Allowed families: {', '.join(allowed_families)}
+Allowed owner agents: {', '.join(allowed_agents)}
+
+Evidence (tail of the failing stage's log):
+```
+{excerpt}
+```
+
+Return the JSON object only."""
+    return FAILURE_ANALYST_SYSTEM_PROMPT, user
+
+
+CONTRACT_PLANNER_SYSTEM_PROMPT = """You are contract_planner in an equivalence-first C-to-HLS-C flow.
+
+The static analyzer inferred an argument contract for the top function by regex; some of
+it was conservatively DEFAULTED rather than derived. Propose refinements a human can
+apply to the config. Proposals are recorded, never applied automatically.
+
+Rules:
+- Only propose values the C source actually justifies; cite the reason from the code.
+- direction is one of input|output|inout. length is the element count the code truly
+  touches. range is [lo, hi] for a scalar's legal domain.
+- Respond with ONLY a JSON array of objects:
+  [{"argument": <name>, "direction": <opt>, "length": <opt int>,
+    "range": <opt [lo, hi]>, "rationale": <string>}]
+"""
+
+
+def build_contract_planner_prompt(analysis: AnalysisResult, original_source: str) -> tuple[str, str]:
+    fn = analysis.function
+    defaulted = [
+        d.message
+        for d in analysis.diagnostics.items
+        if d.code == "missing-pointer-bound"
+    ]
+    defaulted_text = "\n".join(f"- {line}" for line in defaulted) or "- (none; everything was derived or configured)"
+    user = f"""Top function: `{fn.name}`  (signature: `{fn.signature}`)
+
+Current inferred contract:
+{_argument_lines(analysis)}
+
+Conservatively DEFAULTED items (highest value to refine):
+{defaulted_text}
+
+Original C source:
+```c
+{original_source}
+```
+
+Return the JSON array only."""
+    return CONTRACT_PLANNER_SYSTEM_PROMPT, user
+
+
+STIMULUS_AUGMENT_SYSTEM_PROMPT = """You are shift_left_testbench_agent in an equivalence-first C-to-HLS-C flow.
+
+A deterministic testbench already drives directed patterns and seeded random stimulus.
+Propose a few EXTRA directed input vectors that target the code's interesting behavior:
+branch boundaries, wrap-around, off-by-one on loop bounds, values that maximize
+intermediate magnitudes. The same vector is driven into the golden C and the generated
+HLS-C, so a vector can only ever EXPOSE a difference, never mask one.
+
+Rules:
+- Values must respect the declared contract exactly: arrays carry exactly their declared
+  element count; scalars stay inside their declared range.
+- Numbers only (integers for integer types). No expressions, no strings.
+- Respond with ONLY a JSON array of vectors, each vector an object mapping EVERY input
+  argument name to a value (arrays to a list of numbers):
+  [{"a": [1, 2, ...], "n": 3}, ...]
+"""
+
+
+def build_stimulus_prompt(analysis: AnalysisResult, original_source: str, max_vectors: int) -> tuple[str, str]:
+    fn = analysis.function
+    user = f"""Top function: `{fn.name}`  (signature: `{fn.signature}`)
+
+Argument contract (values MUST fit it):
+{_argument_lines(analysis)}
+
+Original C source (find its edge cases):
+```c
+{original_source}
+```
+
+Propose at most {max_vectors} vectors. Return the JSON array only."""
+    return STIMULUS_AUGMENT_SYSTEM_PROMPT, user
 
 
 QOR_OPTIMIZER_SYSTEM_PROMPT = """You are rtl_optimizer_agent in an equivalence-first C-to-HLS flow.
@@ -588,6 +749,29 @@ def extract_reference_c(text: str, top_name: str) -> str | None:
 
 # Fence-length aware: an N-backtick fence is closed only by the same N backticks, so a
 # 4-backtick block wrapping inline triple-backtick examples is not truncated mid-body.
+def extract_json_payload(text: str) -> object | None:
+    """First parseable JSON object or array in a model response, or ``None``.
+
+    Shared by every agent whose contract is structured data rather than code
+    (failure_analyst, contract_planner, the stimulus augmenter). Fenced blocks are
+    tried first, then the raw text; anything that does not parse is simply not a
+    payload -- the callers all have a deterministic fallback."""
+
+    candidates = [block for _lang, block in extract_code_blocks(text)]
+    candidates.append(text or "")
+    decoder = json.JSONDecoder()
+    for chunk in candidates:
+        for idx, char in enumerate(chunk):
+            if char not in "[{":
+                continue
+            try:
+                value, _end = decoder.raw_decode(chunk[idx:])
+            except ValueError:
+                continue
+            return value
+    return None
+
+
 _FENCE = re.compile(r"(`{3,})[ \t]*([A-Za-z0-9_+\-]*)[ \t]*\r?\n(.*?)\r?\n?\1", re.S)
 _CODE_LANGS = {"", "c", "cc", "cpp", "c++", "cxx", "h", "hpp", "hxx"}
 

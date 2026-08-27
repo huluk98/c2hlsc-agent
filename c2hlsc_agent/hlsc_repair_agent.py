@@ -8,7 +8,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from .agent_loop import classify_failure
+from .agent_loop import classify_failure, refine_failure_analysis
 from .analyze import AnalysisResult
 from .config import AgentConfig
 from .equivalence import VerificationState
@@ -114,6 +114,14 @@ def clear_repair_audit(project_dir: Path) -> None:
         audit_path.unlink()
 
 
+def _analyst_budget_allows(llm: object) -> bool:
+    """Skip the optional failure_analyst call when it would eat the repair's last
+    model-call. A raw (unbudgeted) client has no counter and always allows it."""
+
+    remaining = getattr(llm, "remaining_llm_calls", None)
+    return remaining is None or int(remaining) >= 2
+
+
 def repair_project(
     project_dir: Path,
     analysis: AnalysisResult,
@@ -143,6 +151,12 @@ def repair_project(
             status = "applied"
             summary = f"Applied {len(changes)} auditable mechanical repair(s); rerun verification from software equivalence."
         elif llm is not None and getattr(config, "use_llm", False):
+            analyst_refined = False
+            if getattr(config, "use_failure_analyst", True) and _analyst_budget_allows(llm):
+                refined = refine_failure_analysis(decision, state, phase, llm)
+                if refined is not None:
+                    decision = refined
+                    analyst_refined = True
             llm_changes, oscillated = _llm_repair(
                 project_dir, analysis, decision, phase, evidence, llm, config=config, history=history
             )
@@ -153,6 +167,8 @@ def repair_project(
                     f"Applied LLM repair to {', '.join(c.path for c in llm_changes)}; "
                     "rerun verification from software equivalence."
                 )
+                if analyst_refined:
+                    summary += " Failure analysis was refined by failure_analyst (LLM)."
             elif oscillated:
                 status = "oscillation_rejected"
                 summary = (
@@ -223,6 +239,12 @@ def _llm_repair(
     top = analysis.function.name
     history = history or []
 
+    from .audit_memory import relevant_cards
+
+    try:
+        cards = relevant_cards(config, getattr(decision, "family", "unknown"), phase)
+    except OSError:
+        cards = []  # unreadable memory store is a degraded prompt, never a failed repair
     system, user = build_repair_prompt(
         analysis,
         decision,
@@ -232,6 +254,7 @@ def _llm_repair(
         current,
         history=history,
         nl_spec=getattr(config, "nl_spec", None) if config is not None else None,
+        repair_cards=cards,
     )
     try:
         response = llm.complete(system, user)

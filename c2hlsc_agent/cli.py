@@ -7,8 +7,10 @@ from pathlib import Path
 
 from .agent_loop import classify_failure
 from .analyze import analyze_source
+from .audit_memory import promote_repair_cards
 from .candidates import select_best_candidate
 from .config import AgentConfig, load_config, merge_cli_config
+from .contract_planner import propose_contract, write_proposals
 from .convert import ReferenceGenerationError, generate_hls_sources, generate_reference_c
 from .equivalence import VerificationState
 from .hlsc_repair_agent import clear_repair_audit, repair_project
@@ -17,6 +19,7 @@ from .hls_runner import verify_project
 from .llm import build_llm_client, missing_llm_reason
 from .remote import RemoteVitis
 from .report import final_status, write_reports
+from .stimulus_augment import propose_augmented_vectors, write_provenance
 from .run_control import (
     RUN_LEDGER_FILENAME,
     BudgetedLLMClient,
@@ -60,6 +63,29 @@ def _add_llm_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--llm-cli-cmd",
         help="command for --llm-backend claude-cli, default 'claude'; may be multi-word",
+    )
+
+
+def _add_agent_arguments(parser: argparse.ArgumentParser) -> None:
+    agents = parser.add_argument_group(
+        "live agents",
+        "optional model-backed agents; each is verifier-gated and falls back to the "
+        "deterministic behaviour on any invalid output",
+    )
+    agents.add_argument(
+        "--no-failure-analyst",
+        action="store_true",
+        help="disable the failure_analyst LLM refinement of the repair classification",
+    )
+    agents.add_argument(
+        "--no-repair-memory",
+        action="store_true",
+        help="disable audit_memory promotion/retrieval of audited repair cards",
+    )
+    agents.add_argument(
+        "--memory-dir",
+        help="directory holding the audited repair-card memory "
+        "(default ~/.c2hlsc, or C2HLSC_MEMORY_DIR)",
     )
 
 
@@ -142,6 +168,19 @@ def build_parser() -> argparse.ArgumentParser:
     convert.add_argument("--rtl", default="verilog", help="RTL language for cosim, default verilog")
     _add_llm_arguments(convert)
     _add_run_control_arguments(convert)
+    convert.add_argument(
+        "--propose-contract",
+        action="store_true",
+        help="contract_planner: ask the model to propose argument directions/bounds/ranges; "
+        "written to contract_proposals.json, NEVER applied automatically",
+    )
+    convert.add_argument(
+        "--tb-augment",
+        action="store_true",
+        help="shift_left_testbench_agent: ask the model for extra directed stimulus vectors; "
+        "validated against the contract and appended after the deterministic tests",
+    )
+    _add_agent_arguments(convert)
     convert.add_argument("--seed", type=int, help="random seed")
     convert.add_argument("--max-iterations", type=int, help="max verification iterations (default 1); repaired reruns require --auto-repair")
     convert.add_argument("--auto-repair", action="store_true", help="apply mechanical and LLM repairs automatically between verification attempts")
@@ -157,6 +196,7 @@ def build_parser() -> argparse.ArgumentParser:
     repair.add_argument("--config", help="YAML/JSON config file used for the original conversion")
     repair.add_argument("--iteration", type=int, default=1, help="repair iteration number recorded in the audit")
     _add_llm_arguments(repair)
+    _add_agent_arguments(repair)
     optimize = sub.add_parser(
         "optimize",
         help="post-equivalence QoR (PPA) optimization of a verified project (rtl_optimizer_agent)",
@@ -307,9 +347,19 @@ def run_convert(args: argparse.Namespace) -> int:
         config.use_llm = True  # NL-only generation is inherently LLM-driven
     # --spec (design intent) and --candidates (best-of-N) are only honoured on the LLM
     # path; auto-enable it so they are not silently ignored, unless --no-llm is explicit.
-    elif (config.nl_spec or config.llm_candidates > 1) and not config.use_llm:
+    elif (
+        config.nl_spec or config.llm_candidates > 1 or config.propose_contract or config.tb_augment
+    ) and not config.use_llm:
         if getattr(args, "no_llm", False):
-            which = "--spec" if config.nl_spec else "--candidates"
+            which = (
+                "--spec"
+                if config.nl_spec
+                else "--candidates"
+                if config.llm_candidates > 1
+                else "--propose-contract"
+                if config.propose_contract
+                else "--tb-augment"
+            )
             print(f"{which} has no effect with --no-llm; using the deterministic generator.", file=sys.stderr)
         else:
             config.use_llm = True
@@ -388,6 +438,26 @@ def run_convert(args: argparse.Namespace) -> int:
                 "fixed-size arrays, or pass --config with arguments.<name>.length for a sound equivalence check.",
                 file=sys.stderr,
             )
+    aug_provenance: tuple[list, list] | None = None
+    if llm is not None and config.use_llm and config.tb_augment:
+        try:
+            vectors, rejections = propose_augmented_vectors(analysis, llm)
+        except RunBudgetExceeded as exc:
+            _permit_optional_llm_fallback(controller, exc, 'stimulus augmentation')
+            print(
+                f'LLM budget exhausted before stimulus augmentation ({exc}); '
+                'keeping the deterministic testbench.',
+                file=sys.stderr,
+            )
+            vectors, rejections = [], [f'budget: {exc}']
+        config.augmented_vectors = vectors
+        aug_provenance = (vectors, rejections)
+        if args.verbose:
+            print(
+                f"shift_left_testbench_agent: {len(vectors)} directed vector(s) accepted, "
+                f"{len(rejections)} rejected."
+            )
+
     generated = None
     if llm is not None and config.use_llm and config.llm_candidates > 1:
         try:
@@ -433,6 +503,29 @@ def run_convert(args: argparse.Namespace) -> int:
             generated = generate_hls_sources(analysis, config, llm=None)
     project = write_project(out_dir, analysis, generated, config)
     clear_repair_audit(out_dir)
+    if aug_provenance is not None:
+        vectors, rejections = aug_provenance
+        write_provenance(out_dir, vectors, rejections, getattr(llm, "model", None))
+        generated.transformations.append(
+            f"shift_left_testbench_agent appended {len(vectors)} validated directed "
+            f"vector(s) after the {config.num_tests} deterministic tests "
+            f"({len(rejections)} rejected); see tb/augmented_vectors.json."
+        )
+    if llm is not None and config.use_llm and config.propose_contract:
+        try:
+            proposals, proposal_error = propose_contract(analysis, llm)
+        except RunBudgetExceeded as exc:
+            _permit_optional_llm_fallback(controller, exc, 'contract proposals')
+            proposals, proposal_error = [], f'budget: {exc}'
+        proposals_path = write_proposals(
+            out_dir, proposals, getattr(llm, "model", None), proposal_error
+        )
+        generated.transformations.append(
+            f"contract_planner proposed {len(proposals)} contract refinement(s); "
+            f"see {proposals_path.name} (advisory, not applied)."
+        )
+        if args.verbose:
+            print(f"contract_planner: {len(proposals)} proposal(s) -> {proposals_path}")
     repair_history = []
 
     if analysis.diagnostics.has_errors and not config.keep_going:
@@ -486,6 +579,17 @@ def run_convert(args: argparse.Namespace) -> int:
                 RunStatus.PASSED,
                 'all required verification phases passed',
             )
+            if llm is not None and config.use_llm:
+                promoted = promote_repair_cards(
+                    out_dir,
+                    config,
+                    repair_history,
+                    top=config.top or '',
+                    verified=True,
+                    model=getattr(llm, 'model', None),
+                )
+                if promoted and args.verbose:
+                    print(f'audit_memory: promoted {promoted} audited repair card(s).')
             break
         failure = failure_fingerprint(state)
         repeat_count = controller.record_verification(

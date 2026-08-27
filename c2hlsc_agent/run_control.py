@@ -408,6 +408,15 @@ class BudgetedLLMClient:
         self._purpose = purpose
         self.model = delegate.model
 
+    @property
+    def remaining_llm_calls(self) -> int:
+        """Unspent model-call budget. The failure_analyst refinement checks this and
+        stands down when fewer than two calls remain, so an optional classification
+        never eats the final call the repair itself needs."""
+
+        record = self._controller.record
+        return max(0, record.budget.max_llm_calls - record.usage.llm_calls)
+
     def complete(
         self,
         system: str,

@@ -166,7 +166,8 @@ class LlmRepairTests(unittest.TestCase):
     def test_llm_repair_patches_generated_hls_when_mechanical_fails(self):
         with tempfile.TemporaryDirectory() as raw:
             tmp = Path(raw)
-            config = AgentConfig(use_llm=True, run_vitis=True)
+            # analyst off: this test pins the REPAIR call count and prompt specifically
+            config = AgentConfig(use_llm=True, run_vitis=True, use_failure_analyst=False)
             analysis, out = self._project(tmp, config)
             fake = FakeLLM(REPAIR_RESPONSE)
             outcome = repair_project(out, analysis, config, _csynth_failure_state(), 1, llm=fake)
