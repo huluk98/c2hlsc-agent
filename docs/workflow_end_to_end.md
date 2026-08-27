@@ -320,8 +320,8 @@ requested). **A skipped or unrequested phase is never promoted to `pass`.**
 
 | Phase | Command | Timeout | What it proves |
 | --- | --- | --- | --- |
-| `software_equivalence` | `make test` | 120 s | Original C and generated HLS-C agree on the generated stimuli, on the host |
-| `trace_consistency` | `make leveri-test` | 180 s | The paired golden/HLS harnesses are structurally aligned (schema, stimulus, CFG, def-use) **and** their output traces agree — the shift-left dual tier |
+| `software_equivalence` | `tb/host_build.py test` | 120 s | Original C and generated HLS-C agree on the generated stimuli, on the host |
+| `trace_consistency` | `tb/host_build.py leveri-test` | 180 s | The paired golden/HLS harnesses are structurally aligned (schema, stimulus, CFG, def-use) **and** their output traces agree — the shift-left dual tier |
 | `csim` | `vitis_hls -f run_csim.tcl` | 600 s | The same comparison inside Vitis' own C simulation |
 | `csynth` | `vitis_hls -f run_csynth.tcl` | 1200 s | The design synthesizes; produces the QoR report |
 | `cosim` | `vitis_hls -f run_cosim.tcl` | 600 s | Generated HLS-C and the generated RTL agree |
@@ -661,6 +661,31 @@ make rtl-cosim        # simulate the RTL against those vectors
 The RTL tier is **not** Vitis CoSim. It exercises synthesized RTL under its own declared
 interface contract, and its results must be reported as such.
 
+### Running on native Windows
+
+`make` is not a Windows tool, and both host rungs are required on every verification — so
+`make` is not on the critical path at all. Every recipe lives in the generated
+**`tb/host_build.py`**, which the agent invokes with its own `sys.executable`; the Makefile
+is a thin alias over the same file, so `make test` still does what everyone expects and
+there is still exactly one definition of each recipe.
+
+What a native Windows box actually needs:
+
+| Need | Answer |
+| --- | --- |
+| Compiler | A GCC/Clang-style driver: `winget install LLVM.LLVM`, or MSYS2 `mingw-w64-gcc`. **MSVC (`cl.exe`) is detected and reported, never silently used** — its flag syntax (`/std:c++17`, `/Fe`) is incompatible, and mistranslating flags would fail confusingly |
+| Python | Any 3.10+; the agent passes its own interpreter through, so `python` vs `python3` never matters |
+| make | **Not needed.** `doctor` marks it optional and will not fail a machine without it |
+| A POSIX shell | **Not needed.** `run_all.py` is the shell-free sibling of `run_all.sh` |
+
+Other Windows-specific behaviour: executables get a `.exe` suffix, a timed-out command is
+killed with `taskkill /T` (there are no POSIX process groups, so without it a hung compiler
+or simulator leaves orphaned children holding output files open), and `doctor` uses
+`winget`, with every package id verified by `winget show` before it is offered.
+
+Verified by running a full conversion with `make`, `bash` and `sh` all absent from `PATH`:
+both host rungs pass and the run exits 0.
+
 ### When a tool is missing
 
 ```text
@@ -755,7 +780,8 @@ without a fresh report and a named tool, version, part, and clock.
 | `input.c` | `shift_left_testbench_agent` (copy) | every testbench; never modified |
 | `src/hls_top.{hpp,cpp}` | generator, then repair, then optimizer | ladder, candidates |
 | `tb/*` | `shift_left_testbench_agent` | ladder + the optional tiers |
-| `run_{hls,csim,csynth,cosim}.tcl`, `Makefile`, `run_all.sh` | `shift_left_testbench_agent` | `cosim_operator` |
+| `tb/host_build.py` | `shift_left_testbench_agent` | the agent, and every Makefile recipe |
+| `run_{hls,csim,csynth,cosim}.tcl`, `Makefile`, `run_all.sh`, `run_all.py` | `shift_left_testbench_agent` | `cosim_operator` |
 | `software_equivalence.log`, `trace_consistency.log`, `csim.log`, `csynth.log`, `cosim.log` | `cosim_operator` | `failure_analyst`, repair evidence |
 | `leveri_golden_trace.csv`, `leveri_hls_trace.csv` | the paired trace testbenches | `tb/leveri_compare.py` (dual tier) |
 | `coverage/gcov_report.json`, `coverage/klee_report.json` | the coverage targets | `refine`, the conversion report |

@@ -900,15 +900,20 @@ For each conversion, the output directory contains:
 ## Verification Order
 
 1. Static analysis
-2. Host software equivalence with `g++` (`make test`)
-3. Trace consistency — the HLS-LeVeri dual tier (`make leveri-test`)
+2. Host software equivalence with `g++` (`tb/host_build.py test`)
+3. Trace consistency — the HLS-LeVeri dual tier (`tb/host_build.py leveri-test`)
 4. Vitis HLS `csim_design`
 5. Vitis HLS `csynth_design`
 6. Vitis HLS `cosim_design`
 
 Steps 2 and 3 are the host tier and always run. When `--no-run-vitis` is used, the Vitis
-phases are marked `skipped`; host equivalence and trace consistency still run when `g++`,
-`make` and `python3` are available.
+phases are marked `skipped`; host equivalence and trace consistency still run given a
+GCC/Clang-style compiler and Python.
+
+**`make` is not required.** Every recipe lives in the generated `tb/host_build.py`, which
+the agent runs with its own interpreter; the Makefile is a thin alias over the same file.
+That is what makes native Windows work — no MSYS, no Cygwin, no WSL. See
+[`docs/workflow_end_to_end.md`](docs/workflow_end_to_end.md) for the Windows specifics.
 
 Step 3 is what makes the shift-left tier a gate rather than an advisory report. Its static
 half compares the two paired *harnesses* (trace schema, stimulus columns, control-flow

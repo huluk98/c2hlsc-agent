@@ -1006,7 +1006,9 @@ def run_doctor(args: argparse.Namespace) -> int:
             )
         # Missing OPTIONAL tools are not an error for the core flow; only a missing core
         # tool means the agent cannot verify anything on this machine.
-        core_missing = [status for status in absent if status.tool.tier == "core"]
+        core_missing = [
+            status for status in absent if status.tool.tier == "core" and not status.tool.optional
+        ]
         return 1 if core_missing else 0
     print("\nEvery checked tool is present.")
     return 0

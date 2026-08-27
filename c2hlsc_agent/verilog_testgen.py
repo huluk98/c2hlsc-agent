@@ -812,6 +812,7 @@ import re
 import signal
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -944,7 +945,7 @@ def ensure_vectors(spec: dict, logs: list) -> bool:
 
 def generate_sv(spec: dict, rtl_dir: Path | None, logs: list) -> Path:
     top = spec["top"]
-    gen = ["python3", "tb/gen_rtl_tb.py"]
+    gen = [sys.executable, "tb/gen_rtl_tb.py"]
     if rtl_dir is not None:
         top_v = None
         module_re = re.compile(r"\bmodule\s+" + re.escape(top) + r"\b")

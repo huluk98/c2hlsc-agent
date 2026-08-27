@@ -54,11 +54,22 @@ def _timeout_result(project_dir: Path, phase: str, exc: subprocess.TimeoutExpire
     )
 
 
+def host_target(target: str) -> list[str]:
+    """Command for one host-tier target.
+
+    The generated project's recipes live in tb/host_build.py, and the agent runs it with
+    its own interpreter. make is a convenience alias over the same file, not a dependency:
+    it is not a native Windows tool, and both host rungs are required on every run.
+    """
+
+    return [sys.executable, str(Path("tb") / "host_build.py"), target]
+
+
 def run_software_equivalence(project_dir: Path, verbose: bool = False) -> PhaseResult:
     try:
-        result = run_command(["make", "test"], project_dir, "software_equivalence", timeout=120)
+        result = run_command(host_target("test"), project_dir, "software_equivalence", timeout=120)
     except FileNotFoundError:
-        return PhaseResult("software_equivalence", "fail", summary="make not found")
+        return PhaseResult("software_equivalence", "fail", summary="tb/host_build.py not found")
     except subprocess.TimeoutExpired as exc:
         return _timeout_result(project_dir, "software_equivalence", exc, "host equivalence")
     if verbose and result.stdout:
@@ -75,15 +86,10 @@ def run_trace_consistency(project_dir: Path, verbose: bool = False) -> PhaseResu
     followed by dynamic behavioural consistency on the output columns.
     """
 
-    # Hand make the interpreter running the agent rather than trusting a python3 on PATH:
-    # on Windows it is usually 'python' (or a Store stub that does nothing), and in a
-    # virtualenv python3 may not be this interpreter at all. Since this rung is required,
-    # getting that wrong would fail every conversion on those machines.
-    command = ["make", "leveri-test", f"PYTHON={sys.executable}"]
     try:
-        result = run_command(command, project_dir, "trace_consistency", timeout=180)
+        result = run_command(host_target("leveri-test"), project_dir, "trace_consistency", timeout=180)
     except FileNotFoundError:
-        return PhaseResult("trace_consistency", "fail", summary="make not found")
+        return PhaseResult("trace_consistency", "fail", summary="tb/host_build.py not found")
     except subprocess.TimeoutExpired as exc:
         return _timeout_result(project_dir, "trace_consistency", exc, "trace consistency")
     if verbose and result.stdout:

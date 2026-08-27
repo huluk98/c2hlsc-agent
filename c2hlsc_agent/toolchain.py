@@ -33,7 +33,7 @@ from typing import Iterable
 TIERS = ("core", "coverage", "symbolic", "ppa", "rtl", "vendor")
 
 TIER_PURPOSE = {
-    "core": "host equivalence and the shift-left trace tier (make test, make leveri-test)",
+    "core": "host equivalence and the shift-left trace tier (tb/host_build.py test / leveri-test)",
     "coverage": "concrete structural coverage (make gcov-coverage) and the refinement loop",
     "symbolic": "symbolic exploration for corner-case stimulus (make klee-coverage)",
     "ppa": "local synthesis, gate-level simulation and STA (optimize --local-ppa)",
@@ -51,6 +51,9 @@ class Tool:
     apt: str | None = None
     dnf: str | None = None
     pacman: str | None = None
+    winget: str | None = None
+    #: Absent-but-optional tools never fail `doctor`; the flow works without them.
+    optional: bool = False
     #: Environment variables that may point at the binary instead of PATH.
     env_overrides: tuple[str, ...] = ()
     #: Alternative binary names that satisfy the same need.
@@ -64,6 +67,7 @@ class Tool:
             "apt": self.apt,
             "dnf": self.dnf,
             "pacman": self.pacman,
+            "winget": self.winget,
         }.get(manager or "")
 
 
@@ -76,18 +80,27 @@ TOOLS: tuple[Tool, ...] = (
         apt="g++",
         dnf="gcc-c++",
         pacman="gcc",
-        aliases=("clang++",),
-        manual="On macOS the Xcode command line tools already provide a g++ shim: xcode-select --install",
+        aliases=("clang++", "c++"),
+        manual=(
+            "macOS: the Xcode command line tools already provide a g++ shim (xcode-select --install). "
+            "Windows: install a GCC/Clang-style compiler natively -- winget install LLVM.LLVM, or "
+            "MSYS2 mingw-w64-gcc. MSVC (cl.exe) is not usable: its flag syntax is incompatible."
+        ),
     ),
     Tool(
         name="make",
         tier="core",
-        purpose="drives every generated project target",
+        purpose="convenience alias over tb/host_build.py; NOT required -- the agent runs the driver directly",
         brew="make",
         apt="make",
         dnf="make",
         pacman="make",
-        manual="On macOS the Xcode command line tools already provide make: xcode-select --install",
+        winget="GnuWin32.Make",
+        optional=True,
+        manual=(
+            "Nothing breaks without make: every recipe lives in the generated tb/host_build.py "
+            "and the agent invokes it directly, which is what makes native Windows work."
+        ),
     ),
     Tool(
         name="python3",
@@ -97,6 +110,8 @@ TOOLS: tuple[Tool, ...] = (
         apt="python3",
         dnf="python3",
         pacman="python",
+        winget="Python.Python.3.12",
+        aliases=("python",),
     ),
     Tool(
         name="gcov",
@@ -135,6 +150,7 @@ TOOLS: tuple[Tool, ...] = (
         apt="docker.io",
         dnf="moby-engine",
         pacman="docker",
+        winget="Docker.DockerDesktop",
         manual="On macOS install Docker Desktop: brew install --cask docker",
     ),
     Tool(
@@ -145,6 +161,7 @@ TOOLS: tuple[Tool, ...] = (
         apt="clang",
         dnf="clang",
         pacman="clang",
+        winget="LLVM.LLVM",
         env_overrides=("KLEE_CXX",),
     ),
     Tool(
@@ -231,6 +248,8 @@ def package_manager() -> str | None:
 
     if platform.system() == "Darwin":
         return "brew" if shutil.which("brew") else None
+    if os.name == "nt":
+        return "winget" if shutil.which("winget") else None
     for manager, binary in (("apt", "apt-get"), ("dnf", "dnf"), ("pacman", "pacman")):
         if shutil.which(binary):
             return manager
@@ -272,6 +291,7 @@ def _linux_has_package(manager: str, package: str) -> bool:
         "apt": ["apt-cache", "policy", package],
         "dnf": ["dnf", "--quiet", "list", "--available", package],
         "pacman": ["pacman", "-Si", package],
+        "winget": ["winget", "show", "--id", package, "--exact"],
     }.get(manager)
     if probe is None:
         return False
@@ -301,6 +321,10 @@ def _install_command(manager: str, package: str) -> list[str]:
         "apt": ["sudo", "apt-get", "install", "-y", package],
         "dnf": ["sudo", "dnf", "install", "-y", package],
         "pacman": ["sudo", "pacman", "-S", "--noconfirm", package],
+        "winget": [
+            "winget", "install", "--id", package, "--exact",
+            "--accept-package-agreements", "--accept-source-agreements",
+        ],
     }[manager]
 
 

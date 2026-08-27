@@ -39,6 +39,7 @@ from .analyze import AnalysisResult
 from .config import AgentConfig
 from .convert import GeneratedSource
 from .hls_project import write_project
+from .hls_runner import host_target
 from .stimulus import ExtraVector
 
 REFINEMENT_REPORT = "coverage_refinement.json"
@@ -211,8 +212,10 @@ def collect_ktests(project_dir: Path) -> list[Path]:
 
 
 def _run_target(project_dir: Path, target: str, timeout: int = 900) -> subprocess.CompletedProcess:
+    # host_target(), not make: refinement has to work wherever verification works,
+    # including native Windows.
     return subprocess.run(
-        ["make", target],
+        host_target(target),
         cwd=project_dir,
         capture_output=True,
         text=True,

@@ -93,6 +93,35 @@ def parse_mismatches(text: str) -> list[Mismatch]:
     return mismatches
 
 
+def _terminate_tree(proc: subprocess.Popen) -> None:
+    """Ask a timed-out command and its children to stop.
+
+    On POSIX the process group does it. On Windows there are no process groups in that
+    sense, so taskkill /T is the equivalent -- without it a timed-out compiler or
+    simulator leaves orphaned children holding the output files open.
+    """
+
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/PID", str(proc.pid), "/T"], capture_output=True, check=False)
+        return
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except (AttributeError, ProcessLookupError, PermissionError):
+        proc.kill()
+
+
+def _kill_tree(proc: subprocess.Popen) -> None:
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], capture_output=True, check=False)
+        if proc.poll() is None:
+            proc.kill()
+        return
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (AttributeError, ProcessLookupError, PermissionError):
+        proc.kill()
+
+
 def run_command(command: list[str], cwd: Path, phase: str, timeout: int = 120) -> PhaseResult:
     proc = subprocess.Popen(
         command,
@@ -105,17 +134,11 @@ def run_command(command: list[str], cwd: Path, phase: str, timeout: int = 120) -
     try:
         stdout, stderr = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
-        try:
-            os.killpg(proc.pid, signal.SIGTERM)
-        except (AttributeError, ProcessLookupError, PermissionError):
-            proc.kill()
+        _terminate_tree(proc)
         try:
             stdout, stderr = proc.communicate(timeout=10)
         except subprocess.TimeoutExpired:
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except (AttributeError, ProcessLookupError, PermissionError):
-                proc.kill()
+            _kill_tree(proc)
             stdout, stderr = proc.communicate()
         log_path = cwd / f"{phase}.log"
         log_path.write_text((stdout or "") + "\n--- stderr ---\n" + (stderr or ""), encoding="utf-8")

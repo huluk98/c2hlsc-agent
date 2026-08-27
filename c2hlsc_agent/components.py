@@ -400,6 +400,7 @@ class ShiftLeftTestbenchAgent:
             "c2hlsc_agent.stimulus.render_helpers",
             "c2hlsc_agent.coverage_refine.refine_project",
             "c2hlsc_agent.hls_project.render_makefile",
+            "c2hlsc_agent.hls_project.render_host_build",
             "c2hlsc_agent.hls_project.render_run_csim",
             "c2hlsc_agent.hls_project.render_run_csynth",
             "c2hlsc_agent.hls_project.render_run_cosim",
@@ -422,6 +423,7 @@ class ShiftLeftTestbenchAgent:
             "tb/gen_rtl_tb.py",
             "tb/run_rtl_sim.py",
             "tb/rtl_tb_manifest.json",
+            "tb/host_build.py",
             "coverage_refinement.json",
             "run_hls.tcl",
             "run_csim.tcl",
@@ -429,6 +431,7 @@ class ShiftLeftTestbenchAgent:
             "run_cosim.tcl",
             "Makefile",
             "run_all.sh",
+            "run_all.py",
         ),
         gate=(
             "the oracle testbench must compile and drive golden C and HLS-C with identical stimuli; "

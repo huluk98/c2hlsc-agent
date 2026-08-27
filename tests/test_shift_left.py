@@ -563,28 +563,94 @@ class InterpreterPortabilityTests(unittest.TestCase):
     machine where nothing is actually wrong.
     """
 
-    def test_makefile_takes_the_interpreter_as_a_variable(self) -> None:
+    def test_every_makefile_recipe_delegates_to_the_driver(self) -> None:
+        """One definition per recipe, and make stays optional."""
+
         from c2hlsc_agent.hls_project import render_makefile
 
         makefile = render_makefile(AgentConfig())
         self.assertIn("PYTHON ?= python3", makefile)
-        for recipe in ("tb/leveri_compare.py", "tb/run_gcov.py", "tb/run_klee.py", "-m c2hlsc_agent refine"):
-            line = next(row for row in makefile.splitlines() if recipe in row)
-            self.assertIn("$(PYTHON)", line, recipe)
-            self.assertNotIn("python3 ", line, recipe)
+        recipes = [row.strip() for row in makefile.splitlines() if row.startswith("\t")]
+        self.assertTrue(recipes)
+        for row in recipes:
+            # The only recipe that does not go through the driver is the Vitis one, which
+            # invokes the vendor tool directly.
+            if row.startswith("vitis_hls "):
+                continue
+            self.assertTrue(row.startswith("$(PYTHON) "), row)
+            self.assertNotIn("python3 ", row, row)
+        for target in ("test", "leveri-test", "gcov-coverage", "klee-coverage", "clean"):
+            self.assertIn(f"tb/host_build.py {target}", makefile, target)
 
-    def test_the_rung_hands_make_its_own_interpreter(self) -> None:
+    def test_the_host_rungs_do_not_invoke_make(self) -> None:
+        """make is not a native Windows tool, and both host rungs are required."""
+
         from c2hlsc_agent import hls_runner
 
+        for target, phase, call in (
+            ("test", "software_equivalence", hls_runner.run_software_equivalence),
+            ("leveri-test", "trace_consistency", hls_runner.run_trace_consistency),
+        ):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as tmp:
+                with mock.patch.object(hls_runner, "run_command") as runner:
+                    runner.return_value = PhaseResult(phase, "pass")
+                    call(Path(tmp))
+                command = runner.call_args[0][0]
+                self.assertEqual(command[0], sys.executable)
+                self.assertTrue(command[1].endswith("host_build.py"), command)
+                self.assertEqual(command[2], target)
+                self.assertNotIn("make", command)
+
+    def test_the_driver_resolves_a_gcc_style_compiler_and_names_msvc(self) -> None:
+        from c2hlsc_agent.hls_project import render_host_build
+
+        driver = render_host_build(AgentConfig())
+        # MSVC must be reported, never silently used: its flag syntax is incompatible.
+        self.assertIn("only MSVC (cl.exe) was found", driver)
+        self.assertIn('EXE = ".exe" if os.name == "nt" else ""', driver)
+        self.assertIn("sys.executable", driver)
+
+    @unittest.skipUnless(shutil.which("g++") or shutil.which("clang++"), "a C++ compiler is required")
+    def test_the_host_tier_runs_with_no_make_on_path(self) -> None:
+        """The native-Windows scenario: a compiler and Python, no make and no shell."""
+
         with tempfile.TemporaryDirectory() as tmp:
-            project = Path(tmp)
-            (project / "Makefile").write_text("", encoding="utf-8")
-            with mock.patch.object(hls_runner, "run_command") as runner:
-                runner.return_value = PhaseResult("trace_consistency", "pass")
-                hls_runner.run_trace_consistency(project)
-            command = runner.call_args[0][0]
-            self.assertEqual(command[:2], ["make", "leveri-test"])
-            self.assertEqual(command[2], f"PYTHON={sys.executable}")
+            root = Path(tmp)
+            project, _, _ = _project(
+                root,
+                VECTOR_ADD,
+                "vector_add",
+                {
+                    "a": ArgumentConfig(direction="input", length=4),
+                    "b": ArgumentConfig(direction="input", length=4),
+                    "out": ArgumentConfig(direction="output", length=4),
+                    "n": ArgumentConfig(range=(0, 4)),
+                },
+                num_tests=4,
+            )
+            self.assertTrue((project / "tb" / "host_build.py").exists())
+            self.assertTrue((project / "run_all.py").exists())
+            for target in ("test", "leveri-test"):
+                run = subprocess.run(
+                    [sys.executable, str(project / "tb" / "host_build.py"), target],
+                    cwd=project,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(run.returncode, 0, f"{target}: {run.stdout}{run.stderr}")
+
+    def test_run_command_kills_the_process_tree_on_windows(self) -> None:
+        from c2hlsc_agent import equivalence
+
+        proc = mock.Mock()
+        proc.pid = 4321
+        proc.poll.return_value = 0
+        with mock.patch.object(equivalence.os, "name", "nt"), mock.patch.object(
+            equivalence.subprocess, "run"
+        ) as runner:
+            equivalence._kill_tree(proc)
+        runner.assert_called_once()
+        self.assertEqual(runner.call_args[0][0], ["taskkill", "/PID", "4321", "/T", "/F"])
 
     @unittest.skipUnless(HAVE_BUILD, "g++ and make are required")
     def test_the_rung_passes_with_no_python3_on_path(self) -> None:

@@ -615,6 +615,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 
@@ -752,7 +753,7 @@ def main() -> int:
         [cxx, *flags, *extra, "coverage/leveri_hls_tb.o", "coverage/hls_top.o", "-o", "coverage/leveri_hls_tb"],
         ["coverage/leveri_golden_tb"],
         ["coverage/leveri_hls_tb"],
-        ["python3", "tb/leveri_compare.py", "leveri_golden_trace.csv", "leveri_hls_trace.csv"],
+        [sys.executable, "tb/leveri_compare.py", "leveri_golden_trace.csv", "leveri_hls_trace.csv"],
     ]
     command_logs: list[dict[str, object]] = []
     try:
