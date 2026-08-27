@@ -175,8 +175,21 @@ repair prompt; suite-wide test isolation via `tests/__init__.py`), `contract_pla
 (`--propose-contract`, advisory-only proposals), and `shift_left_testbench_agent`
 (`--tb-augment`, contract-validated directed vectors appended after the deterministic
 tests; the unaugmented testbench is byte-identical). New flags: `--propose-contract`,
-`--tb-augment`, `--no-failure-analyst`, `--no-repair-memory`, `--memory-dir`. Suite: 253.
-Dogfooded against the real `claude` CLI (haiku) — see `docs/full_workflow.md` §13.
+`--tb-augment`, `--no-failure-analyst`, `--no-repair-memory`, `--memory-dir`.
+
+**Dogfooded and hardened (commit `b135842`).** A 26-agent pass (4 real-model scenarios +
+3 adversarial review lenses with refute-verify) confirmed 12 findings; all fixed with
+regression tests. Highlights: model responses could crash the run (OverflowError on huge
+JSON ints, TypeError on unhashable JSON values, UnicodeDecodeError on a corrupt card
+store) — all now degrade; a float vector beyond float32 range falsely failed correct
+designs (inf-vs-inf fails `values_equal`) — storage-type bounds added; memory retrieval
+was keyed on the analyst-REFINED family and missed cards (now keyed on the deterministic
+family + same-stage tier; re-dogfooded 7/7 green); and an UNRANGED length-like scalar
+(`int count`) segfaulted the GOLDEN reference over defaulted arrays — stimulus (not
+comparison) now clamped to the matching array length, named in the contract comment.
+contract_planner validates field-by-field and records rejections; its prompt steers
+symbolic bounds into scalar `range` proposals (re-dogfooded: haiku proposed exactly
+`count: range [0, 16]`). All four dogfood scenarios green. Suite: 261.
 
 ---
 
