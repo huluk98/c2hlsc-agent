@@ -1,5 +1,12 @@
 # CLI Handoff: Implement the Combined Generation Workflow
 
+> **Status:** Tasks 1–5 below are implemented on branch
+> `claude/combined-generation-workflow` (LeVeri gate in the ladder, golden-trace
+> smoke, structured divergence evidence, K=3 documentation, drift check, plus
+> Windows support via `C2HLSC_VITIS_BIN` and a make `PYTHON` override). This
+> document remains the specification of record; the backlog items in §4 are
+> still open.
+
 You are an agent working in the repository `huluk98/c2hlsc-agent`. Your job is
 to implement the combined workflow described in
 `docs/handoff_generation_workflow.md`: the evidence-driven generation/repair

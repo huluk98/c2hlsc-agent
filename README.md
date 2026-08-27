@@ -414,7 +414,29 @@ For every generated project, AUTO RTL now writes:
 - `tb/run_klee.py`: optional KLEE runner that writes a skip report if KLEE is absent
 - `tb/leveri_manifest.json`: records KG-ready metadata for the testbench bundle
 
-Run the paired trace check with:
+The LeVeri gate is wired into the automated flow in two places:
+
+- **Golden-trace smoke (before generation).** `convert` renders the golden testbench
+  from the interface contract of the original C, compiles it, and — when every pointer
+  has a configured length and every scalar a configured range — runs it, all before any
+  LLM call. A failure blocks the run: the contract extraction is wrong and no
+  generation tokens or Vitis runs should be spent yet. Unbounded contracts degrade to a
+  compile-only check. Evidence lands in `<out>/.golden_smoke/golden_smoke.log`.
+- **`leveri_trace` phase (in the verification ladder).** After host software
+  equivalence passes, the verifier runs the paired-trace check (`make leveri-test`)
+  and blocks the Vitis phases on a divergence. A `behavior mismatch` classifies as
+  `leveri_trace_mismatch` and feeds the repair prompt structured first-divergence
+  evidence (cycle, column, expected/actual); harness misalignments route to the
+  testbench agent for regeneration.
+
+Disable both with `--no-leveri` (or `leveri_gate: false` in the config).
+
+Generated testbenches must never be hand-edited — change the contract and regenerate.
+`tb/leveri_manifest.json` records the SHA-256 of every generated bundle file, and
+`python scripts/check_generated_testbenches.py --project <dir>` (also
+`scripts/team_preflight.sh --check-project <dir>`) fails on drift.
+
+Run the paired trace check manually with:
 
 ```bash
 make leveri-test
@@ -780,11 +802,27 @@ Supported options:
 - `--max-iterations 1`
 - `--auto-repair`
 - `--keep-going`
+- `--no-leveri`
 - `--use-llm` / `--no-llm`
 - `--llm-backend auto|none|anthropic|openai`
 - `--llm-base-url http://localhost:11434/v1`
 - `--llm-model qwen2.5-coder`
 - `--verbose`
+
+### Standard bounded repair configuration
+
+For agent-driven runs where generation, verification, and repair share one session,
+the standard configuration is a repair budget of K=3, mirroring the evidence-driven
+closed-loop protocol:
+
+```bash
+python -m c2hlsc_agent.cli convert --config examples/vector_add/config.yaml \
+  --out build/vector_add --use-llm --auto-repair --max-iterations 3 --run-vitis
+```
+
+The persistent budgets (8 LLM calls, 8 Vitis runs, 4 h wall clock) and the
+oscillation guards still bound the run; `--max-iterations 3` only caps
+verifier-driven repair rounds.
 
 Use `python -m c2hlsc_agent.cli repair --help` for the separate external-evidence
 repair command.
@@ -842,14 +880,26 @@ For each conversion, the output directory contains:
 
 ## Verification Order
 
-1. Static analysis
+1. Static analysis (plus the golden-trace smoke before generation)
 2. Host software equivalence with `g++`
-3. Vitis HLS `csim_design`
-4. Vitis HLS `csynth_design`
-5. Vitis HLS `cosim_design`
+3. LeVeri paired-trace check (`leveri_trace`; skippable with `--no-leveri`)
+4. Vitis HLS `csim_design`
+5. Vitis HLS `csynth_design`
+6. Vitis HLS `cosim_design`
 
 When `--no-run-vitis` is used, Vitis phases are marked `skipped`; host equivalence is
 still run when `g++` is available.
+
+On native Windows, point the runner at the Vitis HLS launcher explicitly — PATH
+lookup cannot resolve the `.bat` wrapper for direct execution:
+
+```bat
+set C2HLSC_VITIS_BIN=D:\Xilinx\Vivado\2024.2\bin\vitis_hls.bat
+```
+
+(Host equivalence and the LeVeri gate need `make` and `g++`, e.g. from MSYS2/MinGW;
+the gated paired-trace check uses the running Python interpreter, so no `python3`
+alias is required.)
 
 By default, `convert` does not mutate a failing project after verification. This keeps
 the current split-machine workflow explicit: run Vitis/CoSim wherever the toolchain is
