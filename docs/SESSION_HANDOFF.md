@@ -166,6 +166,20 @@ archives. Ubuntu archives themselves ARE reachable, which is how iverilog and yo
 
 ---
 
+## 4d. All eight agents brought live (commit `10570f2`)
+
+The four remaining seams were implemented: `failure_analyst` (LLM refinement of the
+repair classification, dataclass-gated, status never model-writable, budget-guarded),
+`audit_memory_agent` (cards promoted only from verified-passed runs; retrieval into the
+repair prompt; suite-wide test isolation via `tests/__init__.py`), `contract_planner`
+(`--propose-contract`, advisory-only proposals), and `shift_left_testbench_agent`
+(`--tb-augment`, contract-validated directed vectors appended after the deterministic
+tests; the unaugmented testbench is byte-identical). New flags: `--propose-contract`,
+`--tb-augment`, `--no-failure-analyst`, `--no-repair-memory`, `--memory-dir`. Suite: 253.
+Dogfooded against the real `claude` CLI (haiku) — see `docs/full_workflow.md` §13.
+
+---
+
 ## 5. Answered
 
 - **Q1** deliverable → (b) a working tool; ASIC is the long-term goal, not the current one

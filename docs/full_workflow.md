@@ -795,27 +795,33 @@ the routing table that assigns failures to them, and the model call sites.
 
 | Declared agent | What actually runs today | Status |
 |---|---|---|
-| `contract_planner` | `analyze.analyze_source` — regex inference, no model | deterministic |
-| `shift_left_testbench_agent` | `testgen` + `leveri_testgen` + `verilog_testgen` | deterministic |
-| `hlsc_generator_agent` | `convert.generate_hls_sources` — **live model call site 1** | live, verifier-gated |
+| `contract_planner` | `analyze.analyze_source` (regex inference) + `contract_planner.propose_contract` under `--propose-contract`: model-proposed directions/bounds/ranges, validated row-by-row, written to `contract_proposals.json`, **never applied automatically** | live, advisory-only |
+| `shift_left_testbench_agent` | `testgen` + `leveri_testgen` + `verilog_testgen` (the deterministic floor) + `stimulus_augment` under `--tb-augment`: model-proposed directed vectors, numerically validated, appended as constant tables — the model contributes data, never code | live, contract-gated |
+| `hlsc_generator_agent` | `convert.generate_hls_sources` — model call site, structural gate | live, verifier-gated |
 | `cosim_operator` | `hls_runner.verify_project` — the ladder itself | deterministic |
-| `failure_analyst` | `agent_loop.classify_failure` — regex triage; routing is live | **seam** |
-| `hlsc_repair_agent` | `hlsc_repair_agent._llm_repair` — **live model call site 2** | live, verifier-gated |
-| `rtl_optimizer_agent` | `qor_optimizer.optimize_project` — **live, its own command** | live, verifier-gated |
-| `audit_memory_agent` | `repair_audit.json` — persisted, but never retrieved from | **seam** |
+| `failure_analyst` | `agent_loop.classify_failure` (regex triage, always) + `refine_failure_analysis` before each LLM repair: same `FailureAnalysis` dataclass, status never model-writable, invalid answers fall back to regex | live, dataclass-gated |
+| `hlsc_repair_agent` | `hlsc_repair_agent._llm_repair` — model call site, structural + oscillation gates | live, verifier-gated |
+| `rtl_optimizer_agent` | `qor_optimizer.optimize_project` — its own command | live, verifier-gated |
+| `audit_memory_agent` | `audit_memory`: cards promoted **only** from runs whose full requested ladder passed after the repairs; top-2 retrieval into the repair prompt; store `~/.c2hlsc/repair_cards.jsonl` (`--memory-dir` / `C2HLSC_MEMORY_DIR`) | live, audit-gated |
 
-### The two remaining seams
+### All eight agents now have live implementations
 
-- **`failure_analyst`** — a model-backed classifier would replace regex triage while
-  returning the same `FailureAnalysis` dataclass. Near-zero risk, because the output shape
-  is already the contract, and the `Mismatch` records plus phase logs are already
-  structured evidence. For CoSim mismatches it would add PMLC-style slicing.
-- **`audit_memory_agent`** — would promote audited repair successes from
-  `repair_audit.json` into retrieval for future prompts.
+The last four seams were closed in one increment (see `tests/test_live_agents.py` for
+the gate-by-gate contracts):
 
-Two more increments are specified but unbuilt: model-proposed argument
-directions/bounds feeding `ArgumentConfig` (`contract_planner`), and coverage-driven
-testbench augmentation on top of the deterministic floor.
+- **`failure_analyst`** runs only when an LLM repair is about to run (so it never spends
+  a model call that mechanical repair would make unnecessary), skips itself when fewer
+  than two budgeted calls remain, and can never overturn a `blocked` or `pass` verdict.
+- **`audit_memory_agent`** honors its declared stop condition — *no reference HLS, hidden
+  labels, or manual fixes enter prompt-facing memory* — by promoting only from
+  `run_convert` invocations whose full requested ladder passed after the repairs; the
+  standalone `repair` command never promotes because it does not verify.
+- **`contract_planner`** proposals are advisory by design: the soundness-relevant knobs
+  (testbench array bounds, stimulus domains) stay under explicit human control.
+- **`shift_left_testbench_agent`** augmentation appends after the deterministic tests;
+  the first `num_tests` iterations stay bit-identical to an unaugmented run, outputs stay
+  sentinel-filled, and both oracle and HLS top receive the same vector — so an augmented
+  vector can only expose a difference, never mask one.
 
 ### What must not break when agents are added
 

@@ -391,6 +391,32 @@ the earliest failing Vitis stage remotely, classify locally, repair locally with
 Claude CLI, re-run the full ladder — no manual log ferrying (the `repair` subcommand
 remains available for air-gapped setups).
 
+### The live agent roster (`--propose-contract`, `--tb-augment`, analyst, memory)
+
+All eight declared agents now have live implementations; four are model-backed and every
+one of them degrades to the deterministic behaviour on any invalid output. The full
+mapping is in [`docs/full_workflow.md` §13](docs/full_workflow.md#13-the-eight-agents-which-are-live).
+
+- **`failure_analyst`** (on by default with `--use-llm`; opt out with
+  `--no-failure-analyst`): just before an LLM repair, the regex `FailureAnalysis` is
+  offered to the model for sharpening. Same dataclass out, status never model-writable,
+  out-of-vocabulary answers discarded, and it stands down when fewer than two budgeted
+  model calls remain so it can never eat the repair's last call.
+- **`audit_memory_agent`** (on by default with `--use-llm`; opt out with
+  `--no-repair-memory`): repairs from a run whose full requested ladder later PASSED are
+  promoted as cards to `~/.c2hlsc/repair_cards.jsonl` (`--memory-dir` /
+  `C2HLSC_MEMORY_DIR` override) and the two most relevant cards are offered to future
+  repair prompts. The standalone `repair` subcommand never promotes — it does not verify.
+- **`contract_planner`** (`--propose-contract`): model-proposed argument
+  directions/bounds/ranges, validated and written to `contract_proposals.json`. Never
+  applied automatically; copy what you agree with into the config.
+- **`shift_left_testbench_agent`** (`--tb-augment`): model-proposed extra directed
+  stimulus vectors, validated against the contract (exact lengths, scalar ranges,
+  numbers only) and appended after the deterministic tests as constant tables — the
+  model contributes data, never testbench code, and the same values drive the golden
+  oracle and the HLS top, so a vector can only expose a difference. Accepted vectors and
+  rejections are recorded in `tb/augmented_vectors.json`.
+
 ### Repair memory and oscillation guard
 
 Every repair is already recorded in `repair_audit.json`; the LLM repair prompt now
