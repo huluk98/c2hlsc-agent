@@ -190,7 +190,7 @@ class RunVitisUptoTests(unittest.TestCase):
     def test_upto_csynth_skips_cosim(self):
         with tempfile.TemporaryDirectory() as tmp:
             with mock.patch("c2hlsc_agent.hls_runner._run_vitis_phase",
-                            side_effect=lambda d, p, r: PhaseResult(p, "pass")), \
+                            side_effect=lambda d, p, r, **kw: PhaseResult(p, "pass")), \
                  mock.patch("c2hlsc_agent.hls_runner.shutil.which", return_value="/bin/vitis_hls"):
                 phases = run_vitis(Path(tmp), True, upto="csynth")
         self.assertEqual(phases["csynth"].status, "pass")

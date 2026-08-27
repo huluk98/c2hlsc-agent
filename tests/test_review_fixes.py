@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 import sys
 
@@ -79,3 +80,52 @@ class ConfigMergeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WindowsLauncherTests(unittest.TestCase):
+    """W1: on Windows the launcher is vitis_hls.bat. shutil.which finds it through
+    PATHEXT, but CreateProcess -- which subprocess uses -- appends only .exe, so the
+    bare name fails to start on the very machine where Vitis IS installed."""
+
+    def test_batch_launcher_goes_through_cmd_on_windows(self):
+        from c2hlsc_agent.hls_runner import hls_launch_argv
+
+        argv = hls_launch_argv(r"C:\Xilinx\Vitis_HLS\2024.2\bin\vitis_hls.bat",
+                               "run_csim.tcl", windows=True)
+        self.assertEqual(argv[:2], ["cmd", "/c"])
+        self.assertEqual(argv[-2:], ["-f", "run_csim.tcl"])
+
+    def test_exe_and_posix_launchers_are_invoked_directly(self):
+        from c2hlsc_agent.hls_runner import hls_launch_argv
+
+        self.assertEqual(
+            hls_launch_argv("/tools/Xilinx/bin/vitis_hls", "run_csim.tcl", windows=False),
+            ["/tools/Xilinx/bin/vitis_hls", "-f", "run_csim.tcl"],
+        )
+        self.assertEqual(
+            hls_launch_argv("vitis_hls.exe", "run_csim.tcl", windows=True),
+            ["vitis_hls.exe", "-f", "run_csim.tcl"],
+        )
+
+    def test_explicit_absolute_binary_is_honoured_and_checked(self):
+        from c2hlsc_agent.hls_runner import resolve_hls_bin
+
+        with tempfile.TemporaryDirectory() as tmp:
+            real = Path(tmp) / "vitis_hls.bat"
+            real.write_text("@echo off\n", encoding="utf-8")
+            self.assertEqual(resolve_hls_bin(str(real)), str(real))
+            self.assertIsNone(resolve_hls_bin(str(Path(tmp) / "absent.bat")))
+
+    def test_unlaunchable_binary_is_reported_as_toolchain_unavailable(self):
+        # The failure must reach classify_log_family's toolchain_unavailable family, so
+        # the run is blocked and the repair agent never mutates correct source over it.
+        from c2hlsc_agent.agent_loop import classify_log_family
+        from c2hlsc_agent.hls_runner import _run_vitis_phase
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch("c2hlsc_agent.hls_runner.run_command",
+                            side_effect=FileNotFoundError("[WinError 2] cannot find the file")):
+                result = _run_vitis_phase(Path(tmp), "csim", None)
+        self.assertEqual(result.status, "fail")
+        self.assertIn("vitis_hls not found", result.summary)
+        self.assertEqual(classify_log_family("csim", result.summary), "toolchain_unavailable")

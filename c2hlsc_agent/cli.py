@@ -75,7 +75,11 @@ def _add_remote_vitis_arguments(parser: argparse.ArgumentParser) -> None:
         help="remote shell prefix that puts vitis_hls on PATH, e.g. "
         "'source /tools/Xilinx/Vitis/2024.2/settings64.sh'; common locations are probed when unset",
     )
-    parser.add_argument("--vitis-bin", help="remote vitis_hls executable name or absolute path")
+    parser.add_argument(
+        "--vitis-bin",
+        help="vitis_hls executable name or absolute path, for the remote host and for local "
+        "runs alike. On Windows give the full path to vitis_hls.bat. Also honours C2HLSC_VITIS_BIN.",
+    )
 
 
 def _add_run_control_arguments(parser: argparse.ArgumentParser) -> None:
@@ -451,7 +455,13 @@ def run_convert(args: argparse.Namespace) -> int:
             state = state or VerificationState()
             completed_iterations = controller.record.usage.attempts
             break
-        state = verify_project(out_dir, config.run_vitis, verbose=args.verbose, remote=remote)
+        state = verify_project(
+            out_dir,
+            config.run_vitis,
+            verbose=args.verbose,
+            remote=remote,
+            hls_bin=config.vitis_bin,
+        )
         status = final_status(state, config.run_vitis, analysis.diagnostics.has_errors)
         if status == 'pass':
             controller.record_verification(source_signature, None)

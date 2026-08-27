@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -11,6 +12,45 @@ from .remote import RemoteVitis
 
 PHASE_ORDER = ("software_equivalence", "csim", "csynth", "cosim")
 PHASE_TIMEOUTS = {"csim": 600, "csynth": 1200, "cosim": 600}
+
+# The exact string classify_log_family greps for to reach the toolchain_unavailable
+# family, which routes to blocked and stops the repair agent mutating good source.
+_NOT_FOUND_MARKER = "vitis_hls not found"
+
+# On Windows the launcher is a batch file. CreateProcess cannot execute one directly.
+_SHELL_LAUNCHER_SUFFIXES = (".bat", ".cmd")
+
+
+def resolve_hls_bin(explicit: str | None = None) -> str | None:
+    """Resolve the local Vitis launcher to a concrete path, or ``None``.
+
+    Returning the RESOLVED path matters on Windows, where the launcher is
+    ``vitis_hls.bat``: :func:`shutil.which` finds it through ``PATHEXT``, but the
+    ``CreateProcess`` call behind :mod:`subprocess` appends only ``.exe``. Launching the
+    bare name therefore raises ``FileNotFoundError`` on the very machine where Vitis IS
+    installed -- the guard says "found" and the run then dies.
+
+    Order: an explicit path or name, then ``C2HLSC_VITIS_BIN``, then ``PATH``.
+    """
+
+    candidate = explicit or os.environ.get("C2HLSC_VITIS_BIN") or "vitis_hls"
+    if os.path.isabs(candidate):
+        return candidate if os.path.exists(candidate) else None
+    return shutil.which(candidate)
+
+
+def hls_launch_argv(binary: str, tcl: str, *, windows: bool | None = None) -> list[str]:
+    """Argv that actually launches one Vitis phase.
+
+    A ``.bat``/``.cmd`` launcher has to go through ``cmd.exe``; passing it straight to
+    ``CreateProcess`` fails even with a fully qualified path.
+    """
+
+    if windows is None:
+        windows = os.name == "nt"
+    if windows and binary.lower().endswith(_SHELL_LAUNCHER_SUFFIXES):
+        return ["cmd", "/c", binary, "-f", tcl]
+    return [binary, "-f", tcl]
 
 
 def earliest_failing_phase(state: VerificationState, run_vitis_requested: bool) -> str | None:
@@ -53,14 +93,31 @@ def run_software_equivalence(project_dir: Path, verbose: bool = False) -> PhaseR
     return result
 
 
-def _run_vitis_phase(project_dir: Path, phase: str, remote: RemoteVitis | None) -> PhaseResult:
+def _run_vitis_phase(
+    project_dir: Path,
+    phase: str,
+    remote: RemoteVitis | None,
+    hls_bin: str | None = None,
+) -> PhaseResult:
     timeout = PHASE_TIMEOUTS[phase]
     try:
         if remote is not None:
             return remote.run_phase(project_dir, phase, timeout)
-        return run_command(["vitis_hls", "-f", f"run_{phase}.tcl"], project_dir, phase, timeout=timeout)
+        binary = resolve_hls_bin(hls_bin) or "vitis_hls"
+        argv = hls_launch_argv(binary, f"run_{phase}.tcl")
+        return run_command(argv, project_dir, phase, timeout=timeout)
     except subprocess.TimeoutExpired as exc:
         return _timeout_result(project_dir, phase, exc, f"Vitis {phase}")
+    except OSError as exc:
+        # The launcher resolved but could not be started -- a Windows .bat reached
+        # through CreateProcess, a broken symlink, a missing interpreter. This is an
+        # environment problem, so report it in the toolchain_unavailable family rather
+        # than letting it escape as an uncaught exception out of the whole conversion.
+        return PhaseResult(
+            phase,
+            "fail",
+            summary=f"{_NOT_FOUND_MARKER}: could not launch it for {phase} ({type(exc).__name__}: {exc})",
+        )
 
 
 def run_vitis(
@@ -68,6 +125,7 @@ def run_vitis(
     run_requested: bool,
     remote: RemoteVitis | None = None,
     upto: str = "cosim",
+    hls_bin: str | None = None,
 ) -> dict[str, PhaseResult]:
     """Run the Vitis ladder, optionally stopping early.
 
@@ -101,8 +159,11 @@ def run_vitis(
                 "csynth": PhaseResult("csynth", "blocked", summary=message),
                 "cosim": PhaseResult("cosim", "blocked", summary=message),
             }
-    elif shutil.which("vitis_hls") is None:
-        message = "vitis_hls not found on PATH (use --vitis-ssh to run Vitis on a remote Linux host)"
+    elif resolve_hls_bin(hls_bin) is None:
+        message = (
+            f"{_NOT_FOUND_MARKER} on PATH (pass --vitis-bin with the full path, set "
+            "C2HLSC_VITIS_BIN, or use --vitis-ssh to run Vitis on a remote host)"
+        )
         return {
             "csim": PhaseResult("csim", "fail", summary=message),
             "csynth": PhaseResult("csynth", "blocked", summary=message),
@@ -110,7 +171,7 @@ def run_vitis(
         }
 
     try:
-        phases["csim"] = _run_vitis_phase(project_dir, "csim", remote)
+        phases["csim"] = _run_vitis_phase(project_dir, "csim", remote, hls_bin=hls_bin)
         if phases["csim"].status != "pass":
             message = "csim failed"
             phases["csynth"] = PhaseResult("csynth", "blocked", summary=message)
@@ -119,14 +180,14 @@ def run_vitis(
         if upto == "csim":
             return phases
 
-        phases["csynth"] = _run_vitis_phase(project_dir, "csynth", remote)
+        phases["csynth"] = _run_vitis_phase(project_dir, "csynth", remote, hls_bin=hls_bin)
         if phases["csynth"].status != "pass":
             phases["cosim"] = PhaseResult("cosim", "blocked", summary="csynth failed")
             return phases
         if upto == "csynth":
             return phases
 
-        phases["cosim"] = _run_vitis_phase(project_dir, "cosim", remote)
+        phases["cosim"] = _run_vitis_phase(project_dir, "cosim", remote, hls_bin=hls_bin)
         phases["cosim"] = _gate_cosim_on_log(phases["cosim"])
         return phases
     finally:
@@ -169,6 +230,7 @@ def verify_project(
     run_vitis_requested: bool,
     verbose: bool = False,
     remote: RemoteVitis | None = None,
+    hls_bin: str | None = None,
 ) -> VerificationState:
     state = VerificationState()
     software = run_software_equivalence(project_dir, verbose=verbose)
@@ -179,6 +241,6 @@ def verify_project(
         state.add_phase(PhaseResult("csynth", "blocked", summary="software equivalence failed"))
         state.add_phase(PhaseResult("cosim", "blocked", summary="software equivalence failed"))
         return state
-    for result in run_vitis(project_dir, run_vitis_requested, remote=remote).values():
+    for result in run_vitis(project_dir, run_vitis_requested, remote=remote, hls_bin=hls_bin).values():
         state.add_phase(result)
     return state
