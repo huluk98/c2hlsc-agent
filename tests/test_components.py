@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -24,6 +25,8 @@ from c2hlsc_agent.components import (
 )
 from c2hlsc_agent.config import load_config
 from c2hlsc_agent.equivalence import PhaseResult, VerificationState
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # tests/ importable however this is invoked
+
 from support import (  # noqa: E402 - tests/ is on sys.path via unittest discover
     HAVE_BUILD,
 )

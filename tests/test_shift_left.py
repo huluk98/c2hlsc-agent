@@ -34,6 +34,8 @@ from c2hlsc_agent.stimulus import ExtraVector, StimulusError, render_helpers, va
 from c2hlsc_agent import toolchain
 
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # tests/ importable however this is invoked
+
 from support import (  # noqa: E402 - tests/ is added to sys.path above
     BUILD_REASON,
     GCOV_REASON,
@@ -498,6 +500,74 @@ class SymbolicRefinementTests(unittest.TestCase):
             for target in ("test", "leveri-test"):
                 run = run_target(project, target)
                 self.assertEqual(run.returncode, 0, f"{target}: {run.stdout}{run.stderr}")
+
+
+class KleeContainerFallbackTests(unittest.TestCase):
+    """The container fallback must never turn an absent optional tool into a failure.
+
+    Regression for the windows-latest CI failure: that runner has the docker CLI and a
+    daemon that answers, but it runs WINDOWS containers, so `docker run` on the Linux
+    klee image exits 125. The fallback fired and reported failure, where the contract is
+    to skip cleanly -- KLEE being unavailable is not a build failure.
+    """
+
+    def _run_klee_module(self, tmp: Path):
+        project, _, _ = _project(
+            tmp,
+            VECTOR_ADD,
+            "vector_add",
+            {
+                "a": ArgumentConfig(direction="input", length=4),
+                "b": ArgumentConfig(direction="input", length=4),
+                "out": ArgumentConfig(direction="output", length=4),
+                "n": ArgumentConfig(range=(0, 4)),
+            },
+            num_tests=4,
+        )
+        return project, _load_generated_module(project, "tb/run_klee.py", "run_klee_under_test")
+
+    def _docker_info(self, os_type: str):
+        def fake(command, *args, **kwargs):
+            self.assertEqual(command[:2], ["docker", "info"])
+            return subprocess.CompletedProcess(command, 0, stdout=os_type + "\n", stderr="")
+
+        return fake
+
+    def test_a_windows_container_daemon_is_not_usable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _, module = self._run_klee_module(Path(tmp))
+            with mock.patch.object(module.shutil, "which", return_value="/usr/bin/docker"), mock.patch.object(
+                module.subprocess, "run", side_effect=self._docker_info("windows")
+            ):
+                ok, reason = module.docker_available()
+            self.assertFalse(ok)
+            self.assertIn("Linux image", reason)
+
+    def test_a_linux_daemon_is_usable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _, module = self._run_klee_module(Path(tmp))
+            with mock.patch.object(module.shutil, "which", return_value="/usr/bin/docker"), mock.patch.object(
+                module.subprocess, "run", side_effect=self._docker_info("linux")
+            ):
+                ok, reason = module.docker_available()
+            self.assertTrue(ok, reason)
+
+    def test_an_automatic_container_failure_skips_and_exits_zero(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project, module = self._run_klee_module(Path(tmp))
+            code = module._container_failed("klee/klee:latest", False, "container exited 125", {})
+            self.assertEqual(code, 0)
+            report = json.loads((project / "coverage" / "klee_report.json").read_text(encoding="utf-8"))
+            self.assertEqual(report["status"], "skipped")
+            self.assertIn("doctor", report["remedy"])
+
+    def test_a_forced_container_failure_is_a_real_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project, module = self._run_klee_module(Path(tmp))
+            code = module._container_failed("klee/klee:latest", True, "container exited 125", {})
+            self.assertEqual(code, 1)
+            report = json.loads((project / "coverage" / "klee_report.json").read_text(encoding="utf-8"))
+            self.assertEqual(report["status"], "fail")
 
 
 class TraceConsistencyRungTests(unittest.TestCase):

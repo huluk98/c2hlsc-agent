@@ -5,6 +5,7 @@ from pathlib import Path
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # tests/ importable however this is invoked
 
 from c2hlsc_agent.agent_loop import leveri_testbench_policy, multi_agent_procedures
 from c2hlsc_agent.analyze import analyze_source

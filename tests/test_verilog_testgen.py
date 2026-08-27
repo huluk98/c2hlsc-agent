@@ -8,6 +8,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # tests/ importable however this is invoked
 
 from c2hlsc_agent.agent_loop import multi_agent_procedures
 from c2hlsc_agent.analyze import analyze_source

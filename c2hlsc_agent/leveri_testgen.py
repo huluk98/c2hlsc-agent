@@ -893,6 +893,7 @@ import os
 import platform
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 
@@ -939,17 +940,51 @@ def default_klee_include(klee_path: str | None) -> str | None:
 
 
 def docker_available() -> tuple[bool, str]:
-    '''The CLI existing is not enough -- a Mac with Docker Desktop closed has the binary
-    but no daemon, which would otherwise fail with an unhelpful socket error.'''
+    '''Whether the official KLEE image can actually run here.
+
+    Three things have to hold, and checking fewer than all three produces a confusing
+    failure instead of a clean skip:
+      * the CLI exists -- a Mac with Docker Desktop closed still has the binary;
+      * a daemon answers;
+      * that daemon runs LINUX containers. klee/klee is a Linux image, and a Windows
+        daemon in Windows-container mode answers `docker info` happily and then fails
+        `docker run` with exit 125.
+    '''
     if shutil.which("docker") is None:
         return False, "docker not installed"
     try:
-        probe = subprocess.run(["docker", "info"], capture_output=True, text=True, timeout=60)
+        probe = subprocess.run(
+            ["docker", "info", "--format", "{{.OSType}}"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
     except (OSError, subprocess.SubprocessError) as exc:
         return False, f"docker not usable: {exc}"
     if probe.returncode != 0:
         return False, "docker daemon is not running (start Docker Desktop)"
+    os_type = probe.stdout.strip().lower()
+    if os_type and os_type != "linux":
+        return False, f"docker daemon runs {os_type} containers; klee/klee is a Linux image"
     return True, ""
+
+
+def _container_failed(image: str, forced: bool, reason: str, extra: dict) -> int:
+    # A container failure is only a FAILURE when the container was asked for.
+    #
+    # Reached automatically it means the same thing as KLEE not being installed: this
+    # machine cannot do symbolic exploration. That is a skip and exit 0 -- an absent
+    # optional tool must never fail a build. Forced with C2HLSC_KLEE_DOCKER=1 the user
+    # asked for the container specifically, so its failure is real and reported as such.
+
+    payload = {"mode": "docker", "image": image, "reason": reason, **extra}
+    if forced:
+        write_report({"status": "fail", **payload})
+        print(f"KLEE container run failed: {reason}", file=sys.stderr)
+        return 1
+    write_report({"status": "skipped", "remedy": DOCTOR, **payload})
+    print(f"KLEE coverage skipped: container unavailable ({reason}) -- {DOCTOR}")
+    return 0
 
 
 CONTAINER_SCRIPT = r'''
@@ -967,7 +1002,7 @@ klee --output-dir=coverage/klee-out coverage/klee_driver.bc
 '''
 
 
-def run_in_docker(timeout_s: int) -> int:
+def run_in_docker(timeout_s: int, forced: bool) -> int:
     image = os.environ.get("C2HLSC_KLEE_IMAGE", DEFAULT_IMAGE)
     klee_out = COVERAGE_DIR / "klee-out"
     if klee_out.exists():
@@ -985,18 +1020,12 @@ def run_in_docker(timeout_s: int) -> int:
     try:
         result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True, timeout=timeout_s)
     except subprocess.TimeoutExpired as exc:
-        write_report({
-            "status": "fail",
-            "mode": "docker",
-            "image": image,
-            "reason": "timeout",
-            "timeout_s": timeout_s,
-            "stdout": (exc.stdout or "")[-4000:] if isinstance(exc.stdout, str) else "",
-        })
-        return 1
+        return _container_failed(
+            image, forced, "timeout",
+            {"timeout_s": timeout_s, "stdout": (exc.stdout or "")[-4000:] if isinstance(exc.stdout, str) else ""},
+        )
     except (OSError, subprocess.SubprocessError) as exc:
-        write_report({"status": "fail", "mode": "docker", "image": image, "reason": str(exc)})
-        return 1
+        return _container_failed(image, forced, str(exc), {})
 
     logs.append({
         "cmd": command[:-1] + ["<script>"],
@@ -1004,10 +1033,14 @@ def run_in_docker(timeout_s: int) -> int:
         "stdout": result.stdout[-8000:],
         "stderr": result.stderr[-8000:],
     })
+    if result.returncode != 0:
+        return _container_failed(
+            image, forced, f"container exited {result.returncode}",
+            {"commands": logs},
+        )
     ktests = sorted(str(path.relative_to(ROOT)) for path in klee_out.glob("*.ktest")) if klee_out.exists() else []
-    status = "pass" if result.returncode == 0 else "fail"
     write_report({
-        "status": status,
+        "status": "pass",
         "mode": "docker",
         "image": image,
         "policy_id": "hls_leveri_shift_left_v1",
@@ -1016,7 +1049,7 @@ def run_in_docker(timeout_s: int) -> int:
         "ktest_files": ktests,
     })
     print(f"KLEE ({image}) report written to {REPORT_PATH}")
-    return result.returncode
+    return 0
 
 
 def main() -> int:
@@ -1031,7 +1064,7 @@ def main() -> int:
     if forced == "1" or (not native_ready and forced != "0"):
         ok, reason = docker_available()
         if ok:
-            return run_in_docker(timeout_s)
+            return run_in_docker(timeout_s, forced == "1")
         if forced == "1":
             write_report({"status": "skipped", "mode": "docker", "reason": reason, "remedy": DOCTOR})
             print(f"KLEE coverage skipped: {reason}")
