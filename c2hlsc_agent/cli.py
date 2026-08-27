@@ -15,7 +15,14 @@ from .components import (
     render_components_markdown,
     workflow_stages,
 )
-from .config import AgentConfig, load_config, merge_cli_config
+from .config import (
+    STIMULUS_CONTRACT_PATH,
+    AgentConfig,
+    apply_stimulus_contract,
+    load_config,
+    merge_cli_config,
+    read_stimulus_contract,
+)
 from .convert import ReferenceGenerationError, generate_hls_sources, generate_reference_c
 from .equivalence import VerificationState
 from .hlsc_repair_agent import clear_repair_audit, repair_project
@@ -902,7 +909,24 @@ def run_refine(args: argparse.Namespace) -> int:
     from .coverage_refine import RefinementError, refine_project
 
     project_dir = Path(args.project).expanduser().resolve()
-    config = merge_cli_config(load_config(Path(args.config).resolve() if args.config else None), args)
+    if args.config:
+        base = load_config(Path(args.config).resolve())
+    else:
+        # Refinement regenerates the testbenches in place, so it needs the stimulus the
+        # project was built with. Recovering it from the project keeps --config optional
+        # without silently drawing arguments outside their declared ranges.
+        base = AgentConfig()
+        contract = read_stimulus_contract(project_dir)
+        if contract is None:
+            print(
+                f"warning: {project_dir / STIMULUS_CONTRACT_PATH} is missing, so argument "
+                "ranges and lengths cannot be recovered; pass --config to regenerate the "
+                "same stimulus this project was built with",
+                file=sys.stderr,
+            )
+        else:
+            apply_stimulus_contract(base, contract)
+    config = merge_cli_config(base, args)
     if not config.input_files:
         config.input_files = [(project_dir / "input.c").resolve()]
     if not config.input_files[0].exists():

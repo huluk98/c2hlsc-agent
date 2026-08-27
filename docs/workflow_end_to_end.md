@@ -255,7 +255,7 @@ alongside the generator's sources:
 | `input.c` | A copy of the golden oracle. **Never modified by any component.** |
 | `src/hls_top.hpp` / `src/hls_top.cpp` | The generated design |
 | `tb/testbench.cpp` | **The oracle harness.** Includes `../input.c` inside `extern "C"` with the top macro-renamed to `<top>_ref`, drives golden and HLS sides with identical seeded stimuli, compares with a relative float tolerance (1e-6), and prints mismatches in the exact format `parse_mismatches` reads |
-| `tb/leveri_golden_tb.cpp`, `tb/leveri_hls_tb.cpp`, `tb/leveri_compare.py`, `tb/leveri_manifest.json` | HLS-LeVeri paired-trace tier: both sides write per-cycle CSV traces; the comparator does a static check (header, roles, cycle count, identical stimulus columns) and a dynamic output check |
+| `tb/leveri_golden_tb.cpp`, `tb/leveri_hls_tb.cpp`, `tb/leveri_compare.py`, `tb/leveri_manifest.json`, `tb/stimulus_contract.json` | HLS-LeVeri paired-trace tier: both sides write per-cycle CSV traces; the comparator does a static check (header, roles, cycle count, identical stimulus columns) and a dynamic output check |
 | `tb/run_gcov.py`, `tb/klee_driver.cpp`, `tb/run_klee.py` | Coverage hooks; both skip gracefully when the tools are absent |
 | `tb/rtl_vectors_tb.cpp`, `tb/gen_rtl_tb.py`, `tb/run_rtl_sim.py`, `tb/rtl_tb_manifest.json` | Standalone RTL tier: golden vectors from the original C, a self-checking SystemVerilog testbench reconciled against the synthesized RTL's real ports, and a simulator runner |
 | `run_hls.tcl` | The whole ladder in one script |

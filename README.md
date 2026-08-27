@@ -453,6 +453,8 @@ For every generated project, AUTO RTL now writes:
 - `tb/klee_driver.cpp`: symbolic KLEE driver for the golden C top function
 - `tb/run_klee.py`: optional KLEE runner that writes a skip report if KLEE is absent
 - `tb/leveri_manifest.json`: records KG-ready metadata for the testbench bundle
+- `tb/stimulus_contract.json`: the argument metadata, test count and seed the project was
+  built with, so `refine` can regenerate the same stimulus without `--config`
 
 Run the paired trace check with:
 
@@ -922,7 +924,7 @@ For each conversion, the output directory contains:
 - `src/hls_top.cpp`
 - `tb/testbench.cpp`
 - `tb/leveri_golden_tb.cpp`, `tb/leveri_hls_tb.cpp`, `tb/leveri_compare.py`,
-  `tb/run_gcov.py`, `tb/klee_driver.cpp`, `tb/run_klee.py`, `tb/leveri_manifest.json`
+  `tb/run_gcov.py`, `tb/klee_driver.cpp`, `tb/run_klee.py`, `tb/leveri_manifest.json`, `tb/stimulus_contract.json`
   (the HLS-LeVeri shift-left verification bundle)
 - `tb/rtl_vectors_tb.cpp`, `tb/gen_rtl_tb.py`, `tb/run_rtl_sim.py`,
   `tb/rtl_tb_manifest.json` (the standalone RTL/Verilog testbench bundle)

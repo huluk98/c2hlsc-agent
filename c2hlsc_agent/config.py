@@ -57,6 +57,69 @@ class AgentConfig:
     vitis_bin: str = "vitis_hls"
 
 
+STIMULUS_CONTRACT_PATH = "tb/stimulus_contract.json"
+
+
+def stimulus_contract(config: AgentConfig) -> dict[str, Any]:
+    """The subset of the config that decides what the testbenches stimulate.
+
+    Written into every generated project so that regenerating it in place -- which is what
+    a coverage-refinement round does -- rebuilds the *same* stimulus. Losing an argument's
+    declared range is not merely a different set of tests: a scalar used as a loop bound
+    would then be drawn unconstrained, and the golden testbench reads out of bounds.
+    """
+
+    return {
+        "top": config.top,
+        "num_tests": config.num_tests,
+        "seed": config.seed,
+        "interface_mode": config.interface_mode,
+        "directed_tests": list(config.directed_tests),
+        "arguments": {
+            name: {
+                "direction": argument.direction,
+                "length": argument.length,
+                "range": list(argument.range) if argument.range else None,
+                "interface": argument.interface,
+            }
+            for name, argument in config.arguments.items()
+        },
+    }
+
+
+def read_stimulus_contract(project_dir: Path) -> dict[str, Any] | None:
+    """Load a project's persisted stimulus contract, or ``None`` if it predates one."""
+
+    path = project_dir / STIMULUS_CONTRACT_PATH
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def apply_stimulus_contract(config: AgentConfig, data: dict[str, Any]) -> AgentConfig:
+    """Restore the stimulus fields of ``config`` from a persisted contract, in place."""
+
+    if data.get("top"):
+        config.top = str(data["top"])
+    if data.get("num_tests") is not None:
+        config.num_tests = int(data["num_tests"])
+    if data.get("seed") is not None:
+        config.seed = int(data["seed"])
+    if data.get("interface_mode"):
+        config.interface_mode = str(data["interface_mode"])
+    directed = data.get("directed_tests")
+    if isinstance(directed, list):
+        config.directed_tests = [str(item) for item in directed]
+    arguments = data.get("arguments")
+    if isinstance(arguments, dict):
+        config.arguments = {name: _argument_config(value) for name, value in arguments.items()}
+    return config
+
+
 def _parse_scalar(value: str) -> Any:
     value = value.strip()
     if value == "":

@@ -908,9 +908,21 @@ DEFAULT_IMAGE = "klee/klee:latest"
 DOCTOR = "c2hlsc-agent doctor --install"
 
 
+def as_text(value: object) -> str:
+    # Captured output as text. TimeoutExpired carries whatever the pipes held when the
+    # deadline passed, and that is *undecoded bytes* even for a text-mode subprocess.run:
+    # the decode only happens on the normal return path. Writing it straight to JSON
+    # raises, which would lose the very report that explains the timeout.
+    if isinstance(value, bytes):
+        return value.decode("utf-8", "replace")
+    return value if isinstance(value, str) else ""
+
+
 def write_report(payload: dict) -> None:
     COVERAGE_DIR.mkdir(exist_ok=True)
-    REPORT_PATH.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    # default=str so that no unexpected value can stop the report from being written: a
+    # missing report reads as "the tool never ran", which is a different claim entirely.
+    REPORT_PATH.write_text(json.dumps(payload, indent=2, default=str) + "\n", encoding="utf-8")
 
 
 def resolve_tool(env_name: str, *candidate_names: str) -> str | None:
@@ -1045,7 +1057,7 @@ def run_in_docker(timeout_s: int, forced: bool) -> int:
     except subprocess.TimeoutExpired as exc:
         return _container_failed(
             image, forced, "timeout",
-            {"timeout_s": timeout_s, "stdout": (exc.stdout or "")[-4000:] if isinstance(exc.stdout, str) else ""},
+            {"timeout_s": timeout_s, "stdout": as_text(exc.stdout)[-4000:], "stderr": as_text(exc.stderr)[-4000:]},
         )
     except (OSError, subprocess.SubprocessError) as exc:
         return _container_failed(image, forced, str(exc), {})
@@ -1167,11 +1179,11 @@ def main() -> int:
         print(f"KLEE report written to {REPORT_PATH}")
         return executed.returncode
     except subprocess.TimeoutExpired as exc:
-        logs.append({"cmd": exc.cmd, "timeout_s": timeout_s, "stdout": (exc.stdout or "")[-4000:], "stderr": (exc.stderr or "")[-4000:]})
+        logs.append({"cmd": exc.cmd, "timeout_s": timeout_s, "stdout": as_text(exc.stdout)[-4000:], "stderr": as_text(exc.stderr)[-4000:]})
         write_report({"status": "fail", "mode": "native", "reason": "timeout", "commands": logs})
         return 1
     except subprocess.CalledProcessError as exc:
-        logs.append({"cmd": exc.cmd, "returncode": exc.returncode, "stdout": (exc.stdout or "")[-4000:], "stderr": (exc.stderr or "")[-4000:]})
+        logs.append({"cmd": exc.cmd, "returncode": exc.returncode, "stdout": as_text(exc.stdout)[-4000:], "stderr": as_text(exc.stderr)[-4000:]})
         write_report({"status": "fail", "mode": "native", "reason": "compile_failed", "commands": logs})
         return exc.returncode or 1
 

@@ -16,7 +16,13 @@ from unittest import mock
 
 from c2hlsc_agent.agent_loop import classify_failure, classify_log_family
 from c2hlsc_agent.analyze import analyze_source
-from c2hlsc_agent.config import AgentConfig, ArgumentConfig
+from c2hlsc_agent.config import (
+    STIMULUS_CONTRACT_PATH,
+    AgentConfig,
+    ArgumentConfig,
+    apply_stimulus_contract,
+    read_stimulus_contract,
+)
 from c2hlsc_agent.convert import generate_hls_sources
 from c2hlsc_agent.coverage_refine import (
     RefinementError,
@@ -875,6 +881,179 @@ class ToolchainTests(unittest.TestCase):
         ):
             results = toolchain.install([absent])
         self.assertEqual(results[0]["status"], "failed")
+
+
+class StimulusContractTests(unittest.TestCase):
+    """A generated project must describe the stimulus it was built with.
+
+    Coverage refinement regenerates the testbenches in place. If the argument metadata is
+    not recoverable from the project itself, a scalar declared as a loop bound is redrawn
+    unconstrained and the golden testbench reads past the end of its arrays.
+    """
+
+    def _guarded(self, tmp: Path):
+        return _project(
+            tmp,
+            UNREACHABLE_BRANCH,
+            "picky",
+            {"a": ArgumentConfig(direction="input", length=8), "n": ArgumentConfig(range=(0, 8))},
+            num_tests=4,
+            seed=7,
+        )
+
+    def test_write_project_records_the_declared_argument_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project, _, config = self._guarded(Path(tmp))
+            contract = json.loads(
+                (project / STIMULUS_CONTRACT_PATH).read_text(encoding="utf-8")
+            )
+            self.assertEqual(contract["top"], "picky")
+            self.assertEqual(contract["num_tests"], config.num_tests)
+            self.assertEqual(contract["seed"], config.seed)
+            self.assertEqual(contract["arguments"]["n"]["range"], [0, 8])
+            self.assertEqual(contract["arguments"]["a"]["length"], 8)
+            self.assertEqual(contract["arguments"]["a"]["direction"], "input")
+
+    def test_the_contract_round_trips_into_a_bare_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project, _, config = self._guarded(Path(tmp))
+            recovered = apply_stimulus_contract(
+                AgentConfig(), read_stimulus_contract(project)
+            )
+            self.assertEqual(recovered.top, config.top)
+            self.assertEqual(recovered.num_tests, config.num_tests)
+            self.assertEqual(recovered.seed, config.seed)
+            self.assertEqual(recovered.interface_mode, config.interface_mode)
+            self.assertEqual(recovered.directed_tests, config.directed_tests)
+            self.assertEqual(recovered.arguments["n"].range, (0, 8))
+            self.assertEqual(recovered.arguments["a"].length, 8)
+
+    def test_regenerating_from_the_contract_keeps_bounded_arguments_bounded(self) -> None:
+        """The bug this pins: without the contract, ``n`` was drawn over all of int."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            project, analysis, _ = self._guarded(Path(tmp))
+            golden = project / "tb" / "leveri_golden_tb.cpp"
+            self.assertIn("n = bounded_scalar<", golden.read_text(encoding="utf-8"))
+
+            # Exactly what `refine --project X` does with no --config: nothing but the
+            # project on disk.
+            recovered = apply_stimulus_contract(AgentConfig(), read_stimulus_contract(project))
+            recovered.input_files = [project / "input.c"]
+            regenerate(project, analysis, recovered)
+
+            regenerated = golden.read_text(encoding="utf-8")
+            self.assertIn("n = bounded_scalar<", regenerated)
+            self.assertNotIn("n = random_value<", regenerated)
+
+    def test_missing_contract_is_reported_rather_than_guessed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertIsNone(read_stimulus_contract(Path(tmp)))
+
+    def test_a_corrupt_contract_reads_as_absent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            (project / "tb").mkdir()
+            (project / STIMULUS_CONTRACT_PATH).write_text("{not json", encoding="utf-8")
+            self.assertIsNone(read_stimulus_contract(project))
+
+
+class GoldenSourcePreservationTests(unittest.TestCase):
+    def test_regenerating_in_place_does_not_copy_input_c_onto_itself(self) -> None:
+        """``refine`` defaults --input to PROJECT/input.c, which used to raise SameFileError."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "input.c"
+            path.write_text(UNREACHABLE_BRANCH, encoding="utf-8")
+            config = AgentConfig(
+                top="picky",
+                input_files=[path],
+                arguments={"a": ArgumentConfig(direction="input", length=8), "n": ArgumentConfig(range=(0, 8))},
+                num_tests=4,
+            )
+            analysis = analyze_source(path, "picky", config)
+            project = Path(tmp) / "project"
+            write_project(project, analysis, generate_hls_sources(analysis, config), config)
+
+            golden = project / "input.c"
+            before = golden.read_bytes()
+            # Re-analyze from the project copy, the way the CLI does.
+            in_place = analyze_source(golden, "picky", config)
+            regenerate(project, in_place, config)
+            self.assertEqual(golden.read_bytes(), before)
+
+
+class KleeReportDurabilityTests(unittest.TestCase):
+    """A KLEE report must be written for every outcome, timeouts included.
+
+    ``TimeoutExpired`` carries undecoded bytes even from a text-mode ``subprocess.run``.
+    Those bytes used to reach ``json.dumps`` and raise, so a timed-out KLEE run produced a
+    traceback and no report at all -- indistinguishable, downstream, from never running.
+    """
+
+    def _run_klee_module(self, tmp: Path):
+        project, _, _ = _project(
+            tmp,
+            VECTOR_ADD,
+            "vector_add",
+            {
+                "a": ArgumentConfig(direction="input", length=4),
+                "b": ArgumentConfig(direction="input", length=4),
+                "out": ArgumentConfig(direction="output", length=4),
+                "n": ArgumentConfig(range=(0, 4)),
+            },
+            num_tests=4,
+        )
+        return project, _load_generated_module(project, "tb/run_klee.py", "run_klee_timeout_under_test")
+
+    def test_as_text_decodes_the_bytes_a_timeout_hands_back(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _, module = self._run_klee_module(Path(tmp))
+            self.assertEqual(module.as_text(b"KLEE: done\xff"), "KLEE: done�")
+            self.assertEqual(module.as_text("already text"), "already text")
+            self.assertEqual(module.as_text(None), "")
+
+    def test_write_report_never_fails_on_an_unexpected_value(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project, module = self._run_klee_module(Path(tmp))
+            module.write_report({"status": "fail", "cmd": Path("/usr/bin/klee"), "raw": b"\x00"})
+            written = json.loads((project / "coverage" / "klee_report.json").read_text(encoding="utf-8"))
+            self.assertEqual(written["status"], "fail")
+
+    def test_a_timed_out_klee_run_reports_fail_rather_than_crashing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project, module = self._run_klee_module(Path(tmp))
+            include_dir = Path(tmp) / "klee-include"
+            include_dir.mkdir()
+
+            def fake_resolve(env_name, *names):
+                return {"KLEE": "klee", "KLEE_CXX": "clang++"}.get(env_name)
+
+            class _Completed:
+                returncode = 0
+                stdout = ""
+                stderr = ""
+
+            def fake_run(command, *args, **kwargs):
+                if command and str(command[0]).endswith("klee"):
+                    raise subprocess.TimeoutExpired(
+                        cmd=list(command), timeout=60, output=b"KLEE: partial\xff", stderr=b"boom\xfe"
+                    )
+                return _Completed()
+
+            env = {"KLEE_INCLUDE_DIR": str(include_dir), "C2HLSC_KLEE_TIMEOUT": "60"}
+            with mock.patch.object(module, "resolve_tool", side_effect=fake_resolve):
+                with mock.patch.object(module.subprocess, "run", side_effect=fake_run):
+                    with mock.patch.dict(module.os.environ, env, clear=False):
+                        rc = module.main()
+
+            self.assertEqual(rc, 1)
+            report = json.loads((project / "coverage" / "klee_report.json").read_text(encoding="utf-8"))
+            self.assertEqual(report["status"], "fail")
+            self.assertEqual(report["mode"], "native")
+            self.assertEqual(report["reason"], "timeout")
+            self.assertIn("KLEE: partial", report["commands"][-1]["stdout"])
+            self.assertIn("boom", report["commands"][-1]["stderr"])
 
 
 if __name__ == "__main__":

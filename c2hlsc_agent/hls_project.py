@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .analyze import AnalysisResult
-from .config import AgentConfig
+from .config import AgentConfig, stimulus_contract
 from .convert import GeneratedSource
 from .leveri_testgen import generate_leveri_testbenches
 from .testgen import generate_testbench
@@ -354,7 +354,13 @@ def write_project(out_dir: Path, analysis: AnalysisResult, generated: GeneratedS
     (out_dir / "tb").mkdir(exist_ok=True)
     leveri_bundle = generate_leveri_testbenches(analysis, config)
     verilog_bundle = generate_verilog_testbenches(analysis, config)
-    shutil.copyfile(analysis.function.source_path, out_dir / "input.c")
+    golden = out_dir / "input.c"
+    source = Path(analysis.function.source_path)
+    if not (golden.exists() and source.exists() and source.samefile(golden)):
+        # Re-emitting a project in place (refinement) reads the golden C from the project
+        # itself; copying it onto itself is both an error and a needless rewrite of the
+        # one file that must stay byte-identical.
+        shutil.copyfile(source, golden)
     files = [
         out_dir / "input.c",
         out_dir / "src" / "hls_top.hpp",
@@ -367,6 +373,7 @@ def write_project(out_dir: Path, analysis: AnalysisResult, generated: GeneratedS
         out_dir / "tb" / "klee_driver.cpp",
         out_dir / "tb" / "run_klee.py",
         out_dir / "tb" / "leveri_manifest.json",
+        out_dir / "tb" / "stimulus_contract.json",
         out_dir / "tb" / "rtl_vectors_tb.cpp",
         out_dir / "tb" / "gen_rtl_tb.py",
         out_dir / "tb" / "run_rtl_sim.py",
@@ -390,6 +397,11 @@ def write_project(out_dir: Path, analysis: AnalysisResult, generated: GeneratedS
     (out_dir / "tb" / "klee_driver.cpp").write_text(leveri_bundle.klee_driver, encoding="utf-8")
     (out_dir / "tb" / "run_klee.py").write_text(leveri_bundle.klee_script, encoding="utf-8")
     (out_dir / "tb" / "leveri_manifest.json").write_text(leveri_bundle.manifest_json, encoding="utf-8")
+    # Makes the project self-describing: a later in-place regeneration can rebuild the
+    # same stimulus without being handed the original config file again.
+    (out_dir / "tb" / "stimulus_contract.json").write_text(
+        json.dumps(stimulus_contract(config), indent=2) + "\n", encoding="utf-8"
+    )
     (out_dir / "tb" / "rtl_vectors_tb.cpp").write_text(verilog_bundle.vectors_tb, encoding="utf-8")
     (out_dir / "tb" / "gen_rtl_tb.py").write_text(verilog_bundle.gen_script, encoding="utf-8")
     (out_dir / "tb" / "run_rtl_sim.py").write_text(verilog_bundle.run_script, encoding="utf-8")

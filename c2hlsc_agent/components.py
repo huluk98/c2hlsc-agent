@@ -419,6 +419,7 @@ class ShiftLeftTestbenchAgent:
             "tb/klee_driver.cpp",
             "tb/run_klee.py",
             "tb/leveri_manifest.json",
+            "tb/stimulus_contract.json",
             "tb/rtl_vectors_tb.cpp",
             "tb/gen_rtl_tb.py",
             "tb/run_rtl_sim.py",
