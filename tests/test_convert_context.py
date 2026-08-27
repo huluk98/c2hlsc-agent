@@ -7,7 +7,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from c2hlsc_agent.analyze import analyze_source
 from c2hlsc_agent.config import AgentConfig, ArgumentConfig
-from c2hlsc_agent.convert import generate_hls_sources
+from c2hlsc_agent.convert import _header_signature, generate_hls_sources
 
 
 SOURCE = """
@@ -71,6 +71,24 @@ class CarriedFileScopeTests(unittest.TestCase):
         generated = self._generate()
         prologue = generated.source.split("namespace {", 1)[0]
         self.assertIn("#include <stdint.h>", prologue)
+
+
+    def test_header_drops_array_bounds_it_cannot_resolve(self):
+        # Regression: a bound naming a file-scope constant reached the generated unit
+        # but not the header, which precedes the namespace holding that constant. The
+        # outermost bound decays to a pointer, so dropping it keeps the declaration
+        # compatible with the definition.
+        from pathlib import Path as _Path
+
+        from c2hlsc_agent.analyze import FunctionInfo, _parse_arg
+
+        args = [_parse_arg("int a[SIZE]"), _parse_arg("int b[16]"), _parse_arg("int n")]
+        fn = FunctionInfo("f", "void", args, "", "", "", _Path("input.c"))
+        signature = _header_signature(fn)
+        self.assertIn("int a[]", signature)
+        self.assertIn("int b[16]", signature)
+        self.assertIn("int n", signature)
+
 
 
 if __name__ == "__main__":

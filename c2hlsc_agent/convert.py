@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-from .analyze import AnalysisResult, FunctionArg, FunctionInfo
+from .analyze import AnalysisResult, FunctionArg, FunctionInfo, _constant_dim
 from .config import AgentConfig
 from .hlsc_generator import HLSC_GENERATOR_PROMPT_ID, HLSC_GENERATOR_SYSTEM_PROMPT
 from .llm import (
@@ -99,6 +99,28 @@ def _signature_typedefs(context: str) -> str:
     return "\n".join(dict.fromkeys(found))
 
 
+def _header_signature(function: FunctionInfo) -> str:
+    """The top's declaration with a non-literal outermost array bound dropped.
+
+    A parameter's outermost array bound decays to a pointer and is not part of its
+    type, so ``T a[]`` still matches a definition written ``T a[SIZE]``. Dropping it
+    keeps the header from depending on a constant it cannot see: the constant lives
+    in the generated unit's anonymous namespace, which the header precedes.
+    """
+
+    params = []
+    for arg in function.args:
+        params.append(
+            re.sub(
+                r"\[([^\]]*)\]",
+                lambda m: "[]" if m.group(1).strip() and _constant_dim(m.group(1)) is None else m.group(0),
+                arg.raw,
+                count=1,
+            )
+        )
+    return f"{function.return_type} {function.name}({', '.join(params)})"
+
+
 def _generate_conservative_sources(analysis: AnalysisResult, config: AgentConfig) -> GeneratedSource:
     function = analysis.function
     pragma_lines, pragma_rows = _pragma_lines(config, function.args)
@@ -130,7 +152,7 @@ def _generate_conservative_sources(analysis: AnalysisResult, config: AgentConfig
 {_include_for_types(function.args, function.return_type)}
 {carried_typedefs}
 
-{function.signature};
+{_header_signature(function)};
 
 #endif
 """

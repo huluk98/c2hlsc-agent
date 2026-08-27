@@ -1,0 +1,235 @@
+# Memory slate: the settled record for this project.
+#
+# This file is the authority when the prose docs disagree with each other or with
+# the code. Prose describes intent; entries here describe what was decided and what
+# was measured, each pinned to a commit and to something that can be re-run.
+#
+# Three kinds of entry:
+#   decisions  - a question that was put to a human and answered. Only a human
+#                closes one of these.
+#   evidence   - a claim about the system that was actually verified, with the
+#                means to verify it again. `scripts/replay_slate.py` re-runs these.
+#   frontier   - questions still open. An empty frontier means the design tree has
+#                been walked; it is rarely empty for long.
+#
+# Adding an entry: append, never rewrite. A decision that gets reversed becomes a
+# new decision that supersedes the old one by id, so the path stays legible.
+
+version: 1
+
+decisions:
+  - id: D001
+    question: >-
+      How should this repository be positioned relative to arXiv 2606.28409,
+      which uses the same four-stage verifier-closed ladder and reports 87.85%
+      all-pass on 107 designs?
+    answer: >-
+      The paper is a labmate's work carrying this user's name. Positioning is
+      therefore disclosure, not differentiation: cite it prominently and frame
+      this repository as the group's open artifact rather than as a novel
+      contribution.
+    decided_by: human
+    decided_on: 2026-08-27
+    supersedes: null
+    forecloses: >-
+      Presenting the four-stage ladder, PMLC localization, or the repair-card RAG
+      as new contributions of this repository.
+
+  - id: D002
+    question: >-
+      Should the correctness defects in the equivalence oracle be fixed before any
+      evaluation work is run?
+    answer: >-
+      Yes. Both defects corrupt any number the agent would produce, so measuring
+      first would mean measuring again.
+    decided_by: human
+    decided_on: 2026-08-27
+    supersedes: null
+    evidence: [E001, E002]
+
+  - id: D003
+    question: >-
+      What becomes of the 10,003-record natural-language corpus, whose default
+      testbench asserts nothing and which ships no golden C?
+    answer: >-
+      It is not a correctness benchmark and will not be used to support
+      correctness claims. It becomes the substrate for a knowledge base.
+    decided_by: human
+    decided_on: 2026-08-27
+    supersedes: null
+    forecloses: >-
+      Reporting any pass rate over this corpus as evidence of equivalence.
+    opens: [Q004]
+
+  - id: D004
+    question: >-
+      Should the generator's dropped-context defect be fixed, given it is the
+      largest single blocker to running an existing benchmark suite unmodified?
+    answer: >-
+      Yes, together with the stimulus-bounds defects that make its failures
+      present as segfaults rather than diagnostics.
+    decided_by: human
+    decided_on: 2026-08-27
+    supersedes: null
+    evidence: [E003, E004]
+
+evidence:
+  - id: E001
+    claim: >-
+      Pointer direction inference classified an output written through a local
+      alias or a helper as an input, which excluded it from the equivalence
+      comparison. A design that ignored its inputs and wrote a constant passed
+      every test.
+    verified_by: test
+    test: tests/test_analyze.py::AnalyzeTests::test_output_written_through_alias_is_still_compared
+    fixed_in: ffad5a6
+    note: >-
+      Confirmed end to end before the fix by sabotaging a converted design to
+      write a constant and observing 100/100 tests still pass.
+
+  - id: E002
+    claim: >-
+      final_status judged a run by diagnostics on the *input* C, so source that
+      was successfully transformed and passed equivalence still reported failure.
+      That is the tool's central use case.
+    verified_by: test
+    test: tests/test_analyze.py::AnalyzeTests::test_generated_output_is_rescanned_independently_of_the_input
+    fixed_in: ffad5a6
+
+  - id: E003
+    claim: >-
+      The conservative generator emitted only the top function body, so macros,
+      typedefs, constant tables and helper functions defined at file scope never
+      reached the generated translation unit and it failed to compile.
+    verified_by: test
+    test: tests/test_convert_context.py
+    fixed_in: 663addd
+
+  - id: E004
+    claim: >-
+      An integer scalar with no configured range was generated as a full-range
+      random value. Used as a loop bound over a fixed-size array argument it ran
+      off the end, and the segfault surfaced only as a make failure with no
+      diagnostic.
+    verified_by: test
+    test: tests/test_analyze.py::AnalyzeTests::test_unranged_scalar_is_clamped_to_the_shortest_array
+    fixed_in: 663addd
+
+  - id: E005
+    claim: >-
+      Across the 104 usable HLS-Eval designs, 13 reached host-side golden-vs-HLS
+      equivalence on the conservative (non-LLM) path with no human adaptation.
+      This is the pre-fix baseline.
+    verified_by: artifact
+    artifact: docs/memory/artifacts/sweep-baseline-pre-fix.json
+    measured_at: 663addd~2
+    method: >-
+      Per design, concatenate the header and implementation, macro-expand with
+      gcc -E -P, derive array lengths from declared dimensions, then run
+      `convert --no-llm --no-run-vitis --new-run` and record the report verdict.
+    caveat: >-
+      A floor, not a headline. Host-side equivalence on the conservative path
+      only; the LLM path and Vitis csim/cosim are not exercised.
+
+  - id: E006
+    claim: >-
+      Carrying the input's file scope and hoisting signature typedefs took the
+      HLS-Eval sweep from 13/104 to 38/104 designs reaching host-side
+      golden-vs-HLS equivalence on the conservative path. 25 designs gained, none
+      regressed.
+    verified_by: artifact
+    artifact: docs/memory/artifacts/sweep-after-fixes-preprocessed.json
+    measured_at: 776c745
+    baseline: docs/memory/artifacts/sweep-baseline-pre-fix.json
+    method: >-
+      Same harness as E005, archived at docs/memory/artifacts/sweep-harness.py,
+      run before and after the fixes on identical inputs.
+    breakdown: >-
+      20 of the gains are chstone designs unblocked by hoisting signature
+      typedefs (float64, flag, bits64, int8, int16); 4 are machsuite designs
+      unblocked by carrying helper functions and constant tables (merge, init,
+      CPF, twiddles8); 1 is pp4fpga, unblocked by dropping an unresolvable array
+      bound from the header declaration.
+    caveat: >-
+      Still a floor, and still the conservative path with no Vitis. The harness
+      pre-expands macros with gcc -E -P, so this number does not measure raw
+      source handling; see E007.
+
+  - id: E007
+    claim: >-
+      On raw source with macros, helpers and tables left intact -- no gcc -E -P
+      pre-expansion -- the same sweep reaches 24/104.
+    verified_by: artifact
+    artifact: docs/memory/artifacts/sweep-after-fixes-raw-source.json
+    measured_at: 776c745
+    caveat: >-
+      Not a like-for-like comparison with E006 and not an agent limit. The
+      harness derives each `length:` by evaluating the declared array bound, which
+      fails when the bound is a macro, so those designs are converted with the
+      default length of 16 while their bodies still index to the macro's value.
+      The header fix cleared all ten "X was not declared in this scope" failures
+      here, but the designs then fail equivalence for want of a correct bound. A
+      human-written config supplies that bound; the harness cannot.
+
+frontier:
+  - id: Q004
+    question: >-
+      What is the knowledge base keyed on, and what is allowed to enter it?
+    blocked_on: human
+    context: >-
+      agent_loop.py already names "retrieved repair cards" as a repair input and
+      audit_memory_agent claims to promote audited repair successes; neither has
+      any executing code behind it, and cli.py deletes the only audit file at the
+      start of every run. arXiv 2606.28409 has a family-routed evidence RAG, so
+      there is a design to align with rather than invent.
+    recommendation: >-
+      Key on failure family plus earliest failing stage, since that is the
+      retrieval context the repair prompt actually holds. Admit a card only after
+      the full ladder re-passes: an unverified repair in a knowledge base
+      launders a guess into an authority.
+
+  - id: Q006
+    question: >-
+      Does the knowledge base replace an evaluation, or precede one?
+    blocked_on: human
+    context: >-
+      Both compete for the same weeks. A knowledge base is a mechanism and still
+      needs a benchmark to show it helps. C2HLSC's repository is public with all
+      ten paper benchmarks plus 720 raw LLM baseline runs, so a published
+      comparison point is available without re-running their tool.
+    recommendation: >-
+      Precede it. Build the knowledge base, but plan the ablation now: pass rate
+      with and without retrieval over the same benchmark set. That ablation is
+      the paper; the mechanism alone is a feature with no evidence.
+
+  - id: Q008
+    question: >-
+      Should pointer direction inference understand a write spelled
+      ``(*p)[i][j] = ...`` or ``p->field = ...``?
+    blocked_on: human
+    context: >-
+      26 designs in the sweep are blocked by the no-observable-output error, and
+      the AES kernels show why: AddRoundKey writes `(*state)[i][j] ^= ...`, which
+      the write pattern does not match, so `state` is classified an input, nothing
+      is comparable, and the run is refused. The refusal is correct -- vacuous
+      verification is worse than none -- but the underlying inference is what is
+      wrong, and each such design is currently unevaluable rather than merely
+      unverified.
+    recommendation: >-
+      Add the deref-index and arrow forms to the write pattern. Beyond those two,
+      stop: regex alias analysis has a ceiling and the honest next step is a real
+      parser, which is a much larger decision than this one.
+
+  - id: Q009
+    question: >-
+      What should the agent do with a top function it cannot brace-match?
+    blocked_on: human
+    context: >-
+      Three designs (c2hlsc/des, machsuite/bfs_queue, machsuite/md_grid) crash
+      `convert` with an uncaught ValueError from _find_matching_brace rather than
+      producing a report. A traceback is not a diagnosis, and a crashed run leaves
+      no artifact for a human to act on.
+    recommendation: >-
+      Catch it at the analyze boundary and emit an error-severity diagnostic
+      naming the top and the offending offset, so the run fails with a report like
+      every other rejection.
