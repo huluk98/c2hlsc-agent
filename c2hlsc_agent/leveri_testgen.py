@@ -1271,8 +1271,46 @@ def _manifest(analysis: AnalysisResult, config: AgentConfig) -> str:
     return json.dumps(payload, indent=2) + "\n"
 
 
+#: Columns x rows above which the paired traces stop being a diagnostic artifact and
+#: start being a disk-exhaustion hazard. The tier writes one CSV column per array
+#: *element*, so a design with megabyte arrays produces gigabyte traces: knn declares
+#: 3,145,730 elements across its arguments, which at num_tests=100 is ~3.8 GB per side.
+TRACE_CELL_WARN_THRESHOLD = 5_000_000
+
+
+def projected_trace_cells(columns: list[dict[str, object]], num_tests: int) -> int:
+    """Total CSV cells each paired trace will contain."""
+
+    return max(len(columns) - 1, 0) * max(num_tests, 0)
+
+
+def _warn_if_trace_is_huge(analysis: AnalysisResult, config: AgentConfig) -> int:
+    """Record, and warn about, a paired trace large enough to be a hazard.
+
+    The tier's value is that both sides emit every stimulus and output column, which is
+    what makes the static alignment check meaningful. That does not scale: the columns
+    are per *element*, so real array bounds turn the traces into multi-gigabyte files
+    long before they turn into a useful diagnostic. Warning is deliberate -- silently
+    capping the columns would weaken the check without saying so, and this tier is the
+    reason the shift-left comparison exists.
+    """
+
+    cells = projected_trace_cells(_columns(analysis.function.args, analysis.function.return_type), config.num_tests)
+    if cells > TRACE_CELL_WARN_THRESHOLD:
+        analysis.diagnostics.add(
+            "warning",
+            "large-paired-trace",
+            f"each paired trace will hold about {cells:,} cells "
+            f"({config.num_tests} rows); expect multi-gigabyte CSVs and slow comparison",
+            analysis.function.source_path.name,
+            "Lower num_tests, or shrink the declared argument lengths, for a trace this wide.",
+        )
+    return cells
+
+
 def generate_leveri_testbenches(analysis: AnalysisResult, config: AgentConfig) -> LeVeriTestbenchBundle:
     fn = analysis.function
+    _warn_if_trace_is_huge(analysis, config)
     golden_include = f"""extern "C" {{
 // The golden C may carry its own main() -- benchmark sources usually do. The
 // testbench defines main, so rename the original's out of the way rather than

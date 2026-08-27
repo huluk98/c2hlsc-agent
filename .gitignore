@@ -31,3 +31,7 @@ run_ledger.jsonl
 # holder and the suite has no unified licence. See scripts/fetch_chstone.py.
 third_party/
 build/
+
+# Preserved benchmark reports (small JSON); the generated projects they came from are
+# build output and are not committed.
+build_reports/
