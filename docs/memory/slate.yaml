@@ -139,7 +139,7 @@ evidence:
       regressed.
     verified_by: artifact
     artifact: docs/memory/artifacts/sweep-after-fixes-preprocessed.json
-    measured_at: 776c745
+    measured_at: 350bfff
     baseline: docs/memory/artifacts/sweep-baseline-pre-fix.json
     method: >-
       Same harness as E005, archived at docs/memory/artifacts/sweep-harness.py,
@@ -161,7 +161,7 @@ evidence:
       pre-expansion -- the same sweep reaches 24/104.
     verified_by: artifact
     artifact: docs/memory/artifacts/sweep-after-fixes-raw-source.json
-    measured_at: 776c745
+    measured_at: 350bfff
     caveat: >-
       Not a like-for-like comparison with E006 and not an agent limit. The
       harness derives each `length:` by evaluating the declared array bound, which
