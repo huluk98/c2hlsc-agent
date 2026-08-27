@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -98,6 +99,51 @@ def _split_params(params: str) -> list[str]:
     return out
 
 
+def _constant_dim(dim: str) -> int | None:
+    """Fold a literal array bound such as ``64 * 64`` into its value.
+
+    Only literal arithmetic is folded. A bound naming a macro cannot be resolved from
+    here, because the parser sees one parameter at a time rather than the translation
+    unit; those fall through to the configured length instead.
+    """
+
+    text = re.sub(r"\b(\d+)[uUlL]+\b", r"\1", dim.strip())
+    if not text:
+        return None
+    try:
+        tree = ast.parse(text, mode="eval")
+    except SyntaxError:
+        return None
+
+    def fold(node: ast.AST) -> int | None:
+        if isinstance(node, ast.Expression):
+            return fold(node.body)
+        if isinstance(node, ast.Constant) and isinstance(node.value, int) and not isinstance(node.value, bool):
+            return node.value
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.UAdd):
+            return fold(node.operand)
+        if isinstance(node, ast.BinOp):
+            left = fold(node.left)
+            right = fold(node.right)
+            if left is None or right is None:
+                return None
+            if isinstance(node.op, ast.Add):
+                return left + right
+            if isinstance(node.op, ast.Sub):
+                return left - right
+            if isinstance(node.op, ast.Mult):
+                return left * right
+            if isinstance(node.op, (ast.Div, ast.FloorDiv)):
+                return left // right if right else None
+            if isinstance(node.op, ast.LShift):
+                return left << right if 0 <= right < 64 else None
+            return None
+        return None
+
+    value = fold(tree)
+    return value if value is not None and value > 0 else None
+
+
 def _parse_arg(raw: str, metadata: ArgumentConfig | None = None) -> FunctionArg:
     raw = raw.strip()
     # `restrict` is a C99 keyword that is not valid C++. Drop it from the parameter text
@@ -121,8 +167,9 @@ def _parse_arg(raw: str, metadata: ArgumentConfig | None = None) -> FunctionArg:
     length = metadata.length
     if length is None:
         for dim in array_dims:
-            if dim.strip().isdigit():
-                length = int(dim.strip())
+            folded = _constant_dim(dim)
+            if folded is not None:
+                length = folded
                 break
     return FunctionArg(
         raw=raw,
@@ -273,6 +320,15 @@ def _unsupported(function: FunctionInfo, full_source: str = "") -> list[Diagnost
     return diagnostics
 
 
+def _is_integer_scalar(c_type: str) -> bool:
+    tokens = set(c_type.replace("*", " ").split())
+    if tokens & {"float", "double"}:
+        return False
+    if tokens & {"int", "char", "short", "long", "unsigned", "signed", "size_t", "ssize_t", "bool"}:
+        return True
+    return bool(re.search(r"\bu?int\d+_t\b", c_type))
+
+
 def _has_observable_output(function: FunctionInfo) -> bool:
     """Report whether the testbench will have anything to compare.
 
@@ -342,6 +398,23 @@ def analyze_source(input_file: Path, top: str, config: AgentConfig) -> AnalysisR
                 f"argument {arg.name!r} has no configured bound; using conservative test length 16",
                 input_file.name,
                 "Set arguments.<name>.length in config.yaml.",
+            )
+    pointer_lengths = [arg.length for arg in function.args if arg.is_pointer_like and arg.length]
+    if pointer_lengths:
+        # An unranged integer scalar is generated as a full-range random value. Beside a
+        # fixed-size array argument that is a loop bound waiting to run off the end, and
+        # the resulting segfault surfaces only as a make failure with no diagnostic.
+        safe_bound = min(pointer_lengths)
+        for arg in function.args:
+            if arg.is_pointer_like or arg.scalar_range or not _is_integer_scalar(arg.c_type):
+                continue
+            arg.scalar_range = (0, safe_bound)
+            diagnostics.add(
+                "warning",
+                "unbounded-scalar-stimulus",
+                f"scalar {arg.name!r} has no configured range; clamping stimulus to [0, {safe_bound}] so it cannot index past the shortest array argument",
+                input_file.name,
+                "Set arguments.<name>.range in config.yaml to exercise the intended input space.",
             )
     unsupported = _unsupported(function, source)
     diagnostics.extend(unsupported)

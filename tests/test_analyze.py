@@ -249,6 +249,51 @@ class AnalyzeTests(unittest.TestCase):
         )
         self.assertEqual(unsupported_in_generated(clean, "k", cfg, "src/hls_top.cpp"), [])
 
+    def test_array_bound_expression_is_constant_folded(self):
+        # Regression: a bound like 64*64 failed isdigit(), so length fell back to the
+        # conservative default of 16 and the testbench indexed past its own buffers.
+        path = self._write(
+            """
+            void gemm(const double m1[64*64], const double m2[64*64], double prod[64*64]) {
+              for (int i = 0; i < 64*64; ++i) prod[i] = m1[i] + m2[i];
+            }
+            """
+        )
+        result = analyze_source(path, "gemm", AgentConfig(top="gemm"))
+        lengths = {arg.name: arg.length for arg in result.function.args}
+        self.assertEqual(lengths["m1"], 4096)
+        self.assertEqual(lengths["prod"], 4096)
+
+    def test_unranged_scalar_is_clamped_to_the_shortest_array(self):
+        # Regression: an unranged scalar was generated as a full-range random int. Used
+        # as a loop bound over a fixed-size array that segfaults the testbench, and the
+        # crash surfaced only as a make failure with no diagnostic.
+        path = self._write(
+            """
+            void k(const int x[64], int y[64], int n) {
+              for (int i = 0; i < n; ++i) y[i] = x[i] + 1;
+            }
+            """
+        )
+        result = analyze_source(path, "k", AgentConfig(top="k"))
+        ranges = {arg.name: arg.scalar_range for arg in result.function.args}
+        self.assertEqual(ranges["n"], (0, 64))
+        codes = {diag.code for diag in result.diagnostics.items}
+        self.assertIn("unbounded-scalar-stimulus", codes)
+
+    def test_configured_scalar_range_is_not_overridden(self):
+        path = self._write(
+            """
+            void k(const int x[64], int y[64], int n) {
+              for (int i = 0; i < n; ++i) y[i] = x[i] + 1;
+            }
+            """
+        )
+        cfg = AgentConfig(top="k", arguments={"n": ArgumentConfig(range=(0, 8))})
+        result = analyze_source(path, "k", cfg)
+        ranges = {arg.name: arg.scalar_range for arg in result.function.args}
+        self.assertEqual(ranges["n"], (0, 8))
+
     def test_pointer_arithmetic_and_stdlib_are_reported(self):
         path = self._write(
             """

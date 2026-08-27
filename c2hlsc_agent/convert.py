@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 
-from .analyze import AnalysisResult, FunctionArg
+from .analyze import AnalysisResult, FunctionArg, FunctionInfo
 from .config import AgentConfig
 from .hlsc_generator import HLSC_GENERATOR_PROMPT_ID, HLSC_GENERATOR_SYSTEM_PROMPT
 from .llm import (
@@ -55,16 +56,79 @@ def _pragma_lines(config: AgentConfig, args: list[FunctionArg]) -> tuple[list[st
     return lines, rows
 
 
+def _file_scope_context(source: str, function: FunctionInfo) -> tuple[str, str]:
+    """Split the input's file scope into ``#include`` lines and everything else.
+
+    The conservative generator emits only the top function body, so macros, typedefs,
+    constant tables and helper functions defined beside it never reach the generated
+    translation unit and it fails to compile. Includes have to stay at file scope; the
+    caller places the rest in an anonymous namespace, because the testbench compiles
+    the original input.c into the same program and external definitions would collide
+    with the copies pulled in for the golden oracle.
+    """
+
+    remainder = source.replace(function.definition, "", 1)
+    # A leftover prototype for the top would declare a second, never-defined function
+    # inside the anonymous namespace.
+    remainder = re.sub(
+        rf"^[^;{{}}\n]*\b{re.escape(function.name)}\s*\([^;{{}}]*\)\s*;[ \t]*$",
+        "",
+        remainder,
+        flags=re.M,
+    )
+    includes: list[str] = []
+    kept: list[str] = []
+    for line in remainder.splitlines():
+        if re.match(r"[ \t]*#[ \t]*include\b", line):
+            includes.append(line.strip())
+        else:
+            kept.append(line)
+    return "\n".join(dict.fromkeys(includes)), "\n".join(kept).strip()
+
+
+def _signature_typedefs(context: str) -> str:
+    """Type aliases from the input that the generated header's signature may need.
+
+    Only aliases of an existing type are carried. A struct, union or enum *definition*
+    would declare a distinct new type in the testbench translation unit, which already
+    has the original one from input.c; repeating an identical typedef is legal C++, so
+    those are safe. The brace exclusion in the pattern is what draws that line.
+    """
+
+    found = [m.group(0).strip() for m in re.finditer(r"^[ \t]*typedef[^;{}]*;", context, re.M)]
+    return "\n".join(dict.fromkeys(found))
+
+
 def _generate_conservative_sources(analysis: AnalysisResult, config: AgentConfig) -> GeneratedSource:
     function = analysis.function
     pragma_lines, pragma_rows = _pragma_lines(config, function.args)
     body = function.body.rstrip()
     if pragma_lines:
         body = "\n" + "\n".join(f"  {line}" for line in pragma_lines) + "\n" + body
+    try:
+        original = function.source_path.read_text(encoding="utf-8")
+    except OSError:
+        original = ""
+    carried_includes, carried_context = _file_scope_context(original, function) if original else ("", "")
+    carried_typedefs = _signature_typedefs(carried_context)
+    if carried_typedefs:
+        # Hoisted into the header for the signature's sake, so they must leave the
+        # anonymous namespace: two visible declarations of one alias are ambiguous.
+        carried_context = re.sub(r"^[ \t]*typedef[^;{}]*;[ \t]*$", "", carried_context, flags=re.M).strip()
+    context_block = ""
+    if carried_context:
+        context_block = (
+            "\n// Carried over from the original file scope: the macros, types, constant\n"
+            "// tables and helper functions the top function depends on. Internal linkage\n"
+            "// keeps them from colliding with the copies the testbench includes from\n"
+            "// input.c to build its golden oracle.\n"
+            "namespace {\n" + carried_context + "\n}  // namespace\n"
+        )
     header = f"""#ifndef C2HLSC_GENERATED_HLS_TOP_HPP
 #define C2HLSC_GENERATED_HLS_TOP_HPP
 
 {_include_for_types(function.args, function.return_type)}
+{carried_typedefs}
 
 {function.signature};
 
@@ -75,7 +139,8 @@ def _generate_conservative_sources(analysis: AnalysisResult, config: AgentConfig
 // a conservative, equivalence-preserving refactor is explicitly recorded.
 
 #include "hls_top.hpp"
-
+{carried_includes}
+{context_block}
 {function.return_type} {function.name}({', '.join(arg.raw for arg in function.args)}) {{
 {body}
 }}
@@ -86,7 +151,12 @@ def _generate_conservative_sources(analysis: AnalysisResult, config: AgentConfig
         transformations=[
             f"Applied {HLSC_GENERATOR_PROMPT_ID} as the HLS-C generator policy.",
             "Preserved original top-function body and signature for equivalence-first HLS baseline.",
-        ],
+        ]
+        + (
+            ["Carried the original file-scope macros, types and helpers into the generated unit."]
+            if carried_context
+            else []
+        ),
         interface_pragmas=pragma_rows,
     )
 
