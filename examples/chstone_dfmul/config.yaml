@@ -1,0 +1,8 @@
+# CHStone dfmul: IEEE-754 double multiply on raw 64-bit patterns.
+# The inputs are bit patterns, so full-range random stimulus is the intended
+# domain; the directed patterns (zeros/ones/minmax/alternating) cover the
+# denormal/NaN-adjacent corners first.
+top: dfmul_top
+input: input.c
+num_tests: 200
+seed: 1
