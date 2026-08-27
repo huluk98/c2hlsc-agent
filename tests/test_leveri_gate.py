@@ -255,6 +255,75 @@ class GoldenSmokeTests(unittest.TestCase):
             self.assertTrue((out / ".golden_smoke" / "leveri_golden_trace.csv").exists())
 
 
+class StructuredMismatchEvidenceTests(unittest.TestCase):
+    COMPARATOR_LINE = (
+        "HLS-LeVeri consistency check failed: behavior mismatch cycle=3 column=out[1] "
+        "expected=5 actual=6"
+    )
+
+    def test_parse_leveri_divergences_reads_both_kinds(self):
+        from c2hlsc_agent.equivalence import parse_leveri_divergences
+
+        text = (
+            self.COMPARATOR_LINE
+            + "\nHLS-LeVeri consistency check failed: stimulus mismatch cycle=2 column=a[0] golden=1 hls=9"
+        )
+        divergences = parse_leveri_divergences(text)
+        kinds = {d.kind for d in divergences}
+        self.assertEqual(kinds, {"behavior", "stimulus"})
+        behavior = next(d for d in divergences if d.kind == "behavior")
+        self.assertEqual((behavior.cycle, behavior.column, behavior.expected, behavior.actual), ("3", "out[1]", "5", "6"))
+
+    def test_repair_prompt_contains_structured_divergence_section(self):
+        from types import SimpleNamespace
+
+        from c2hlsc_agent.llm import build_repair_prompt
+
+        with tempfile.TemporaryDirectory() as tmp:
+            analysis, _cfg = _vector_add_setup(Path(tmp))
+        decision = SimpleNamespace(
+            family="leveri_trace_mismatch",
+            next_action="patch",
+            repair_scope="generated HLS-C only",
+        )
+        evidence = "tool banner\n" + self.COMPARATOR_LINE + "\nmore log"
+        _system, user = build_repair_prompt(
+            analysis, decision, "leveri_trace", evidence, "src/hls_top.cpp", "void vector_add() {}"
+        )
+        self.assertIn("Structured mismatch evidence", user)
+        self.assertIn("behavior divergence at cycle 3, column out[1]: expected=5 actual=6", user)
+        structured_at = user.index("Structured mismatch evidence")
+        tail_at = user.index("Earliest-failure evidence")
+        self.assertLess(structured_at, tail_at)
+
+    def test_repair_prompt_omits_the_section_without_mismatches(self):
+        from types import SimpleNamespace
+
+        from c2hlsc_agent.llm import build_repair_prompt
+
+        with tempfile.TemporaryDirectory() as tmp:
+            analysis, _cfg = _vector_add_setup(Path(tmp))
+        decision = SimpleNamespace(family="synthesis_failure", next_action="patch", repair_scope="hls")
+        _system, user = build_repair_prompt(
+            analysis, decision, "csynth", "ERROR: [SYNCHK 200-11] boom", "src/hls_top.cpp", "void vector_add() {}"
+        )
+        self.assertNotIn("Structured mismatch evidence", user)
+
+    def test_host_mismatch_lines_are_structured_too(self):
+        from types import SimpleNamespace
+
+        from c2hlsc_agent.llm import build_repair_prompt
+
+        with tempfile.TemporaryDirectory() as tmp:
+            analysis, _cfg = _vector_add_setup(Path(tmp))
+        decision = SimpleNamespace(family="host_behavior_mismatch", next_action="patch", repair_scope="hls")
+        evidence = "Mismatch test=4 arg=out index=2 expected=7 actual=8 seed=1"
+        _system, user = build_repair_prompt(
+            analysis, decision, "software_equivalence", evidence, "src/hls_top.cpp", "void vector_add() {}"
+        )
+        self.assertIn("host mismatch test=4 out[2]: expected=7 actual=8 seed=1", user)
+
+
 class LeveriEndToEndTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which("g++") and shutil.which("make"), "g++ and make are required")
     def test_seeded_divergence_fails_the_gate_with_behavior_mismatch(self):

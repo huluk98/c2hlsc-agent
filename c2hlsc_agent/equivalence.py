@@ -93,6 +93,50 @@ def parse_mismatches(text: str) -> list[Mismatch]:
     return mismatches
 
 
+@dataclass
+class LeveriDivergence:
+    """One divergence reported by the LeVeri dual-tier trace comparator."""
+
+    kind: str  # "behavior" (output columns differ) or "stimulus" (harness misalignment)
+    cycle: str
+    column: str
+    expected: str
+    actual: str
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "kind": self.kind,
+            "cycle": self.cycle,
+            "column": self.column,
+            "expected": self.expected,
+            "actual": self.actual,
+        }
+
+
+def parse_leveri_divergences(text: str) -> list[LeveriDivergence]:
+    behavior_pattern = re.compile(
+        r"behavior mismatch cycle=(?P<cycle>\S+)\s+column=(?P<column>\S+)\s+"
+        r"expected=(?P<expected>\S+)\s+actual=(?P<actual>\S+)"
+    )
+    stimulus_pattern = re.compile(
+        r"stimulus mismatch cycle=(?P<cycle>\S+)\s+column=(?P<column>\S+)\s+"
+        r"golden=(?P<expected>\S+)\s+hls=(?P<actual>\S+)"
+    )
+    divergences: list[LeveriDivergence] = []
+    for kind, pattern in (("behavior", behavior_pattern), ("stimulus", stimulus_pattern)):
+        for match in pattern.finditer(text):
+            divergences.append(
+                LeveriDivergence(
+                    kind=kind,
+                    cycle=match.group("cycle"),
+                    column=match.group("column"),
+                    expected=match.group("expected"),
+                    actual=match.group("actual"),
+                )
+            )
+    return divergences
+
+
 def run_command(command: list[str], cwd: Path, phase: str, timeout: int = 120) -> PhaseResult:
     proc = subprocess.Popen(
         command,

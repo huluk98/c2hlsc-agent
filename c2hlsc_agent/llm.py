@@ -32,6 +32,7 @@ import urllib.request
 from typing import Protocol
 
 from .analyze import AnalysisResult
+from .equivalence import parse_leveri_divergences, parse_mismatches
 from .hlsc_generator import HLSC_GENERATOR_SYSTEM_PROMPT, render_hlsc_generator_task
 
 DEFAULT_ANTHROPIC_MODEL = "claude-opus-4-8"
@@ -431,6 +432,37 @@ try a genuinely different fix:
 """
 
 
+def _mismatch_evidence_section(evidence: str) -> str:
+    """Structured first-divergence evidence, parsed from the FULL (untruncated) evidence.
+
+    This is the PMLC-L1/L3 analog: on a behavioral mismatch the paired-trace comparator
+    and the host oracle already name the failing cycle/test, column/argument, and the
+    expected-vs-actual values — hand the model that localization as data instead of
+    hoping it survives inside the raw log tail.
+    """
+
+    lines: list[str] = []
+    for div in parse_leveri_divergences(evidence)[:5]:
+        lines.append(
+            f"- {div.kind} divergence at cycle {div.cycle}, column {div.column}: "
+            f"expected={div.expected} actual={div.actual}"
+        )
+    for mismatch in parse_mismatches(evidence)[:5]:
+        index = "" if mismatch.element_index is None else f"[{mismatch.element_index}]"
+        seed = "" if mismatch.seed is None else f" seed={mismatch.seed}"
+        lines.append(
+            f"- host mismatch test={mismatch.test_index} {mismatch.argument}{index}: "
+            f"expected={mismatch.expected} actual={mismatch.actual}{seed}"
+        )
+    if not lines:
+        return ""
+    return (
+        "\nStructured mismatch evidence (first divergences; the golden reference is authoritative):\n"
+        + "\n".join(lines)
+        + "\n"
+    )
+
+
 def build_repair_prompt(
     analysis: AnalysisResult,
     decision: object,
@@ -449,7 +481,7 @@ Failure family: {getattr(decision, 'family', 'unknown')}
 Repair intent: {getattr(decision, 'next_action', '')}
 Repair scope: {getattr(decision, 'repair_scope', '')}
 Must-preserve top-function signature: `{fn.signature}`
-{_nl_spec_section(nl_spec)}{_history_section(history)}
+{_nl_spec_section(nl_spec)}{_history_section(history)}{_mismatch_evidence_section(evidence or "")}
 Earliest-failure evidence (tail of the log):
 ```
 {excerpt}
