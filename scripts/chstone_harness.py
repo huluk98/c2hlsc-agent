@@ -269,9 +269,43 @@ def strip_io(source: str) -> tuple[str, int]:
             source = source[:call_start] + replacement + source[end + semicolon.end():]
             cursor = call_start + len(replacement)
             removed += 1
-    source = re.sub(r"^[ \t]*#[ \t]*include[ \t]*<stdio\.h>[ \t]*$", "", source, flags=re.M)
-    source = re.sub(r"^[ \t]*#[ \t]*include[ \t]*<stdlib\.h>[ \t]*$", "", source, flags=re.M)
+    # The includes stay. strip_io deliberately leaves calls whose value is consumed by an
+    # expression, and dropping <stdio.h> under them would turn a working benchmark into
+    # "'printf' was not declared in this scope".
     return source, removed
+
+
+_TENTATIVE = re.compile(
+    r"^[A-Za-z_][A-Za-z_0-9 \t]*[ \t*]+[A-Za-z_][A-Za-z_0-9]*(?:\[[^\]]*\])*[ \t]*;[ \t]*$"
+)
+
+
+def merge_tentative_definitions(source: str) -> tuple[str, int]:
+    """Collapse repeated file-scope tentative definitions into one.
+
+    C lets the same object be declared at file scope more than once without an
+    initialiser -- these are *tentative definitions* and the translation unit merges
+    them. CHStone relies on it: ``unsigned char *CurHuffReadBuf;`` appears in both
+    ``huffman.h`` and ``init.h``. C++ has no tentative definitions, so once those headers
+    are inlined into one unit the second is a hard redefinition.
+
+    Only exact duplicate declarations at column zero with no initialiser are merged, so
+    the value the program computes cannot change: in C these already denoted one object.
+    """
+
+    seen: set[str] = set()
+    merged = 0
+    lines: list[str] = []
+    for line in source.splitlines():
+        key = line.strip()
+        if key and not line[:1].isspace() and _TENTATIVE.match(line) and not key.startswith(("return", "typedef")):
+            if key in seen:
+                lines.append(f"/* merged tentative definition: {key} */")
+                merged += 1
+                continue
+            seen.add(key)
+        lines.append(line)
+    return "\n".join(lines), merged
 
 
 def rename_main(source: str) -> tuple[str, bool]:
@@ -497,6 +531,7 @@ def main(argv: list[str] | None = None) -> int:
                 source, stripped = strip_io(source)
             else:
                 stripped = 0
+            source, merged = merge_tentative_definitions(source)
             if not renamed:
                 result.samples.append(Sample(0, "error", "top-not-found", "no main() to rename"))
                 results.append(result)
@@ -504,7 +539,11 @@ def main(argv: list[str] | None = None) -> int:
                 continue
             prepared = prepared_dir / f"{name}.c"
             prepared.write_text(source, encoding="utf-8")
-            adaptations[name] = {"driver": driver_for(bench_dir).name, "io_statements_removed": stripped}
+            adaptations[name] = {
+                "driver": driver_for(bench_dir).name,
+                "io_statements_removed": stripped,
+                "tentative_definitions_merged": merged,
+            }
         except Exception as exc:  # assembling is best-effort; report, do not crash the sweep
             result.samples.append(Sample(0, "error", "assembly-failed", str(exc)[:300]))
             results.append(result)
