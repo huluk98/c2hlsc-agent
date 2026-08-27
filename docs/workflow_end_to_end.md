@@ -52,18 +52,27 @@ Everything below exists to keep those two statements true.
 
 ```mermaid
 flowchart TD
-    A[plan: contract_planner] --> B[generate: hlsc_generator_agent]
-    B --> C[emit: shift_left_testbench_agent]
-    C --> D[verify: cosim_operator]
-    D -->|pass| G[record: audit_memory_agent]
-    D -->|fail| E[triage: failure_analyst]
-    E -->|needs_action + --auto-repair| F[repair: hlsc_repair_agent]
-    E -->|blocked| G
-    F -->|changed| D
-    F -->|no change / oscillation| G
-    G -->|full ladder passed| H[optimize: rtl_optimizer_agent]
-    H -->|winner re-verified| G
+    A["01 plan<br/><b>contract_planner</b>"] --> B["02 generate<br/><b>hlsc_generator_agent</b>"]
+    B --> C["03 emit<br/><b>shift_left_testbench_agent</b>"]
+    C --> D["04 verify<br/><b>cosim_operator</b>"]
+    D -- "fail" --> E["05 triage<br/><b>failure_analyst</b>"]
+    D -- "pass" --> G["07 record<br/><b>audit_memory_agent</b>"]
+    E -- "needs_action + --auto-repair" --> F["06 repair<br/><b>hlsc_repair_agent</b>"]
+    E -. "blocked" .-> G
+    F == "re-verify from the FIRST rung" ==> D
+    F -- "no change / oscillation" --> G
+    G -- "full ladder passed" --> H["08 optimize<br/><b>rtl_optimizer_agent</b>"]
+    H -- "winner re-verified" --> G
+
+    classDef llm stroke-width:2px,stroke-dasharray:0
+    class B,F,H llm
 ```
+
+The dashed edge is the one that is easy to miss: when triage returns `blocked` — no Vitis
+on the machine, a broken SSH sync — the run reports and stops instead of "repairing"
+source that was never the problem. The bold edge always re-enters at the **first** rung,
+never at the phase that failed. The three bold-outlined components (`generate`, `repair`,
+`optimize`) are the only ones a model can touch.
 
 | Stage | Component | Status | What it decides |
 | --- | --- | --- | --- |
@@ -314,6 +323,20 @@ requested). **A skipped or unrequested phase is never promoted to `pass`.**
 | `csynth` | `vitis_hls -f run_csynth.tcl` | 1200 s | The design synthesizes; produces the QoR report |
 | `cosim` | `vitis_hls -f run_cosim.tcl` | 600 s | Generated HLS-C and the generated RTL agree |
 
+```mermaid
+flowchart LR
+    C["input.c<br/><i>the golden oracle</i>"] -- "generate" --> H["src/hls_top.cpp<br/><i>the generated design</i>"]
+    H -- "csynth" --> R["RTL (Verilog)<br/><i>what you ship</i>"]
+    C <-. "software_equivalence<br/>make test, on the host" .-> H
+    C <-. "csim<br/>the same comparison, in Vitis" .-> H
+    H <-. "cosim<br/>C/RTL co-simulation" .-> R
+```
+
+**No single rung proves that the RTL matches the original C.** Rungs 1 and 2 compare
+`input.c` against `src/hls_top.cpp`. CSynth compares nothing — it *produces* the RTL.
+CoSim compares `src/hls_top.cpp` against that RTL. Only the unbroken chain gets you the
+claim, which is why an earlier failure blocks every later rung instead of being skipped.
+
 Notes that matter:
 
 - **Process hygiene.** Every command runs in its own session; a timeout escalates
@@ -344,6 +367,30 @@ equivalence, and repair local and runs only the Vitis phases remotely:
 3. `rsync` artifacts back (best-effort; the phase logs are already local, since the SSH
    console output is what gets written to `<phase>.log` — which is also what the CoSim log
    gate reads).
+
+```mermaid
+flowchart LR
+    subgraph LOCAL["your workstation"]
+        direction TB
+        L1["analyze_source"] --> L2["generate HLS-C (+ model)"]
+        L2 --> L3["make test"]
+        L3 --> L4["classify_failure -> repair_project"]
+        L4 --> L5["conversion_report.* · run_ledger.jsonl<br/><i>every &lt;phase&gt;.log is written here</i>"]
+    end
+    subgraph REMOTE["Vitis host (Linux)"]
+        direction TB
+        R1["vitis_hls -f run_csim.tcl"]
+        R2["vitis_hls -f run_csynth.tcl"]
+        R3["vitis_hls -f run_cosim.tcl"]
+    end
+    LOCAL -- "rsync --delete -> &lt;dir&gt;/&lt;name&gt;-&lt;sha1&gt;" --> REMOTE
+    LOCAL -- "ssh: timeout -k 30s N vitis_hls -f run_&lt;phase&gt;.tcl" --> REMOTE
+    REMOTE -- "rsync artifacts back (best-effort)" --> LOCAL
+```
+
+The logs stay local: each phase's `<phase>.log` is the SSH console output, written on your
+side — which is exactly what the CoSim log gate reads, so the "exit 0 but the log says
+fail" check works identically over SSH.
 
 A **sync failure is infrastructure, not a code defect**: it is reported as
 `remote vitis unavailable`, classified `blocked`, and no repair is attempted.
@@ -401,6 +448,23 @@ Order of attempts, first match wins:
    hash is checked against **every source state already visited** (before/after hashes from
    the whole audit); a repeat is rejected as `oscillation_rejected` rather than written.
 
+```mermaid
+flowchart LR
+    V["verify<br/><i>the four rungs</i>"] --> G1{{"guard 1<br/>same (source, failure)<br/>seen twice?"}}
+    G1 -- "no" --> T["triage"]
+    G1 -- "yes" --> X1["run closes<br/><b>exhausted</b>"]
+    T --> RP["repair<br/><i>one patch</i>"]
+    RP --> G3{{"guard 3<br/>proposed source<br/>already tried?"}}
+    G3 -- "yes" --> X3["<b>oscillation_rejected</b><br/>never written to disk"]
+    G3 -- "no" --> G2{{"guard 2<br/>project signature<br/>seen before?"}}
+    G2 -- "yes" --> X2["run closes<br/><b>exhausted</b>"]
+    G2 -- "no" --> V
+```
+
+Guard 1 catches a repair that changed the code but not the outcome. Guard 2 catches a
+repair that returned the project to a state it already occupied. Guard 3 catches a model
+re-proposing a patch that was already tried — before it reaches disk, so it costs nothing.
+
 Hard boundaries: **only `src/hls_top.cpp` is model-writable.** `input.c` and every `tb/`
 file are off limits, so a model can never "fix" a failure by weakening the oracle.
 
@@ -445,6 +509,25 @@ the beginning afterwards.**
 | `blocked` | A required input, model, tool, or human decision is missing | Name the blocker and its owner |
 | `exhausted` | A budget ended or the same state recurred | Stop automation; review before `--new-run` |
 | `cancelled` | Intentionally stopped | Record why |
+
+```mermaid
+stateDiagram-v2
+    [*] --> running
+    running --> failed: verification failed, nothing safe left to try
+    running --> blocked: input, model, tool or human decision missing
+    running --> passed: every required gate passed
+    running --> exhausted: budget ended, or the same state recurred
+    running --> cancelled: intentionally stopped
+    failed --> running: re-run the same command
+    blocked --> running: re-run the same command
+    passed --> [*]
+    exhausted --> [*]
+    cancelled --> [*]
+```
+
+`failed` and `blocked` resume with their counters intact. `passed`, `exhausted`, and
+`cancelled` are **closed**: resuming is refused, and a reset needs `--new-run`. Budgets are
+immutable for the life of a run id — that is the point of them.
 
 ```text
 python -m c2hlsc_agent status --project c2hlsc_project
@@ -511,6 +594,25 @@ python -m c2hlsc_agent optimize --project c2hlsc_project \
    baseline. The candidate is recorded as `final_ladder_fail`.
 7. **Report.** `qor_report.json`, `qor_report.md`, and `qor_table.tex` (LaTeX, for papers).
    Losing candidate directories are deleted; the winner's is kept for provenance.
+
+```mermaid
+flowchart TD
+    K["1 deterministic + N model candidates"] --> D1{{"dedup by source hash"}}
+    D1 -- "duplicate" --> Z1["dropped"]
+    D1 --> D2{{"host equivalence<br/><i>seconds, in a scratch copy</i>"}}
+    D2 -- "equiv_fail" --> Z2["dropped"]
+    D2 --> D3{{"CSynth score<br/><i>no CoSim per candidate</i>"}}
+    D3 -- "csynth_fail / timing_regressed" --> Z3["dropped"]
+    D3 --> W["round winner"]
+    W --> P["promote into src/hls_top.cpp<br/><i>true pre-QoR source backed up to .pre_qor</i>"]
+    P --> L["the FULL ladder, again<br/>make test -> CSim -> CSynth -> CoSim"]
+    L -- "pass" --> ACC["<b>accepted</b><br/>qor_report.json / .md / .tex"]
+    L -- "fail" --> RB["<b>rollback</b><br/>restore the source, delete the stale synthesis report"]
+```
+
+Cheap filters run first: only candidates that already pass host equivalence pay for
+synthesis, and no candidate pays for CoSim. CoSim is spent once, on the winner, as the
+acceptance test.
 
 Exit code 1 means: rolled back, or explicit targets were not met, or **no candidate was
 ever scored** — the last case is an infrastructure problem (usually no Vitis) and is
