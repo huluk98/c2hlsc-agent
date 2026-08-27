@@ -64,13 +64,21 @@ BLOCKERS: tuple[tuple[str, str, str], ...] = (
 @dataclass
 class Sample:
     index: int
-    status: str                      # pass | fail | blocked | skipped | error
+    status: str                      # convert's own verdict: pass | fail | blocked | skipped | error
     blocker: str | None = None
     detail: str = ""
+    selfcheck: str = "not-run"       # CHStone's criterion against the generated design
+    golden_selfcheck: str = "not-run"  # the same criterion against the adapted golden C
 
     @property
     def passed(self) -> bool:
-        return self.status == "pass"
+        """CHStone's definition: the generated design's chstone_main returns 0.
+
+        The golden leg must also pass, otherwise the adaptation -- not the agent -- is
+        what the run measured, and counting it either way would be dishonest.
+        """
+
+        return self.selfcheck == "pass" and self.golden_selfcheck == "pass"
 
 
 @dataclass
@@ -283,6 +291,74 @@ def rename_main(source: str) -> tuple[str, bool]:
 # --------------------------------------------------------------------------- #
 
 
+GOLDEN_DRIVER = """/* CHStone's own criterion, from common/tb.c. */
+int chstone_main(void);
+int main(void) { return chstone_main(); }
+"""
+
+HLS_DRIVER = """// CHStone's own criterion, from common/tb.c, against the generated design.
+#include "hls_top.hpp"
+int main() { return chstone_main(); }
+"""
+
+
+def _build_and_run(sources: list[str], compiler: list[str], out: Path, timeout: int) -> tuple[str, str]:
+    """Compile and run; return ``(outcome, detail)`` where outcome is pass/fail/error."""
+
+    build = subprocess.run([*compiler, *sources, "-o", str(out)], capture_output=True, text=True)
+    if build.returncode != 0:
+        errors = [line for line in build.stderr.splitlines() if "error" in line.lower()]
+        return "error", (errors[0] if errors else build.stderr.strip())[:200]
+    try:
+        run = subprocess.run([str(out)], capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return "error", f"self-check exceeded {timeout}s"
+    if run.returncode == 0:
+        return "pass", ""
+    return "fail", f"chstone_main returned {run.returncode}"
+
+
+def self_check(prepared: Path, project: Path, work: Path, timeout: int) -> dict[str, str]:
+    """Run CHStone's own success criterion against both the golden C and the design.
+
+    CHStone does not decide success by comparing outputs against a reference: each
+    benchmark checks itself and ``chstone_main`` returns 0 exactly when it agrees with
+    its own baked-in expected values (``common/tb.c`` is just ``return chstone_main();``).
+
+    The golden leg is a control on this harness. It compiles the *adapted* C -- after
+    single-TU assembly, the main rename and the console-I/O removal -- and requires it to
+    still return 0. If that leg fails, the adaptation broke the benchmark and the design
+    leg says nothing about the agent.
+    """
+
+    work.mkdir(parents=True, exist_ok=True)
+    result: dict[str, str] = {}
+
+    golden_driver = work / "golden_tb.c"
+    golden_driver.write_text(GOLDEN_DRIVER, encoding="utf-8")
+    result["golden"], result["golden_detail"] = _build_and_run(
+        [str(prepared), str(golden_driver)],
+        ["gcc", "-std=gnu99", "-w"],
+        work / "golden_tb",
+        timeout,
+    )
+
+    design = project / "src" / "hls_top.cpp"
+    if not design.exists():
+        result["design"], result["design_detail"] = "error", "no src/hls_top.cpp"
+        return result
+
+    hls_driver = work / "hls_tb.cpp"
+    hls_driver.write_text(HLS_DRIVER, encoding="utf-8")
+    result["design"], result["design_detail"] = _build_and_run(
+        [str(hls_driver), str(design)],
+        ["g++", "-std=c++17", "-w", "-Wno-narrowing", "-I", str(project / "src")],
+        work / "hls_tb",
+        timeout,
+    )
+    return result
+
+
 def classify(text: str) -> tuple[str | None, str]:
     for name, pattern, description in BLOCKERS:
         if re.search(pattern, text, re.I):
@@ -322,12 +398,36 @@ def run_sample(
             data = {}
         status = str(data.get("status", "error"))
         blob = combined + json.dumps(data)[:20000]
-        # A run that reports pass has nothing to attribute a blocker to.
-        blocker, detail = (None, "") if status == "pass" else classify(blob)
-        return Sample(index, status, blocker, detail)
+        blocker, detail = classify(blob)
+    else:
+        status = "error"
+        blocker, detail = classify(combined)
+        blocker = blocker or "no-report"
+        detail = detail or combined.strip()[-300:]
 
-    blocker, detail = classify(combined)
-    return Sample(index, "error", blocker or "no-report", detail or combined.strip()[-300:])
+    checks = self_check(prepared, project, project / "selfcheck", timeout)
+    sample = Sample(
+        index,
+        status,
+        blocker,
+        detail,
+        selfcheck=checks.get("design", "not-run"),
+        golden_selfcheck=checks.get("golden", "not-run"),
+    )
+    if sample.passed:
+        # A sample that meets CHStone's criterion has nothing blocking it. convert's own
+        # static diagnostics can still fire -- mips trips `unbounded-loop` because its
+        # simulator runs until a halt instruction -- but reporting that as a blocker on a
+        # benchmark that passed would misstate the result.
+        sample.blocker, sample.detail = None, ""
+    elif not sample.blocker:
+        if sample.golden_selfcheck != "pass":
+            sample.blocker = "adaptation-broke-golden"
+            sample.detail = checks.get("golden_detail", "") or "adapted golden C does not return 0"
+        else:
+            sample.blocker = f"selfcheck-{sample.selfcheck}"
+            sample.detail = checks.get("design_detail", "") or "generated design did not return 0"
+    return sample
 
 
 # --------------------------------------------------------------------------- #
@@ -416,7 +516,8 @@ def main(argv: list[str] | None = None) -> int:
             result.samples.append(sample)
         results.append(result)
         blocker = result.first_blocker or "-"
-        print(f"{name:10} -> {result.passes}/{args.samples} pass   blocker={blocker}")
+        legs = f"golden={result.samples[0].golden_selfcheck} design={result.samples[0].selfcheck}"
+        print(f"{name:10} -> {result.passes}/{args.samples} pass   {legs:34} blocker={blocker}")
 
     total = len(results)
     report: dict[str, object] = {
@@ -428,6 +529,8 @@ def main(argv: list[str] | None = None) -> int:
                 "samples": len(r.samples),
                 "blocker": r.first_blocker,
                 "statuses": [s.status for s in r.samples],
+                "selfcheck": [s.selfcheck for s in r.samples],
+                "golden_selfcheck": [s.golden_selfcheck for s in r.samples],
                 "detail": next((s.detail for s in r.samples if s.detail), ""),
             }
             for r in results
