@@ -609,6 +609,11 @@ def render(spec: dict) -> str:
     add("  wire ap_done, ap_idle, ap_ready;")
     add("  integer errors = 0;")
     add("  integer warns = 0;")
+    # Positive evidence. A compare length that loaded as X makes `i < len` false on the
+    # first iteration, so the loop body never runs and the run reports PASS having
+    # compared nothing. Counting what was actually examined is what makes the verdict mean
+    # something; see the COMPARED line and the pass predicate below.
+    add("  integer compares = 0;")
     add("  integer t, i;")
 
     for scalar in scalars:
@@ -744,16 +749,25 @@ def render(spec: dict) -> str:
         advisory = bool(array.get("advisory"))
         kind = "WARN" if advisory else "MISMATCH"
         counter = "warns" if advisory else "errors"
-        add(f"      for (i = 0; i < {name}_cmp[t]; i = i + 1) begin")
-        add(f"        if ({name}_ram[i] !== {name}_exp[t*{depth} + i]) begin")
-        add(f'          $display("RTL_TB: {kind} test=%0d {name}[%0d] expected=%h actual=%h", t, i, {name}_exp[t*{depth} + i], {name}_ram[i]);')
-        add(f"          {counter} = {counter} + 1;")
+        # An unreadable or short vector file leaves the compare length at X. Detect it
+        # rather than letting `i < X` silently skip the whole comparison.
+        add(f"      if (^{name}_cmp[t] === 1'bx) begin")
+        add(f'        $display("RTL_TB: FAIL test=%0d {name} compare length did not load (vector file missing or short)", t);')
+        add("        errors = errors + 1;")
+        add("      end else begin")
+        add(f"        for (i = 0; i < {name}_cmp[t]; i = i + 1) begin")
+        add("          compares = compares + 1;")
+        add(f"          if ({name}_ram[i] !== {name}_exp[t*{depth} + i]) begin")
+        add(f'            $display("RTL_TB: {kind} test=%0d {name}[%0d] expected=%h actual=%h", t, i, {name}_exp[t*{depth} + i], {name}_ram[i]);')
+        add(f"            {counter} = {counter} + 1;")
+        add("          end")
         add("        end")
         add("      end")
     if ret is not None:
         advisory = bool(ret.get("advisory"))
         kind = "WARN" if advisory else "MISMATCH"
         counter = "warns" if advisory else "errors"
+        add("      compares = compares + 1;")
         add("      if (ret_actual !== ret_exp[t]) begin")
         add(f'        $display("RTL_TB: {kind} test=%0d return expected=%h actual=%h", t, ret_exp[t], ret_actual);')
         add(f"        {counter} = {counter} + 1;")
@@ -764,8 +778,17 @@ def render(spec: dict) -> str:
         # A void top with no output/inout array has nothing observable to check, so a bare
         # "PASS" would be vacuous. Say so explicitly instead of implying equivalence.
         add('    $display("RTL_TB: NOTE no observable outputs to compare; PASS means the design only reached ap_done");')
-    add('    if (errors == 0) $display("RTL_TB: PASS %0d tests (%0d advisory warnings)", NUM_TESTS, warns);')
-    add('    else $display("RTL_TB: FAIL %0d mismatches (%0d advisory warnings)", errors, warns);')
+    add('    $display("RTL_TB: COMPARED %0d", compares);')
+    if has_observable:
+        # This top HAS observable outputs, so comparing nothing means the vectors never
+        # loaded -- not that the design agreed. Absence of a mismatch is evidence only
+        # when a mismatch was possible.
+        add('    if (errors == 0 && compares > 0) $display("RTL_TB: PASS %0d tests (%0d advisory warnings)", NUM_TESTS, warns);')
+        add('    else if (compares == 0) $display("RTL_TB: FAIL compared nothing; expected vectors did not load");')
+        add('    else $display("RTL_TB: FAIL %0d mismatches (%0d advisory warnings)", errors, warns);')
+    else:
+        add('    if (errors == 0) $display("RTL_TB: PASS %0d tests (%0d advisory warnings)", NUM_TESTS, warns);')
+        add('    else $display("RTL_TB: FAIL %0d mismatches (%0d advisory warnings)", errors, warns);')
     add("    $finish;")
     add("  end")
 
@@ -1046,16 +1069,36 @@ def main() -> int:
 
     passed = "RTL_TB: PASS" in stdout
     failed = "RTL_TB: FAIL" in stdout or "RTL_TB: MISMATCH" in stdout
-    status = "pass" if (passed and not failed) else "fail"
-    write_report({
+    # How much was actually examined, as a number in the report rather than a line of text
+    # nobody parses. A run that compared nothing is not a run that agreed.
+    compared_match = re.search(r"RTL_TB: COMPARED (\d+)", stdout)
+    comparisons = int(compared_match.group(1)) if compared_match else None
+    # A vector file that failed to load is reported by the simulator on stdout and is
+    # otherwise easy to miss: the compare length reads as X, every loop is skipped, and the
+    # bench would once have printed PASS. Treat it as fatal here too, independently of the
+    # bench's own guard, so neither layer alone has to be right.
+    load_failed = "$readmemh" in stdout and (
+        "Unable to open" in stdout or "Not enough words" in stdout
+    )
+    vacuous = (
+        comparisons == 0 and "RTL_TB: NOTE no observable outputs" not in stdout
+    )
+    status = "pass" if (passed and not failed and not load_failed and not vacuous) else "fail"
+    report: dict = {
         "status": status,
         "policy_id": spec.get("policy_id"),
         "top": spec["top"],
         "rtl_dir": str(rtl_dir),
         "testbench": str(tb.relative_to(ROOT)),
+        "comparisons_performed": comparisons,
         "stdout_tail": stdout[-8000:],
         "commands": logs,
-    })
+    }
+    if load_failed:
+        report["reason"] = "expected-value vectors failed to load; nothing was compared"
+    elif vacuous:
+        report["reason"] = "the testbench compared nothing"
+    write_report(report)
     print(f"RTL cosim {status}: report written to {REPORT_PATH}")
     return 0 if status == "pass" else 1
 
