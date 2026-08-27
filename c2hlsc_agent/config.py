@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import ast
 import json
 import os
 from dataclasses import dataclass, field
@@ -120,6 +119,38 @@ def apply_stimulus_contract(config: AgentConfig, data: dict[str, Any]) -> AgentC
     return config
 
 
+def _split_flow(body: str) -> list[str]:
+    """Split the inside of a YAML flow collection on its top-level commas.
+
+    Nesting and quoting both matter: ``{range: [0, 16]}`` has one top-level entry, and
+    ``["a,b"]`` has one item, not two.
+    """
+
+    parts: list[str] = []
+    current: list[str] = []
+    depth = 0
+    quote: str | None = None
+    for char in body:
+        if quote is not None:
+            current.append(char)
+            if char == quote:
+                quote = None
+            continue
+        if char in "'\"":
+            quote = char
+        elif char in "[{":
+            depth += 1
+        elif char in "]}":
+            depth -= 1
+        elif char == "," and depth == 0:
+            parts.append("".join(current))
+            current = []
+            continue
+        current.append(char)
+    parts.append("".join(current))
+    return [part.strip() for part in parts if part.strip()]
+
+
 def _parse_scalar(value: str) -> Any:
     value = value.strip()
     if value == "":
@@ -128,8 +159,19 @@ def _parse_scalar(value: str) -> Any:
         return value.lower() == "true"
     if value.lower() in {"null", "none"}:
         return None
+    # Flow collections are parsed structurally rather than with ast.literal_eval, which
+    # only accepts Python literals: `[input.c]` is a perfectly ordinary YAML list of one
+    # unquoted string, but Python reads `input.c` as attribute access and raises.
     if value.startswith("[") and value.endswith("]"):
-        return ast.literal_eval(value)
+        return [_parse_scalar(item) for item in _split_flow(value[1:-1])]
+    if value.startswith("{") and value.endswith("}"):
+        mapping: dict[str, Any] = {}
+        for item in _split_flow(value[1:-1]):
+            if ":" not in item:
+                raise ValueError(f"malformed inline mapping entry {item!r} in {value!r}")
+            key, entry = item.split(":", 1)
+            mapping[key.strip().strip("\"'")] = _parse_scalar(entry)
+        return mapping
     if (value.startswith('"') and value.endswith('"')) or (value.startswith("'") and value.endswith("'")):
         return value[1:-1]
     try:

@@ -83,6 +83,14 @@ walking. That is the single most common reason a real design is rejected.
 Both YAML and JSON are accepted. Relative paths resolve against the **config file's own
 directory**, not the working directory.
 
+**PyYAML is optional.** It is an extra (`pip install -e '.[yaml]'`), so a plain
+`pip install -e .` leaves a small built-in parser in charge. That parser handles block
+style, flow style (`{direction: input, length: 16}`, `[input.c]`), quoted scalars,
+inline comments and nesting — the syntax on this page works either way. It rejects block
+scalars (`|`, `>`) and multi-document files outright, and it mis-parses anchors
+**silently** (`a: &x 1` becomes the string `"&x 1"`). Install the extra if you need any
+of those.
+
 ### Design
 
 | Key | Default | Effect |
