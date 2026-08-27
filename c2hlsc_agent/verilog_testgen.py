@@ -4,7 +4,7 @@ import json
 import re
 from dataclasses import dataclass
 
-from .analyze import AnalysisResult, FunctionArg
+from .analyze import AnalysisResult, FunctionArg, active_length_arg, looks_like_length_name
 from .config import AgentConfig
 
 
@@ -68,17 +68,6 @@ def get_rtl_testbench_contract() -> RtlTestbenchContract:
 # Type helpers
 # ---------------------------------------------------------------------------
 
-_LENGTH_NAMES = {
-    "n",
-    "len",
-    "length",
-    "size",
-    "count",
-    "num",
-    "limit",
-    "samples",
-    "elements",
-}
 
 
 def _clean_type(c_type: str) -> str:
@@ -125,30 +114,10 @@ def _addr_bits(depth: int) -> int:
     return max(1, (depth - 1).bit_length())
 
 
-def _looks_like_length_name(scalar_name: str, array_name: str) -> bool:
-    name = scalar_name.lower()
-    array = array_name.lower()
-    return (
-        name in _LENGTH_NAMES
-        or name in {f"{array}_n", f"n_{array}", f"{array}_len", f"{array}_length", f"{array}_size", f"{array}_count"}
-        or name.startswith("num_")
-        or name.endswith("_len")
-        or name.endswith("_length")
-        or name.endswith("_size")
-        or name.endswith("_count")
-    )
+_looks_like_length_name = looks_like_length_name
 
 
-def _active_length_arg(array_arg: FunctionArg, scalars: list[FunctionArg]) -> FunctionArg | None:
-    for scalar in scalars:
-        if not scalar.scalar_range:
-            continue
-        lo, hi = scalar.scalar_range
-        if lo < 0 or array_arg.length is None or hi > array_arg.length:
-            continue
-        if _looks_like_length_name(scalar.name, array_arg.name):
-            return scalar
-    return None
+_active_length_arg = active_length_arg
 
 
 def _array_ports(direction: str) -> list[str]:

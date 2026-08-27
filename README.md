@@ -428,6 +428,20 @@ The local policy lives in `c2hlsc_agent/leveri_testgen.py` as
 `hls_leveri_shift_left_v1`. It is owned by `shift_left_testbench_agent`, not by
 `hlsc_generator_agent`.
 
+The paper this follows is *Shift-Left High-Level Synthesis Verification via
+Knowledge-Augmented LLM Agent* (arXiv:2606.17128). What is implemented here:
+
+| Paper component | Status |
+| --- | --- |
+| Paired golden/HLS testbenches from one contract, one synchronized stimulus schedule | implemented |
+| Dual-tier check — static structural alignment | implemented: trace schema, stimulus columns, **control flow**, **def-use** |
+| Dual-tier check — dynamic behavioural consistency | implemented, clamped to the declared active length |
+| Concrete coverage with gcov | implemented and **parsed**: line/branch percentages plus the uncovered line and branch list |
+| Symbolic exploration with KLEE | implemented: driver, run, and `.ktest` decoding |
+| Coverage-driven refinement loop | implemented as `c2hlsc-agent refine` — KLEE counterexamples become permanent directed cases; widening is the documented fallback where KLEE is unavailable |
+| Heterogeneous HLS Verification Knowledge Graph | **not implemented**; the manifest records the metadata a future graph would need |
+| Benchmark reproduction over the paper's 107 pairs | **not implemented** |
+
 For every generated project, AUTO RTL now writes:
 
 - `tb/leveri_golden_tb.cpp`: runs the macro-renamed original C and writes
@@ -817,6 +831,10 @@ Other subcommands:
 - `repair` — apply a repair from evidence produced by an external run
   (`python -m c2hlsc_agent repair --help`).
 - `optimize` — the post-equivalence QoR loop (`rtl_optimizer_agent`).
+- `refine` — coverage-driven stimulus refinement: measure structural coverage, turn what
+  the schedule never reaches into permanent directed cases, and repeat.
+- `doctor` — check every external tool each tier needs and, with `--install`, install the
+  missing ones through Homebrew (macOS) or apt/dnf/pacman (Linux).
 - `status` — read the persistent bounded-run ledger without changing it.
 - `components` — inspect the agent component scaffold; runs nothing.
 
@@ -877,13 +895,23 @@ For each conversion, the output directory contains:
 ## Verification Order
 
 1. Static analysis
-2. Host software equivalence with `g++`
-3. Vitis HLS `csim_design`
-4. Vitis HLS `csynth_design`
-5. Vitis HLS `cosim_design`
+2. Host software equivalence with `g++` (`make test`)
+3. Trace consistency — the HLS-LeVeri dual tier (`make leveri-test`)
+4. Vitis HLS `csim_design`
+5. Vitis HLS `csynth_design`
+6. Vitis HLS `cosim_design`
 
-When `--no-run-vitis` is used, Vitis phases are marked `skipped`; host equivalence is
-still run when `g++` is available.
+Steps 2 and 3 are the host tier and always run. When `--no-run-vitis` is used, the Vitis
+phases are marked `skipped`; host equivalence and trace consistency still run when `g++`,
+`make` and `python3` are available.
+
+Step 3 is what makes the shift-left tier a gate rather than an advisory report. Its static
+half compares the two paired *harnesses* (trace schema, stimulus columns, control-flow
+shape, def-use structure) and its dynamic half compares their output traces, clamped to the
+declared active length. A static-tier failure is routed to `shift_left_testbench_agent` as
+a testbench defect; a dynamic-tier failure is routed to `failure_analyst` as a design
+defect. See [`docs/workflow_end_to_end.md`](docs/workflow_end_to_end.md) for the full
+walkthrough.
 
 By default, `convert` does not mutate a failing project after verification. This keeps
 the current split-machine workflow explicit: run Vitis/CoSim wherever the toolchain is

@@ -24,6 +24,15 @@ from .hls_runner import verify_project
 from .llm import build_llm_client, missing_llm_reason
 from .remote import RemoteVitis
 from .report import final_status, write_reports
+from .toolchain import (
+    TIER_PURPOSE,
+    TIERS,
+    check as check_tools,
+    install as install_tools,
+    missing as missing_tools,
+    package_manager,
+    summary_line,
+)
 from .run_control import (
     RUN_LEDGER_FILENAME,
     BudgetedLLMClient,
@@ -152,7 +161,12 @@ def build_parser() -> argparse.ArgumentParser:
     convert.add_argument("--verbose", action="store_true", help="print command output")
     repair = sub.add_parser("repair", help="apply a repair from externally supplied Vitis/verification evidence")
     repair.add_argument("--project", required=True, help="existing generated project directory")
-    repair.add_argument("--stage", required=True, choices=["software_equivalence", "csim", "csynth", "cosim"], help="earliest failing stage from the external run")
+    repair.add_argument(
+        "--stage",
+        required=True,
+        choices=["software_equivalence", "trace_consistency", "csim", "csynth", "cosim"],
+        help="earliest failing stage from the external run",
+    )
     repair.add_argument("--evidence", action="append", default=[], help="path to a log/report file from the failing stage; may be repeated")
     repair.add_argument("--evidence-text", default="", help="inline failing-stage evidence text")
     repair.add_argument("--input", help="original input C file; defaults to PROJECT/input.c")
@@ -228,6 +242,51 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="emit the full docs/agent_components.md reference",
     )
+    refine = sub.add_parser(
+        "refine",
+        help="coverage-driven stimulus refinement: drive structural coverage up by feeding "
+        "uncovered code back into the testbenches (shift_left_testbench_agent)",
+    )
+    refine.add_argument("--project", required=True, help="existing generated project directory")
+    refine.add_argument("--top", help="top function name; defaults to conversion_report.json top when available")
+    refine.add_argument("--input", help="original input C file; defaults to PROJECT/input.c")
+    refine.add_argument("--config", help="YAML/JSON config file used for the original conversion")
+    refine.add_argument(
+        "--target",
+        type=float,
+        help="structural coverage target in percent, measured as the WEAKER of line and "
+        "branch coverage; without one the loop simply improves what it can",
+    )
+    refine.add_argument("--max-rounds", type=int, default=5, help="max refinement rounds (default 5)")
+    refine.add_argument("--max-vectors", type=int, default=64, help="max refinement vectors to add (default 64)")
+    refine.add_argument(
+        "--no-widen",
+        action="store_true",
+        help="fail instead of falling back to widening the random schedule when KLEE is unavailable",
+    )
+    refine.add_argument("--verbose", action="store_true", help="print per-round progress")
+    doctor = sub.add_parser(
+        "doctor",
+        help="check the external tools each verification tier needs, and install the missing ones",
+    )
+    doctor.add_argument(
+        "--install",
+        action="store_true",
+        help="actually install the missing tools with this machine's package manager "
+        "(Homebrew on macOS, apt/dnf/pacman on Linux); without it, doctor only reports",
+    )
+    doctor.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="with --install, print the commands that would run instead of running them",
+    )
+    doctor.add_argument(
+        "--tier",
+        action="append",
+        choices=list(TIERS),
+        help="limit to one or more tiers; may be repeated (default: all)",
+    )
+    doctor.add_argument("--json", action="store_true", help="emit machine-readable JSON")
     status = sub.add_parser(
         'status',
         help='show the latest persistent bounded-run state for a project',
@@ -610,7 +669,7 @@ def _external_failure_state(stage: str, evidence: str, run_vitis: bool):
     from .equivalence import PhaseResult, VerificationState
 
     state = VerificationState()
-    phases = ["software_equivalence"]
+    phases = ["software_equivalence", "trace_consistency"]
     if run_vitis:
         phases.extend(["csim", "csynth", "cosim"])
     if stage not in phases:
@@ -637,7 +696,7 @@ def run_repair(args: argparse.Namespace) -> int:
         config.top = _load_project_top(project_dir)
     if not config.top:
         raise SystemExit("--top is required because conversion_report.json does not record a top function")
-    config.run_vitis = args.stage != "software_equivalence"
+    config.run_vitis = args.stage not in {"software_equivalence", "trace_consistency"}
     evidence = _read_evidence(args.evidence, args.evidence_text)
     if not evidence:
         raise SystemExit("--evidence or --evidence-text is required")
@@ -836,6 +895,123 @@ def run_components(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_refine(args: argparse.Namespace) -> int:
+    """Coverage-driven stimulus refinement on an existing project."""
+
+    from .coverage_refine import RefinementError, refine_project
+
+    project_dir = Path(args.project).expanduser().resolve()
+    config = merge_cli_config(load_config(Path(args.config).resolve() if args.config else None), args)
+    if not config.input_files:
+        config.input_files = [(project_dir / "input.c").resolve()]
+    if not config.input_files[0].exists():
+        raise SystemExit("--input is required because PROJECT/input.c does not exist")
+    if not config.top:
+        config.top = _load_project_top(project_dir)
+    if not config.top:
+        raise SystemExit("--top is required because conversion_report.json does not record a top function")
+
+    analysis = analyze_source(config.input_files[0], config.top, config)
+    try:
+        outcome = refine_project(
+            project_dir,
+            analysis,
+            config,
+            target=args.target,
+            max_rounds=args.max_rounds,
+            max_vectors=args.max_vectors,
+            allow_widen=not args.no_widen,
+            verbose=args.verbose,
+        )
+    except RefinementError as exc:
+        raise SystemExit(f"coverage refinement could not run: {exc}")
+
+    print(outcome.summary)
+    print(f"Refinement report: {project_dir / 'coverage_refinement.json'}")
+    if outcome.uncovered_branches:
+        print(f"Still uncovered: {len(outcome.uncovered_branches)} branch(es), {len(outcome.uncovered_lines)} line(s)")
+    print(
+        "Re-run verification after refinement: the added cases are real tests and the "
+        "design has not been checked against them yet."
+    )
+    if outcome.status == "blocked":
+        return 1
+    if args.target is not None and outcome.status != "met":
+        return 1
+    return 0
+
+
+def run_doctor(args: argparse.Namespace) -> int:
+    """Report — and optionally install — the tools each verification tier needs."""
+
+    manager = package_manager()
+    statuses = check_tools(args.tier)
+    absent = missing_tools(statuses)
+
+    results: list[dict[str, object]] = []
+    if args.install and absent:
+        results = install_tools(absent, dry_run=args.dry_run)
+        if not args.dry_run:
+            statuses = check_tools(args.tier)  # re-probe so the report reflects reality
+            absent = missing_tools(statuses)
+
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "platform": sys.platform,
+                    "package_manager": manager,
+                    "tools": [status.to_dict() for status in statuses],
+                    "install_results": results,
+                },
+                indent=2,
+            )
+        )
+        return 0 if not absent else 1
+
+    print(f"Package manager: {manager or 'none detected'}")
+    by_tier: dict[str, list] = {}
+    for status in statuses:
+        by_tier.setdefault(status.tool.tier, []).append(status)
+    for tier, entries in by_tier.items():
+        print(f"\n{tier} — {TIER_PURPOSE.get(tier, '')}")
+        for status in entries:
+            print(summary_line(status))
+
+    if results:
+        print("\nInstall results:")
+        for row in results:
+            name = row.get("name")
+            state = row.get("status")
+            if state == "would_run":
+                print(f"  {name}: would run {' '.join(row.get('command', []))}")
+            elif state == "manual":
+                print(f"  {name}: needs manual installation — {row.get('reason')}")
+            elif state == "installed":
+                print(f"  {name}: installed at {row.get('path')}")
+            else:
+                print(f"  {name}: {state} ({str(row.get('error') or row.get('stderr') or '')[:200]})")
+
+    if absent:
+        installable = [status for status in absent if status.installable]
+        if installable and not args.install:
+            print(
+                f"\n{len(installable)} missing tool(s) can be installed here: "
+                "run `c2hlsc-agent doctor --install`."
+            )
+        manual = [status for status in absent if not status.installable]
+        if manual:
+            print(
+                f"{len(manual)} missing tool(s) need manual installation (see the notes above)."
+            )
+        # Missing OPTIONAL tools are not an error for the core flow; only a missing core
+        # tool means the agent cannot verify anything on this machine.
+        core_missing = [status for status in absent if status.tool.tier == "core"]
+        return 1 if core_missing else 0
+    print("\nEvery checked tool is present.")
+    return 0
+
+
 def run_status(args: argparse.Namespace) -> int:
     project_dir = Path(args.project).expanduser().resolve()
     ledger = RunLedger(project_dir / RUN_LEDGER_FILENAME)
@@ -886,6 +1062,10 @@ def main(argv: list[str] | None = None) -> int:
         return run_optimize(args)
     if args.command == "components":
         return run_components(args)
+    if args.command == "refine":
+        return run_refine(args)
+    if args.command == "doctor":
+        return run_doctor(args)
     if args.command == 'status':
         return run_status(args)
     parser.error(f"unknown command {args.command}")

@@ -17,7 +17,7 @@ the floor and the fallback.
 | --- | --- | --- | --- |
 | 1 | `plan` | Fix the must-preserve contract before any code is generated. | `contract_planner` |
 | 2 | `generate` | Propose a synthesizable HLS-C translation unit (deterministic baseline, optional model candidate). | `hlsc_generator_agent` |
-| 3 | `emit` | Materialize the project on disk: sources, every testbench tier, TCLs, Makefile. | `shift_left_testbench_agent` |
+| 3 | `emit` | Materialize the project: sources, every testbench tier, TCLs, Makefile; refine the stimulus against coverage. | `shift_left_testbench_agent` |
 | 4 | `verify` | Run the short-circuiting equivalence ladder; this is the only acceptance oracle. | `cosim_operator` |
 | 5 | `triage` | Turn the earliest failure into a routed, owner-tagged repair intent. | `failure_analyst` |
 | 6 | `repair` | Apply a minimal auditable patch, then rerun the ladder from the beginning. | `hlsc_repair_agent` |
@@ -30,8 +30,8 @@ the floor and the fallback.
 | --- | --- | --- | --- | --- |
 | `contract_planner` | `plan` | `deterministic` | `convert`, `repair`, `optimize` | error-severity diagnostics stop the run before verification unless --keep-going; missing pointer bounds default to length 16 with a warning |
 | `hlsc_generator_agent` | `generate` | `llm_optional` | `convert` | extract_hls_source + is_plausible_translation_unit must accept the model's block (balanced braces, defines the top); otherwise the conservative copy is used |
-| `shift_left_testbench_agent` | `emit` | `deterministic` | `convert` | The oracle testbench must compile and drive golden C and HLS-C with identical stimuli. |
-| `cosim_operator` | `verify` | `deterministic` | `convert`, `optimize` | software_equivalence -> csim -> csynth -> cosim, short-circuited: the first non-pass phase blocks the rest; a CoSim log failure marker downgrades a zero exit code to fail |
+| `shift_left_testbench_agent` | `emit` | `deterministic` | `convert`, `refine` | the oracle testbench must compile and drive golden C and HLS-C with identical stimuli; refinement stops when the coverage target is met, two rounds fail to improve it, or the round/vector budget is spent |
+| `cosim_operator` | `verify` | `deterministic` | `convert`, `optimize` | software_equivalence -> trace_consistency -> csim -> csynth -> cosim, short-circuited: the first non-pass phase blocks the rest; a CoSim log failure marker downgrades a zero exit code to fail |
 | `failure_analyst` | `triage` | `deterministic` | `convert`, `repair` | Routing only; it never edits the project. Its verdict decides which component runs next. |
 | `hlsc_repair_agent` | `repair` | `llm_optional` | `convert`, `repair` | requires --auto-repair on convert; a repair that reproduces a previously seen project signature stops the loop (oscillation guard), and a no-change repair ends it |
 | `audit_memory_agent` | `record` | `deterministic` | `convert`, `status` | Always runs, including on failure: a report that hides a failed phase is a bug. |
@@ -81,22 +81,24 @@ the floor and the fallback.
 ## `shift_left_testbench_agent`
 
 - **Role:** Testbench and coverage agent
-- **Stage:** `emit` — Materialize the project on disk: sources, every testbench tier, TCLs, Makefile.
+- **Stage:** `emit` — Materialize the project: sources, every testbench tier, TCLs, Makefile; refine the stimulus against coverage.
 - **Status:** `deterministic`
 - **Owns:** Build a golden-C oracle harness and high-coverage stimuli before synthesis; follow hls_leveri_shift_left_v1 for paired trace generation and dual-tier consistency checks.
 - **Inputs:** original C/C++, must-preserve contract, argument metadata
 - **Outputs:** host testbench, paired golden/HLS trace testbenches, standalone RTL self-checking testbench, directed/random stimuli, gcov/KLEE coverage artifacts, coverage plan, input/output trace schema
-- **Implemented by:** `c2hlsc_agent.hls_project.write_project`, `c2hlsc_agent.testgen.generate_testbench`, `c2hlsc_agent.leveri_testgen.generate_leveri_testbenches`, `c2hlsc_agent.verilog_testgen.generate_verilog_testbenches`, `c2hlsc_agent.hls_project.render_makefile`, `c2hlsc_agent.hls_project.render_run_csim`, `c2hlsc_agent.hls_project.render_run_csynth`, `c2hlsc_agent.hls_project.render_run_cosim`
-- **Driven by CLI:** `convert`
-- **Reads:** `input.c`
-- **Writes:** `src/hls_top.hpp`, `src/hls_top.cpp`, `tb/testbench.cpp`, `tb/leveri_golden_tb.cpp`, `tb/leveri_hls_tb.cpp`, `tb/leveri_compare.py`, `tb/run_gcov.py`, `tb/klee_driver.cpp`, `tb/run_klee.py`, `tb/leveri_manifest.json`, `tb/rtl_vectors_tb.cpp`, `tb/gen_rtl_tb.py`, `tb/run_rtl_sim.py`, `tb/rtl_tb_manifest.json`, `run_hls.tcl`, `run_csim.tcl`, `run_csynth.tcl`, `run_cosim.tcl`, `Makefile`, `run_all.sh`
+- **Implemented by:** `c2hlsc_agent.hls_project.write_project`, `c2hlsc_agent.testgen.generate_testbench`, `c2hlsc_agent.leveri_testgen.generate_leveri_testbenches`, `c2hlsc_agent.verilog_testgen.generate_verilog_testbenches`, `c2hlsc_agent.stimulus.render_helpers`, `c2hlsc_agent.coverage_refine.refine_project`, `c2hlsc_agent.hls_project.render_makefile`, `c2hlsc_agent.hls_project.render_run_csim`, `c2hlsc_agent.hls_project.render_run_csynth`, `c2hlsc_agent.hls_project.render_run_cosim`
+- **Driven by CLI:** `convert`, `refine`
+- **Reads:** `input.c`, `coverage/gcov_report.json`, `coverage/klee-out/*.ktest`
+- **Writes:** `src/hls_top.hpp`, `src/hls_top.cpp`, `tb/testbench.cpp`, `tb/leveri_golden_tb.cpp`, `tb/leveri_hls_tb.cpp`, `tb/leveri_compare.py`, `tb/run_gcov.py`, `tb/klee_driver.cpp`, `tb/run_klee.py`, `tb/leveri_manifest.json`, `tb/rtl_vectors_tb.cpp`, `tb/gen_rtl_tb.py`, `tb/run_rtl_sim.py`, `tb/rtl_tb_manifest.json`, `coverage_refinement.json`, `run_hls.tcl`, `run_csim.tcl`, `run_csynth.tcl`, `run_cosim.tcl`, `Makefile`, `run_all.sh`
 - **Budgets:** _none_
-- **Gate:** The oracle testbench must compile and drive golden C and HLS-C with identical stimuli.
+- **Gate:** the oracle testbench must compile and drive golden C and HLS-C with identical stimuli; refinement stops when the coverage target is met, two rounds fail to improve it, or the round/vector budget is spent
 - **Stop condition:** Host testbench compiles, feeds identical inputs to golden C and HLS-C, and reaches the configured coverage target.
-- **LLM seam:** Add model-proposed directed stimuli or coverage-driven refinement ON TOP of the deterministic testbench; keep the deterministic harness as the floor so a model can never weaken the oracle.
+- **LLM seam:** Coverage-driven refinement is live: KLEE counterexamples become permanent directed cases. The next increment is model-proposed directed stimuli on top of that; keep the deterministic harness as the floor so a model can never weaken the oracle.
 - **Invariants:**
   - The golden side calls the ORIGINAL C, macro-renamed to <top>_ref; it is never the generated code.
   - Stimulus is seeded (mt19937_64) so a mismatch is reproducible from the report.
+  - Both paired harnesses run ONE schedule; the static tier proves that rather than assuming it.
+  - Refinement only ADDS test cases: it never rewrites src/hls_top.cpp, so a repaired or optimized design survives a refinement round untouched.
   - No repair component may ever rewrite a testbench file from model output.
 
 ## `cosim_operator`
@@ -107,16 +109,17 @@ the floor and the fallback.
 - **Owns:** Run the verifier as the loop controller, short-circuiting on the first failing stage.
 - **Inputs:** HLS project, run_hls.tcl, testbench, toolchain settings
 - **Outputs:** software equivalence log, CSim log, CSynth log, CoSim log, phase status
-- **Implemented by:** `c2hlsc_agent.hls_runner.verify_project`, `c2hlsc_agent.hls_runner.run_software_equivalence`, `c2hlsc_agent.hls_runner.run_vitis`, `c2hlsc_agent.hls_runner._gate_cosim_on_log`, `c2hlsc_agent.cosim_verdict.evaluate_cosim_verdict`, `c2hlsc_agent.equivalence.run_command`, `c2hlsc_agent.remote.RemoteVitis.run_phase`
+- **Implemented by:** `c2hlsc_agent.hls_runner.verify_project`, `c2hlsc_agent.hls_runner.run_software_equivalence`, `c2hlsc_agent.hls_runner.run_trace_consistency`, `c2hlsc_agent.hls_runner.run_vitis`, `c2hlsc_agent.hls_runner._gate_cosim_on_log`, `c2hlsc_agent.cosim_verdict.evaluate_cosim_verdict`, `c2hlsc_agent.equivalence.run_command`, `c2hlsc_agent.remote.RemoteVitis.run_phase`
 - **Driven by CLI:** `convert`, `optimize`
-- **Reads:** `Makefile`, `run_csim.tcl`, `run_csynth.tcl`, `run_cosim.tcl`, `src/hls_top.cpp`, `tb/testbench.cpp`
-- **Writes:** `software_equivalence.log`, `csim.log`, `csynth.log`, `cosim.log`, `c2hlsc_project/`
+- **Reads:** `Makefile`, `run_csim.tcl`, `run_csynth.tcl`, `run_cosim.tcl`, `src/hls_top.cpp`, `tb/testbench.cpp`, `tb/leveri_golden_tb.cpp`, `tb/leveri_hls_tb.cpp`
+- **Writes:** `software_equivalence.log`, `trace_consistency.log`, `csim.log`, `csynth.log`, `cosim.log`, `c2hlsc_project/`
 - **Budgets:** `vitis_runs`, `wall_seconds`
-- **Gate:** software_equivalence -> csim -> csynth -> cosim, short-circuited: the first non-pass phase blocks the rest; a CoSim log failure marker downgrades a zero exit code to fail
+- **Gate:** software_equivalence -> trace_consistency -> csim -> csynth -> cosim, short-circuited: the first non-pass phase blocks the rest; a CoSim log failure marker downgrades a zero exit code to fail
 - **Stop condition:** Compile, CSim, synthesis, and C/RTL CoSim pass, or the earliest failure is classified with compact evidence.
 - **LLM seam:** None by design. The operator is the acceptance oracle; keeping it deterministic is what makes every model-proposed change checkable.
 - **Invariants:**
   - A skipped or unrequested phase is never reported as pass.
+  - The shift-left trace tier runs on every verification, so a paired-trace divergence fails the run instead of sitting in an advisory report nobody reads.
   - Vitis exiting 0 is not sufficient for CoSim: the log verdict is checked too.
   - A remote sync failure is reported as toolchain_unavailable (blocked), never as a code defect.
 

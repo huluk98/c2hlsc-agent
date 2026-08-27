@@ -1,31 +1,38 @@
 from __future__ import annotations
 
-from .analyze import AnalysisResult, FunctionArg
+from .analyze import AnalysisResult, FunctionArg, active_length_arg, looks_like_length_name
 from .config import AgentConfig
+from .stimulus import (
+    directed_index_decl,
+    directed_schedule,
+    directed_var,
+    extra_guard,
+    extra_vectors,
+    render_extra_tables,
+    render_helpers,
+    total_iterations,
+)
 
 
-_LENGTH_NAMES = {
-    "n",
-    "len",
-    "length",
-    "size",
-    "count",
-    "num",
-    "limit",
-    "samples",
-    "elements",
-}
 
 
 def _is_unsigned(c_type: str) -> bool:
     return "unsigned" in c_type or c_type.strip().startswith("uint") or "ap_uint" in c_type
 
 
-def _scalar_decl(arg: FunctionArg) -> str:
+def _scalar_decl(arg: FunctionArg, config: AgentConfig) -> str:
+    slot = directed_var(config, "test_idx")
     if arg.scalar_range:
         lo, hi = arg.scalar_range
-        return f"bounded_scalar<{arg.c_type}>(test_idx, rng, {lo}LL, {hi}LL)"
-    return f"random_value<{arg.c_type}>(rng)"
+        base = f"bounded_scalar<{arg.c_type}>({slot}, rng, {lo}LL, {hi}LL)"
+    else:
+        base = f"random_value<{arg.c_type}>(rng)"
+    guard = extra_guard(config, "test_idx")
+    if not guard:
+        return base
+    return (
+        f"({guard}) ? static_cast<{arg.c_type}>(c2hlsc_extra_{arg.name}[test_idx]) : {base}"
+    )
 
 
 def _storage_type(arg: FunctionArg) -> str:
@@ -36,18 +43,34 @@ def _value_print(expr: str) -> str:
     return f"static_cast<long long>({expr})"
 
 
-def _init_array(arg: FunctionArg) -> str:
+def _init_array(arg: FunctionArg, config: AgentConfig) -> str:
+    storage = _storage_type(arg)
     if arg.direction == "output":
+        # Outputs are never driven from a refinement vector: the sentinel is what makes an
+        # unwritten element visible, and it must stay unique per test index.
         return f"""for (int i = 0; i < {arg.length}; ++i) {{
-      auto v = output_sentinel<{_storage_type(arg)}>(test_idx, i);
+      auto v = output_sentinel<{storage}>(test_idx, i);
       ref_{arg.name}[i] = v;
       hls_{arg.name}[i] = v;
     }}"""
     unsigned = "true" if _is_unsigned(arg.c_type) else "false"
-    return f"""for (int i = 0; i < {arg.length}; ++i) {{
-      auto v = patterned_value<{_storage_type(arg)}>(test_idx, i, rng, {unsigned});
+    slot = directed_var(config, "test_idx")
+    patterned = f"""for (int i = 0; i < {arg.length}; ++i) {{
+      auto v = patterned_value<{storage}>({slot}, i, rng, {unsigned});
       ref_{arg.name}[i] = v;
       hls_{arg.name}[i] = v;
+    }}"""
+    guard = extra_guard(config, "test_idx")
+    if not guard:
+        return patterned
+    return f"""if ({guard}) {{
+      for (int i = 0; i < {arg.length}; ++i) {{
+        auto v = static_cast<{storage}>(c2hlsc_extra_{arg.name}[test_idx][i]);
+        ref_{arg.name}[i] = v;
+        hls_{arg.name}[i] = v;
+      }}
+    }} else {{
+      {patterned}
     }}"""
 
 
@@ -61,30 +84,10 @@ def _call_args(prefix: str, args: list[FunctionArg]) -> str:
     return ", ".join(values)
 
 
-def _looks_like_length_name(scalar_name: str, array_name: str) -> bool:
-    name = scalar_name.lower()
-    array = array_name.lower()
-    return (
-        name in _LENGTH_NAMES
-        or name in {f"{array}_n", f"n_{array}", f"{array}_len", f"{array}_length", f"{array}_size", f"{array}_count"}
-        or name.startswith("num_")
-        or name.endswith("_len")
-        or name.endswith("_length")
-        or name.endswith("_size")
-        or name.endswith("_count")
-    )
+_looks_like_length_name = looks_like_length_name
 
 
-def _active_length_arg(array_arg: FunctionArg, scalars: list[FunctionArg]) -> FunctionArg | None:
-    for scalar in scalars:
-        if not scalar.scalar_range:
-            continue
-        lo, hi = scalar.scalar_range
-        if lo < 0 or array_arg.length is None or hi > array_arg.length:
-            continue
-        if _looks_like_length_name(scalar.name, array_arg.name):
-            return scalar
-    return None
+_active_length_arg = active_length_arg
 
 
 def _scalar_log_expr(scalars: list[FunctionArg]) -> str:
@@ -142,9 +145,9 @@ def generate_testbench(analysis: AnalysisResult, config: AgentConfig) -> str:
         storage_type = _storage_type(arg)
         declarations.append(f"    {storage_type} ref_{arg.name}[{arg.length}] = {{}};")
         declarations.append(f"    {storage_type} hls_{arg.name}[{arg.length}] = {{}};")
-        initializers.append("    " + _init_array(arg).replace("\n", "\n    "))
+        initializers.append("    " + _init_array(arg, config).replace("\n", "\n    "))
     for arg in scalars:
-        declarations.append(f"    {arg.c_type} {arg.name} = {_scalar_decl(arg)};")
+        declarations.append(f"    {arg.c_type} {arg.name} = {_scalar_decl(arg, config)};")
 
     return_compare = ""
     return_capture_ref = ""
@@ -188,6 +191,15 @@ def generate_testbench(analysis: AnalysisResult, config: AgentConfig) -> str:
       }}
     }}""")
 
+    vectors = extra_vectors(config)
+    schedule = directed_schedule(config)
+    stimulus_helpers = render_helpers(config, "test_idx")
+    extra_tables = render_extra_tables(fn.args, vectors)
+    directed_decl = directed_index_decl(config, "test_idx")
+    iterations = total_iterations(config)
+    directed_names = ", ".join(schedule) or "none"
+    extra_note = f"; +{len(vectors)} refinement vector(s)" if vectors else ""
+
     return f"""// Generated by c2hlsc_agent. This file is testbench-only code.
 {contract_comment}
 #include <algorithm>
@@ -206,53 +218,7 @@ extern "C" {{
 
 #include "../src/hls_top.hpp"
 
-template <typename T>
-T random_value(std::mt19937_64& rng) {{
-  if (std::numeric_limits<T>::is_integer) {{
-    return static_cast<T>(rng());
-  }}
-  return static_cast<T>((rng() % 20001) - 10000) / static_cast<T>(100);
-}}
-
-template <typename T>
-T bounded_scalar(int test_idx, std::mt19937_64& rng, long long lo, long long hi) {{
-  if (hi < lo) return static_cast<T>(lo);
-  long long value = lo;
-  if (test_idx == 0) {{
-    value = lo;
-  }} else if (test_idx == 1) {{
-    value = hi;
-  }} else if (test_idx == 2) {{
-    value = lo + ((hi - lo) / 2);
-  }} else if (test_idx == 3 && lo <= 1 && hi >= 1) {{
-    value = 1;
-  }} else {{
-    const unsigned long long span = static_cast<unsigned long long>(hi - lo) + 1ULL;
-    value = lo + static_cast<long long>(rng() % span);
-  }}
-  return static_cast<T>(value);
-}}
-
-template <typename T>
-T patterned_value(int test_idx, int element_idx, std::mt19937_64& rng, bool is_unsigned) {{
-  if (test_idx == 0) return static_cast<T>(0);
-  if (test_idx == 1) return static_cast<T>(~static_cast<unsigned long long>(0));
-  if (test_idx == 2 && std::numeric_limits<T>::is_integer) {{
-    return is_unsigned ? std::numeric_limits<T>::max()
-                       : (element_idx % 2 ? std::numeric_limits<T>::max() : std::numeric_limits<T>::min());
-  }}
-  if (test_idx == 3) return static_cast<T>(element_idx % 2 ? 0xAAAAAAAAULL : 0x55555555ULL);
-  return random_value<T>(rng);
-}}
-
-template <typename T>
-T output_sentinel(int test_idx, int element_idx) {{
-  unsigned long long value = 0x9E3779B97F4A7C15ULL;
-  value ^= static_cast<unsigned long long>(test_idx + 1) * 0xBF58476D1CE4E5B9ULL;
-  value ^= static_cast<unsigned long long>(element_idx + 1) * 0x94D049BB133111EBULL;
-  return static_cast<T>(value);
-}}
-
+{extra_tables}{stimulus_helpers}
 template <typename T>
 bool values_equal(T a, T b) {{
   if (std::numeric_limits<T>::is_integer) {{
@@ -274,7 +240,8 @@ int clamp_count(long long value, int limit) {{
 
 int main() {{
   std::mt19937_64 rng({config.seed}ULL);
-  for (int test_idx = 0; test_idx < {config.num_tests}; ++test_idx) {{
+  for (int test_idx = 0; test_idx < {iterations}; ++test_idx) {{
+{directed_decl}
 {chr(10).join(declarations)}
 {chr(10).join(initializers)}
 {chr(10).join(compare_declarations)}
@@ -284,7 +251,8 @@ int main() {{
 {return_compare}
 {chr(10).join(comparisons)}
   }}
-  std::cout << "c2hlsc_agent: all {config.num_tests} tests passed, seed={config.seed}\\n";
+  std::cout << "c2hlsc_agent: all {iterations} tests passed, seed={config.seed}"
+            << " (directed: {directed_names}{extra_note})\\n";
   return 0;
 }}
 """

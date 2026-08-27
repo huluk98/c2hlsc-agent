@@ -25,6 +25,10 @@ class AgentConfig:
     arguments: dict[str, ArgumentConfig] = field(default_factory=dict)
     num_tests: int = 100
     directed_tests: list[str] = field(default_factory=lambda: ["zeros", "ones", "minmax", "alternating"])
+    # Concrete input vectors found by coverage refinement (KLEE counterexamples). Set
+    # programmatically by c2hlsc_agent.coverage_refine, never read from a config file:
+    # they are run evidence, not user configuration.
+    extra_vectors: list[Any] = field(default_factory=list)
     part: str = "xczu7ev-ffvc1156-2-e"
     clock: float = 10.0
     interface_mode: str = "default"

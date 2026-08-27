@@ -45,6 +45,51 @@ class AnalysisResult:
     unsupported_constructs: list[Diagnostic]
 
 
+#: Scalar parameter names that conventionally carry the *active* length of a companion
+#: array. When one is present and its configured range fits inside the array, every
+#: testbench tier compares only that many elements — the rest of the buffer is outside
+#: the declared contract and comparing it would report a false mismatch.
+LENGTH_NAMES = {
+    "n",
+    "len",
+    "length",
+    "size",
+    "count",
+    "num",
+    "limit",
+    "samples",
+    "elements",
+}
+
+
+def looks_like_length_name(scalar_name: str, array_name: str) -> bool:
+    name = scalar_name.lower()
+    array = array_name.lower()
+    return (
+        name in LENGTH_NAMES
+        or name in {f"{array}_n", f"n_{array}", f"{array}_len", f"{array}_length", f"{array}_size", f"{array}_count"}
+        or name.startswith("num_")
+        or name.endswith("_len")
+        or name.endswith("_length")
+        or name.endswith("_size")
+        or name.endswith("_count")
+    )
+
+
+def active_length_arg(array_arg: FunctionArg, scalars: list[FunctionArg]) -> FunctionArg | None:
+    """The bounded scalar that acts as ``array_arg``'s active length, if any."""
+
+    for scalar in scalars:
+        if not scalar.scalar_range:
+            continue
+        lo, hi = scalar.scalar_range
+        if lo < 0 or array_arg.length is None or hi > array_arg.length:
+            continue
+        if looks_like_length_name(scalar.name, array_arg.name):
+            return scalar
+    return None
+
+
 def strip_comments(source: str) -> str:
     source = re.sub(r"/\*.*?\*/", "", source, flags=re.S)
     source = re.sub(r"//.*", "", source)

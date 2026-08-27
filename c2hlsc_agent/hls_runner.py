@@ -9,14 +9,26 @@ from .equivalence import PhaseResult, VerificationState, parse_mismatches, run_c
 from .remote import RemoteVitis
 
 
-PHASE_ORDER = ("software_equivalence", "csim", "csynth", "cosim")
+PHASE_ORDER = ("software_equivalence", "trace_consistency", "csim", "csynth", "cosim")
 PHASE_TIMEOUTS = {"csim": 600, "csynth": 1200, "cosim": 600}
+
+#: Host phases, in order. Both run on the local toolchain (g++/make/python3) and both are
+#: required whenever a project is verified at all; the Vitis phases below them are opt-in.
+HOST_PHASES = ("software_equivalence", "trace_consistency")
+VITIS_PHASES = ("csim", "csynth", "cosim")
+
+
+def required_phases(run_vitis_requested: bool) -> list[str]:
+    """Phases whose result decides the run: the host tier always, Vitis when requested."""
+
+    required = list(HOST_PHASES)
+    if run_vitis_requested:
+        required.extend(VITIS_PHASES)
+    return required
 
 
 def earliest_failing_phase(state: VerificationState, run_vitis_requested: bool) -> str | None:
-    required = ["software_equivalence"]
-    if run_vitis_requested:
-        required.extend(["csim", "csynth", "cosim"])
+    required = required_phases(run_vitis_requested)
     for phase in required:
         if state.status_for(phase) != "pass":
             return phase
@@ -48,6 +60,34 @@ def run_software_equivalence(project_dir: Path, verbose: bool = False) -> PhaseR
         return PhaseResult("software_equivalence", "fail", summary="make not found")
     except subprocess.TimeoutExpired as exc:
         return _timeout_result(project_dir, "software_equivalence", exc, "host equivalence")
+    if verbose and result.stdout:
+        print(result.stdout)
+    return result
+
+
+def run_trace_consistency(project_dir: Path, verbose: bool = False) -> PhaseResult:
+    """The HLS-LeVeri shift-left tier: paired traces plus the dual-tier consistency check.
+
+    Runs ``make leveri-test``, which builds the golden and HLS trace testbenches, executes
+    both against one synchronized stimulus schedule, and runs ``tb/leveri_compare.py`` --
+    static structural alignment (schema, stimulus columns, control flow, data dependency)
+    followed by dynamic behavioural consistency on the output columns.
+    """
+
+    if shutil.which("python3") is None:
+        # The comparator is a Python script; without an interpreter this is a missing
+        # tool, not a design defect, so word it the way classify_log_family reads.
+        return PhaseResult(
+            "trace_consistency",
+            "fail",
+            summary="python3 not found on PATH; trace tooling unavailable",
+        )
+    try:
+        result = run_command(["make", "leveri-test"], project_dir, "trace_consistency", timeout=180)
+    except FileNotFoundError:
+        return PhaseResult("trace_consistency", "fail", summary="make not found")
+    except subprocess.TimeoutExpired as exc:
+        return _timeout_result(project_dir, "trace_consistency", exc, "trace consistency")
     if verbose and result.stdout:
         print(result.stdout)
     return result
@@ -175,10 +215,23 @@ def verify_project(
     state.add_phase(software)
     state.mismatches.extend(parse_mismatches(software.stdout + "\n" + software.stderr))
     if software.status != "pass":
-        state.add_phase(PhaseResult("csim", "blocked", summary="software equivalence failed"))
-        state.add_phase(PhaseResult("csynth", "blocked", summary="software equivalence failed"))
-        state.add_phase(PhaseResult("cosim", "blocked", summary="software equivalence failed"))
+        _block_after(state, "trace_consistency", "software equivalence failed")
         return state
+
+    trace = run_trace_consistency(project_dir, verbose=verbose)
+    state.add_phase(trace)
+    if trace.status != "pass":
+        _block_after(state, "csim", "trace consistency failed")
+        return state
+
     for result in run_vitis(project_dir, run_vitis_requested, remote=remote).values():
         state.add_phase(result)
     return state
+
+
+def _block_after(state: VerificationState, first_blocked: str, reason: str) -> None:
+    """Mark ``first_blocked`` and every later phase blocked, never skipped."""
+
+    start = PHASE_ORDER.index(first_blocked)
+    for phase in PHASE_ORDER[start:]:
+        state.add_phase(PhaseResult(phase, "blocked", summary=reason))

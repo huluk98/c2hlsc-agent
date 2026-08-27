@@ -250,7 +250,7 @@ class OptimizerLoopTests(unittest.TestCase):
     @staticmethod
     def _passing_state() -> VerificationState:
         state = VerificationState()
-        for phase in ("software_equivalence", "csim", "csynth", "cosim"):
+        for phase in ("software_equivalence", "trace_consistency", "csim", "csynth", "cosim"):
             state.add_phase(PhaseResult(phase, "pass"))
         return state
 
@@ -298,6 +298,7 @@ class OptimizerLoopTests(unittest.TestCase):
             original = (out_dir / "src" / "hls_top.cpp").read_text(encoding="utf-8")
             failing = VerificationState()
             failing.add_phase(PhaseResult("software_equivalence", "pass"))
+            failing.add_phase(PhaseResult("trace_consistency", "pass"))
             failing.add_phase(PhaseResult("csim", "pass"))
             failing.add_phase(PhaseResult("csynth", "pass"))
             failing.add_phase(PhaseResult("cosim", "fail", summary="mismatch"))

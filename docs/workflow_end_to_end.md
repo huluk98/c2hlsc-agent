@@ -54,7 +54,7 @@ Everything below exists to keep those two statements true.
 flowchart TD
     A["01 plan<br/><b>contract_planner</b>"] --> B["02 generate<br/><b>hlsc_generator_agent</b>"]
     B --> C["03 emit<br/><b>shift_left_testbench_agent</b>"]
-    C --> D["04 verify<br/><b>cosim_operator</b>"]
+    C --> D["04 verify<br/><b>cosim_operator</b><br/><i>5 rungs</i>"]
     D -- "fail" --> E["05 triage<br/><b>failure_analyst</b>"]
     D -- "pass" --> G["07 record<br/><b>audit_memory_agent</b>"]
     E -- "needs_action + --auto-repair" --> F["06 repair<br/><b>hlsc_repair_agent</b>"]
@@ -121,6 +121,8 @@ deliberately exercises it.
 | `repair` | Apply one repair from evidence produced by an *external* run (e.g. a Vitis machine) | a change was applied |
 | `optimize` | Post-equivalence PPA loop on an already-verified project | no rollback, targets met (if any), and at least one candidate was actually scored |
 | `status` | Read the persistent bounded-run ledger without touching it | a run record exists |
+| `refine` | Coverage-driven stimulus refinement on a generated project | the target was met, or no target was set and the tooling ran |
+| `doctor` | Check every external tool each tier needs, and install the missing ones | no *core* tool is missing |
 | `components` | Inspect the component scaffold; runs nothing | always |
 
 ---
@@ -311,7 +313,7 @@ passed, and — when `--run-vitis` was requested — `csim`, `csynth`, and `cosi
 
 ## 6. The verification ladder in detail
 
-`verify_project` runs `PHASE_ORDER = (software_equivalence, csim, csynth, cosim)` and
+`verify_project` runs `PHASE_ORDER = (software_equivalence, trace_consistency, csim, csynth, cosim)` and
 short-circuits: the first non-pass phase marks every later phase `blocked`. Statuses are
 used exactly: `pass`, `fail`, `blocked` (an earlier phase failed), `skipped` (never
 requested). **A skipped or unrequested phase is never promoted to `pass`.**
@@ -319,6 +321,7 @@ requested). **A skipped or unrequested phase is never promoted to `pass`.**
 | Phase | Command | Timeout | What it proves |
 | --- | --- | --- | --- |
 | `software_equivalence` | `make test` | 120 s | Original C and generated HLS-C agree on the generated stimuli, on the host |
+| `trace_consistency` | `make leveri-test` | 180 s | The paired golden/HLS harnesses are structurally aligned (schema, stimulus, CFG, def-use) **and** their output traces agree — the shift-left dual tier |
 | `csim` | `vitis_hls -f run_csim.tcl` | 600 s | The same comparison inside Vitis' own C simulation |
 | `csynth` | `vitis_hls -f run_csynth.tcl` | 1200 s | The design synthesizes; produces the QoR report |
 | `cosim` | `vitis_hls -f run_cosim.tcl` | 600 s | Generated HLS-C and the generated RTL agree |
@@ -328,14 +331,42 @@ flowchart LR
     C["input.c<br/><i>the golden oracle</i>"] -- "generate" --> H["src/hls_top.cpp<br/><i>the generated design</i>"]
     H -- "csynth" --> R["RTL (Verilog)<br/><i>what you ship</i>"]
     C <-. "software_equivalence<br/>make test, on the host" .-> H
+    C <-. "trace_consistency<br/>paired traces, dual-tier" .-> H
     C <-. "csim<br/>the same comparison, in Vitis" .-> H
     H <-. "cosim<br/>C/RTL co-simulation" .-> R
 ```
 
-**No single rung proves that the RTL matches the original C.** Rungs 1 and 2 compare
+**No single rung proves that the RTL matches the original C.** The host rungs compare
 `input.c` against `src/hls_top.cpp`. CSynth compares nothing — it *produces* the RTL.
 CoSim compares `src/hls_top.cpp` against that RTL. Only the unbroken chain gets you the
 claim, which is why an earlier failure blocks every later rung instead of being skipped.
+
+### The shift-left tier, in two tiers
+
+`trace_consistency` implements the dual-tier check from the HLS-LeVeri shift-left work.
+Both halves matter, and they answer *different* questions:
+
+```mermaid
+flowchart TD
+    G["tb/leveri_golden_tb.cpp<br/><i>calls input.c as &lt;top&gt;_ref</i>"] --> GT["leveri_golden_trace.csv"]
+    H["tb/leveri_hls_tb.cpp<br/><i>calls src/hls_top.cpp</i>"] --> HT["leveri_hls_trace.csv"]
+    G -. "TIER 1 — static: schema, stimulus columns,<br/>control-flow shape, def-use structure" .-> H
+    GT -- "TIER 2 — dynamic: output columns,<br/>clamped to the declared active length" --> HT
+    G --> Q1{{"tier 1 fails?"}}
+    Q1 --> A1["<b>testbench_structural_divergence</b><br/>owner: shift_left_testbench_agent<br/>the design must NOT be touched"]
+    HT --> Q2{{"tier 2 fails?"}}
+    Q2 --> A2["<b>trace_behavior_mismatch</b><br/>owner: failure_analyst<br/>a design defect, repair src/hls_top.cpp"]
+```
+
+The static tier compares the two **harnesses**, not the two designs. Because both come
+from one template it passes by construction today — which is the point: the day one side's
+stimulus is augmented and the other's is not, the run reports a *harness* defect instead of
+blaming the design. That separation is exactly what `classify_failure` routes on.
+
+The dynamic tier clamps each output element to the array's declared active length (the
+bounded scalar named `n`, `len`, `count`, …), the same way the oracle testbench's
+`clamp_count` does. Without that, a design that legitimately leaves the tail of a buffer
+untouched would be reported as a behavioural mismatch.
 
 Notes that matter:
 
@@ -540,14 +571,88 @@ an intentional reset only: changed requirements, corrected input, an approved bu
 
 ---
 
-## 10. Testbench tiers beyond the ladder
+## 10. Stimulus, coverage, and the refinement loop
 
-The ladder uses `tb/testbench.cpp`. The other tiers are opt-in and run from the project:
+### The directed schedule is configuration, not a constant
+
+`directed_tests` orders the leading directed cases; every later test is pseudo-random from
+the seeded `mt19937_64` stream. Slot *i* of the run uses pattern *i*:
+
+| Pattern | What every element gets |
+| --- | --- |
+| `zeros` | `0` |
+| `ones` | all bits set |
+| `minmax` | type max, alternating with type min for signed types (integers only) |
+| `alternating` | `0xAAAAAAAA` / `0x55555555` by element index |
+| `random` | an explicit "leave this slot pseudo-random" marker |
+
+Bounded scalars get their own corner schedule over the same slots — low, high, midpoint,
+one — capped at the length of `directed_tests`, so `directed_tests: []` really does mean
+*no directed cases anywhere*. An unrecognized name is rejected at generation time rather
+than silently ignored, and the report prints the schedule that was actually compiled in.
+
+### Measuring coverage
 
 ```text
-make leveri-test      # paired golden/HLS CSV traces + static and dynamic comparison
-make gcov-coverage    # line/branch coverage of both trace testbenches
-make klee-coverage    # symbolic exploration of the golden top (skips cleanly if absent)
+make gcov-coverage    # line and branch coverage, PARSED into a number
+make klee-coverage    # symbolic exploration of the golden top
+make refine-coverage  # the loop below
+```
+
+`run_gcov.py` compiles each translation unit separately (a one-step multi-source build
+makes gcc name the notes files in a way gcov cannot resolve, which silently drops
+`src/hls_top.cpp` out of the number), runs both trace testbenches, runs the dual-tier
+comparison, then parses every `.gcov` file into:
+
+- `line_coverage` / `branch_coverage`, measured over `input.c` and `src/hls_top.cpp` only —
+  the harness is 100% covered by construction and would mask the real figure;
+- `uncovered_lines` and `uncovered_branches`, with file and line, which is what the
+  refinement loop steers toward.
+
+Set `C2HLSC_MIN_COVERAGE=95` to turn coverage into a gate. It compares against the
+**weaker** of line and branch coverage: line coverage alone saturates easily while a whole
+branch stays unreached, which is precisely the case worth catching.
+
+### Refining the stimulus against what it missed
+
+```mermaid
+flowchart LR
+    M["measure<br/><i>gcov</i>"] --> U{{"target met?"}}
+    U -- "yes" --> DONE["<b>met</b>"]
+    U -- "no" --> K["explore<br/><i>KLEE on the golden top</i>"]
+    K -- "new .ktest" --> V["decode to input vectors"]
+    K -- "no KLEE / nothing new" --> W["widen the random schedule"]
+    V --> R["regenerate the testbenches<br/><i>vectors replayed before the directed schedule</i>"]
+    W --> R
+    R --> M
+    M -. "2 consecutive flat rounds,<br/>or the round/vector budget" .-> STOP["<b>no_progress</b> / <b>exhausted</b>"]
+```
+
+```text
+c2hlsc-agent refine --project c2hlsc_project --target 95 --max-rounds 5
+```
+
+Each `.ktest` KLEE writes is a concrete input assignment for a path it reached. The loop
+decodes it (big-endian header, little-endian object bytes, one element per argument width),
+clamps scalars into their declared ranges, and folds it in as an `ExtraVector` — a
+permanent directed case replayed *before* the schedule. A branch guarded by `x == 424242`
+becomes a reproducible test instead of a coverage hole.
+
+Where KLEE is unavailable — notably macOS, which has no native package — the loop falls
+back to **widening** the random schedule and says so in the report. Widening cannot reach a
+guarded equality branch; the report never implies otherwise.
+
+Bounds: 5 rounds, 64 vectors, 4096 tests, and a stop after **two consecutive** rounds that
+fail to move the number (one flat round is not proof, since widening is probabilistic).
+
+Two invariants: refinement only ever **adds test cases** — it reads `src/hls_top.cpp` back
+and writes it out unchanged, so a repaired or optimized design survives a round untouched —
+and the added cases are real tests the design has not been checked against yet, so the
+command tells you to re-run verification afterwards.
+
+### Testbench tiers beyond the ladder
+
+```text
 make rtl-vectors      # golden expected vectors from the original C
 make rtl-testbench    # render a self-checking SV testbench against the synthesized RTL ports
 make rtl-cosim        # simulate the RTL against those vectors
@@ -555,6 +660,28 @@ make rtl-cosim        # simulate the RTL against those vectors
 
 The RTL tier is **not** Vitis CoSim. It exercises synthesized RTL under its own declared
 interface contract, and its results must be reported as such.
+
+### When a tool is missing
+
+```text
+c2hlsc-agent doctor                  # what is here, what is not, and what would install it
+c2hlsc-agent doctor --install        # install the missing ones (Homebrew / apt / dnf / pacman)
+c2hlsc-agent doctor --install --dry-run --tier ppa
+```
+
+Tools are grouped by the tier that stops working without them: `core` (g++, make, python3),
+`coverage` (gcov), `symbolic` (klee, clang++), `ppa` (yosys, OpenSTA), `rtl` (iverilog,
+verilator), `vendor` (vitis_hls). Three rules keep it honest:
+
+- **Nothing installs on its own.** `doctor` only looks until you pass `--install`.
+- **A package name is verified before it is offered.** Homebrew formulae are confirmed with
+  `brew info` first, so you are never handed a command that does not exist.
+- **Some tools cannot be installed this way and say so** — KLEE has no macOS formula (the
+  official Docker image is the supported route), and Vitis HLS is a licensed vendor
+  download that is Linux-only; from a Mac, run it remotely with `--vitis-ssh`.
+
+`doctor` exits non-zero only when a **core** tool is missing; an absent optional tool is a
+narrower flow, not a broken install.
 
 ---
 
@@ -629,7 +756,10 @@ without a fresh report and a named tool, version, part, and clock.
 | `src/hls_top.{hpp,cpp}` | generator, then repair, then optimizer | ladder, candidates |
 | `tb/*` | `shift_left_testbench_agent` | ladder + the optional tiers |
 | `run_{hls,csim,csynth,cosim}.tcl`, `Makefile`, `run_all.sh` | `shift_left_testbench_agent` | `cosim_operator` |
-| `software_equivalence.log`, `csim.log`, `csynth.log`, `cosim.log` | `cosim_operator` | `failure_analyst`, repair evidence |
+| `software_equivalence.log`, `trace_consistency.log`, `csim.log`, `csynth.log`, `cosim.log` | `cosim_operator` | `failure_analyst`, repair evidence |
+| `leveri_golden_trace.csv`, `leveri_hls_trace.csv` | the paired trace testbenches | `tb/leveri_compare.py` (dual tier) |
+| `coverage/gcov_report.json`, `coverage/klee_report.json` | the coverage targets | `refine`, the conversion report |
+| `coverage_refinement.json` | `refine` | humans; records every round and every added vector |
 | `c2hlsc_project/` | Vitis | `qor.parse_csynth_xml`, the RTL tier |
 | `candidate_scores.json`, `.candidates/` | best-of-N generation | the report |
 | `repair_audit.json` | `hlsc_repair_agent` | the report, the oscillation guard, future retrieval memory |
@@ -696,6 +826,12 @@ richer multi-turn or tool-using loop is fine, as long as every agent keeps retur
 - The never-hand-the-original-C-to-the-model rule.
 - `_gate_cosim_on_log` — exit code 0 is not a CoSim pass.
 - Only `src/hls_top.cpp` is model-writable; `input.c` and `tb/` are not.
+- The paired harnesses run one schedule, and the static tier *proves* that rather than
+  assuming it. A static-tier failure is a harness defect and must never be repaired as a
+  design defect.
+- Refinement only adds test cases. It reads the design back and writes it out unchanged.
+- Coverage is measured over the specification and the design, never the harness, and a
+  coverage number is only ever reported from a parsed report.
 - The three oscillation guards, and immutable budgets across resume.
 - Repair and transformation audit provenance: no hidden failed phase, oscillation
   rejection, deterministic fallback, or unavailable backend.
@@ -728,6 +864,15 @@ python -m c2hlsc_agent convert \
 python -m c2hlsc_agent convert \
   --spec "8-bit saturating adder; inputs a and b, output sum, saturate at 255" \
   --top sat_add --out build/sat_add --run-vitis
+
+# Check the toolchain first; install whatever this machine is missing.
+python -m c2hlsc_agent doctor
+python -m c2hlsc_agent doctor --install
+
+# Drive structural coverage up, then re-verify against the cases that were added.
+python -m c2hlsc_agent refine --project build/fir --target 95 --verbose
+python -m c2hlsc_agent convert --input examples/simple_fir/input.c --top simple_fir \
+  --config examples/simple_fir/config.yaml --out build/fir --new-run
 
 # Inspect, then optimize.
 python -m c2hlsc_agent status --project build/fir

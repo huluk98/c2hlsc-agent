@@ -49,7 +49,7 @@ STAGE_ORDER = ("plan", "generate", "emit", "verify", "triage", "repair", "record
 STAGE_PURPOSE = {
     "plan": "Fix the must-preserve contract before any code is generated.",
     "generate": "Propose a synthesizable HLS-C translation unit (deterministic baseline, optional model candidate).",
-    "emit": "Materialize the project on disk: sources, every testbench tier, TCLs, Makefile.",
+    "emit": "Materialize the project: sources, every testbench tier, TCLs, Makefile; refine the stimulus against coverage.",
     "verify": "Run the short-circuiting equivalence ladder; this is the only acceptance oracle.",
     "triage": "Turn the earliest failure into a routed, owner-tagged repair intent.",
     "repair": "Apply a minimal auditable patch, then rerun the ladder from the beginning.",
@@ -397,14 +397,16 @@ class ShiftLeftTestbenchAgent:
             "c2hlsc_agent.testgen.generate_testbench",
             "c2hlsc_agent.leveri_testgen.generate_leveri_testbenches",
             "c2hlsc_agent.verilog_testgen.generate_verilog_testbenches",
+            "c2hlsc_agent.stimulus.render_helpers",
+            "c2hlsc_agent.coverage_refine.refine_project",
             "c2hlsc_agent.hls_project.render_makefile",
             "c2hlsc_agent.hls_project.render_run_csim",
             "c2hlsc_agent.hls_project.render_run_csynth",
             "c2hlsc_agent.hls_project.render_run_cosim",
         ),
         status="deterministic",
-        cli=("convert",),
-        reads=("input.c",),
+        cli=("convert", "refine"),
+        reads=("input.c", "coverage/gcov_report.json", "coverage/klee-out/*.ktest"),
         writes=(
             "src/hls_top.hpp",
             "src/hls_top.cpp",
@@ -420,6 +422,7 @@ class ShiftLeftTestbenchAgent:
             "tb/gen_rtl_tb.py",
             "tb/run_rtl_sim.py",
             "tb/rtl_tb_manifest.json",
+            "coverage_refinement.json",
             "run_hls.tcl",
             "run_csim.tcl",
             "run_csynth.tcl",
@@ -427,16 +430,24 @@ class ShiftLeftTestbenchAgent:
             "Makefile",
             "run_all.sh",
         ),
-        gate="The oracle testbench must compile and drive golden C and HLS-C with identical stimuli.",
+        gate=(
+            "the oracle testbench must compile and drive golden C and HLS-C with identical stimuli; "
+            "refinement stops when the coverage target is met, two rounds fail to improve it, or the "
+            "round/vector budget is spent"
+        ),
         budgets=(),
         invariants=(
             "The golden side calls the ORIGINAL C, macro-renamed to <top>_ref; it is never the generated code.",
             "Stimulus is seeded (mt19937_64) so a mismatch is reproducible from the report.",
+            "Both paired harnesses run ONE schedule; the static tier proves that rather than assuming it.",
+            "Refinement only ADDS test cases: it never rewrites src/hls_top.cpp, so a repaired or "
+            "optimized design survives a refinement round untouched.",
             "No repair component may ever rewrite a testbench file from model output.",
         ),
         llm_seam=(
-            "Add model-proposed directed stimuli or coverage-driven refinement ON TOP of the deterministic "
-            "testbench; keep the deterministic harness as the floor so a model can never weaken the oracle."
+            "Coverage-driven refinement is live: KLEE counterexamples become permanent directed cases. "
+            "The next increment is model-proposed directed stimuli on top of that; keep the deterministic "
+            "harness as the floor so a model can never weaken the oracle."
         ),
     )
 
@@ -476,6 +487,7 @@ class CosimOperator:
         implementation=(
             "c2hlsc_agent.hls_runner.verify_project",
             "c2hlsc_agent.hls_runner.run_software_equivalence",
+            "c2hlsc_agent.hls_runner.run_trace_consistency",
             "c2hlsc_agent.hls_runner.run_vitis",
             "c2hlsc_agent.hls_runner._gate_cosim_on_log",
             "c2hlsc_agent.cosim_verdict.evaluate_cosim_verdict",
@@ -484,15 +496,33 @@ class CosimOperator:
         ),
         status="deterministic",
         cli=("convert", "optimize"),
-        reads=("Makefile", "run_csim.tcl", "run_csynth.tcl", "run_cosim.tcl", "src/hls_top.cpp", "tb/testbench.cpp"),
-        writes=("software_equivalence.log", "csim.log", "csynth.log", "cosim.log", "c2hlsc_project/"),
+        reads=(
+            "Makefile",
+            "run_csim.tcl",
+            "run_csynth.tcl",
+            "run_cosim.tcl",
+            "src/hls_top.cpp",
+            "tb/testbench.cpp",
+            "tb/leveri_golden_tb.cpp",
+            "tb/leveri_hls_tb.cpp",
+        ),
+        writes=(
+            "software_equivalence.log",
+            "trace_consistency.log",
+            "csim.log",
+            "csynth.log",
+            "cosim.log",
+            "c2hlsc_project/",
+        ),
         gate=(
-            "software_equivalence -> csim -> csynth -> cosim, short-circuited: the first non-pass phase "
-            "blocks the rest; a CoSim log failure marker downgrades a zero exit code to fail"
+            "software_equivalence -> trace_consistency -> csim -> csynth -> cosim, short-circuited: the "
+            "first non-pass phase blocks the rest; a CoSim log failure marker downgrades a zero exit code to fail"
         ),
         budgets=("vitis_runs", "wall_seconds"),
         invariants=(
             "A skipped or unrequested phase is never reported as pass.",
+            "The shift-left trace tier runs on every verification, so a paired-trace divergence "
+            "fails the run instead of sitting in an advisory report nobody reads.",
             "Vitis exiting 0 is not sufficient for CoSim: the log verdict is checked too.",
             "A remote sync failure is reported as toolchain_unavailable (blocked), never as a code defect.",
         ),
@@ -520,16 +550,10 @@ class CosimOperator:
             status=status,
             summary=(
                 "Ladder: "
-                + ", ".join(f"{phase}={phases.get(phase, 'skipped')}" for phase in ("software_equivalence", "csim", "csynth", "cosim"))
+                + ", ".join(f"{phase}={phases.get(phase, 'skipped')}" for phase in PHASE_ORDER)
                 + f"; {len(state.mismatches)} parsed mismatch(es)."
             ),
-            artifacts=_existing(
-                context.project_dir,
-                "software_equivalence.log",
-                "csim.log",
-                "csynth.log",
-                "cosim.log",
-            ),
+            artifacts=_existing(context.project_dir, *(f"{phase}.log" for phase in PHASE_ORDER)),
             detail={
                 "phases": {name: result.to_dict() for name, result in state.phases.items()},
                 "mismatches": [mismatch.to_dict() for mismatch in state.mismatches],

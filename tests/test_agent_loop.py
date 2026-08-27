@@ -32,6 +32,7 @@ class AgentLoopTests(unittest.TestCase):
     def test_routes_missing_vitis_to_operator(self):
         state = VerificationState()
         state.add_phase(PhaseResult("software_equivalence", "pass"))
+        state.add_phase(PhaseResult("trace_consistency", "pass"))
         state.add_phase(PhaseResult("csim", "fail", summary="vitis_hls not found on PATH"))
         decision = classify_failure(state, run_vitis_requested=True)
         self.assertEqual(decision.family, "toolchain_unavailable")
@@ -40,7 +41,7 @@ class AgentLoopTests(unittest.TestCase):
 
     def test_all_pass_hands_to_optimizer(self):
         state = VerificationState()
-        for phase in ("software_equivalence", "csim", "csynth", "cosim"):
+        for phase in ("software_equivalence", "trace_consistency", "csim", "csynth", "cosim"):
             state.add_phase(PhaseResult(phase, "pass"))
         decision = classify_failure(state, run_vitis_requested=True)
         self.assertEqual(decision.family, "functional_equivalence_signed_off")

@@ -143,6 +143,7 @@ class ComponentContractTests(unittest.TestCase):
             context.config.run_vitis = True
             state = VerificationState()
             state.add_phase(PhaseResult("software_equivalence", "pass"))
+            state.add_phase(PhaseResult("trace_consistency", "pass"))
             state.add_phase(PhaseResult("csim", "pass"))
             state.add_phase(
                 PhaseResult("csynth", "fail", stdout="ERROR: unsupported pointer aliasing and memory bound")
@@ -238,6 +239,7 @@ class ComponentPipelineTests(unittest.TestCase):
             context.config.run_vitis = True
             state = VerificationState()
             state.add_phase(PhaseResult("software_equivalence", "pass"))
+            state.add_phase(PhaseResult("trace_consistency", "pass"))
             state.add_phase(PhaseResult("csim", "pass"))
             state.add_phase(
                 PhaseResult(

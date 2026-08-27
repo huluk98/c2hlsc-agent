@@ -87,7 +87,11 @@ class LeVeriTestgenTests(unittest.TestCase):
         self.assertIn("klee_report.json", bundle.klee_script)
         self.assertIn("static_header_alignment", bundle.manifest_json)
         self.assertIn("dynamic_output_consistency", bundle.manifest_json)
-        self.assertIn("HLS-LeVeri consistency check passed", bundle.compare_script)
+        self.assertIn("HLS-LeVeri dual-tier consistency check passed", bundle.compare_script)
+        self.assertIn("static_control_flow_alignment", bundle.manifest_json)
+        self.assertIn("static_data_dependency_alignment", bundle.manifest_json)
+        self.assertIn("cfg_signature", bundle.compare_script)
+        self.assertIn("ddg_signature", bundle.compare_script)
 
     @unittest.skipUnless(shutil.which("g++") and shutil.which("make") and shutil.which("python3"), "g++, make, and python3 are required")
     def test_project_leveri_trace_check_passes(self):
@@ -100,7 +104,7 @@ class LeVeriTestgenTests(unittest.TestCase):
 
         run = subprocess.run(["make", "-C", str(project), "leveri-test"], text=True, capture_output=True)
         self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
-        self.assertIn("HLS-LeVeri consistency check passed", run.stdout)
+        self.assertIn("HLS-LeVeri dual-tier consistency check passed", run.stdout)
 
     @unittest.skipUnless(shutil.which("g++") and shutil.which("gcov") and shutil.which("make") and shutil.which("python3"), "g++, gcov, make, and python3 are required")
     def test_project_gcov_coverage_target_writes_report(self):

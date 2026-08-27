@@ -85,7 +85,7 @@ LEVERI_GOLDEN_EXE ?= leveri_golden_tb
 LEVERI_HLS_EXE ?= leveri_hls_tb
 RTL_VECTORS_EXE ?= rtl_vectors_tb
 
-.PHONY: all test leveri-test gcov-coverage klee-coverage coverage \\
+.PHONY: all test leveri-test gcov-coverage klee-coverage coverage refine-coverage \\
         rtl-vectors rtl-testbench rtl-cosim clean vitis
 
 all: test
@@ -114,6 +114,11 @@ klee-coverage:
 \tpython3 tb/run_klee.py
 
 coverage: gcov-coverage klee-coverage
+
+# Coverage-driven stimulus refinement: measure, find what the schedule never reaches,
+# get inputs that reach it (KLEE), fold them back in as directed cases, measure again.
+refine-coverage:
+\tpython3 -m c2hlsc_agent refine --project .
 
 # Standalone RTL (Verilog) testbench flow. Produces golden expected vectors from the
 # original C, renders a self-checking testbench, and (post-synthesis) simulates the RTL.

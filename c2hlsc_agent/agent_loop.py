@@ -146,8 +146,19 @@ def _phase_text(state: VerificationState, phase: str) -> str:
 
 def classify_log_family(phase: str, text: str) -> str:
     lowered = text.lower()
-    if "vitis_hls not found" in lowered or "remote vitis unavailable" in lowered:
+    if (
+        "vitis_hls not found" in lowered
+        or "remote vitis unavailable" in lowered
+        or "trace tooling unavailable" in lowered
+        or "make not found" in lowered
+    ):
         return "toolchain_unavailable"
+    if "hls-leveri static" in lowered:
+        # The static tier compares the two HARNESSES, so a divergence there is a
+        # testbench defect by construction and must never be repaired as a design bug.
+        return "testbench_structural_divergence"
+    if "hls-leveri dynamic" in lowered:
+        return "behavioral_mismatch"
     if re.search(r"\b(timeout|timed out|deadlock|stdout-silence)\b", lowered):
         return "timeout_or_deadlock"
     if "mismatch" in lowered or ("expected=" in lowered and "actual=" in lowered):
@@ -162,6 +173,8 @@ def classify_log_family(phase: str, text: str) -> str:
         return "loop_scheduling"
     if re.search(r"\b(not synthesizable|unsupported|cannot synthesize|synthesis failed)\b", lowered):
         return "non_synthesizable_construct"
+    if phase == "trace_consistency":
+        return "trace_consistency_failure"
     if phase in {"software_equivalence", "csim"}:
         return "testbench_or_c_semantics"
     if phase == "csynth":
@@ -211,6 +224,50 @@ def classify_failure(
             owner_agent="cosim_operator",
             next_action="Run host software equivalence before Vitis phases.",
             evidence_needed=("software equivalence phase status",),
+            repair_scope="verification scheduling",
+        )
+
+    trace_status = state.status_for("trace_consistency")
+    if trace_status == "fail":
+        text = _phase_text(state, "trace_consistency")
+        family = classify_log_family("trace_consistency", text)
+        if family == "toolchain_unavailable":
+            return FailureAnalysis(
+                family=family,
+                owner_agent="cosim_operator",
+                next_action="Install the host trace tooling (make + python3), then rerun the verifier from the first rung.",
+                evidence_needed=("PATH", "make/python3 lookup result"),
+                repair_scope="local toolchain environment",
+                status="blocked",
+            )
+        if family == "testbench_structural_divergence":
+            return FailureAnalysis(
+                family=family,
+                owner_agent="shift_left_testbench_agent",
+                next_action=(
+                    "The paired golden/HLS harnesses diverged structurally (control flow or def-use). "
+                    "Resynchronize the testbench generator; this is a harness defect, not a design defect."
+                ),
+                evidence_needed=("static tier message", "both testbench sources", "trace schema"),
+                repair_scope="testbench generation only; the design must not be touched",
+            )
+        return FailureAnalysis(
+            family="trace_behavior_mismatch",
+            owner_agent="failure_analyst",
+            next_action=(
+                "Localize the first diverging cycle and output column in the paired traces, "
+                "then ask the HLS-C repair agent for a minimal semantic patch."
+            ),
+            evidence_needed=("first diverging cycle", "output column", "expected/actual", "paired trace rows"),
+            repair_scope="generated HLS-C only, unless the divergence is traced to bad argument metadata",
+        )
+
+    if trace_status != "pass":
+        return FailureAnalysis(
+            family="trace_consistency_not_run",
+            owner_agent="cosim_operator",
+            next_action="Run the shift-left trace-consistency tier before the Vitis phases.",
+            evidence_needed=("trace_consistency phase status",),
             repair_scope="verification scheduling",
         )
 

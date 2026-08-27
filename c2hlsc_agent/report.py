@@ -10,7 +10,9 @@ from .convert import GeneratedSource
 from .equivalence import VerificationState
 from .hlsc_repair_agent import REPAIR_AUDIT_FILENAME, RepairOutcome
 from .hls_project import ProjectFiles
+from .hls_runner import required_phases
 from .leveri_testgen import LEVERI_TESTBENCH_POLICY_ID
+from .stimulus import directed_schedule, extra_vectors
 
 
 def _table(headers: list[str], rows: list[list[str]]) -> str:
@@ -24,10 +26,60 @@ def _table(headers: list[str], rows: list[list[str]]) -> str:
 def final_status(state: VerificationState, run_vitis: bool, diagnostics_has_errors: bool) -> str:
     if diagnostics_has_errors:
         return "fail"
-    required = ["software_equivalence"]
-    if run_vitis:
-        required.extend(["csim", "csynth", "cosim"])
-    return "pass" if all(state.status_for(phase) == "pass" for phase in required) else "fail"
+    return (
+        "pass"
+        if all(state.status_for(phase) == "pass" for phase in required_phases(run_vitis))
+        else "fail"
+    )
+
+
+def read_coverage(project_root: Path) -> dict[str, object]:
+    """Read whatever the coverage tiers left behind, without running them.
+
+    Missing reports are not an error: gcov and KLEE are opt-in targets, so their absence
+    means "not collected", which is reported as such rather than as zero coverage.
+    """
+
+    coverage: dict[str, object] = {}
+    for name, relative in (("gcov", "coverage/gcov_report.json"), ("klee", "coverage/klee_report.json")):
+        path = project_root / relative
+        if not path.exists():
+            continue
+        try:
+            coverage[name] = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            coverage[name] = {"status": "unreadable", "report": relative}
+    return coverage
+
+
+def _coverage_lines(coverage: dict[str, object]) -> str:
+    gcov = coverage.get("gcov") if isinstance(coverage.get("gcov"), dict) else None
+    klee = coverage.get("klee") if isinstance(coverage.get("klee"), dict) else None
+    if not gcov and not klee:
+        return (
+            "- Structural coverage: _not collected_ "
+            "(run `make gcov-coverage` / `make klee-coverage`, or `c2hlsc-agent refine`)"
+        )
+    lines: list[str] = []
+    if gcov:
+        status = gcov.get("status", "unknown")
+        line_pct = gcov.get("line_coverage")
+        branch_pct = gcov.get("branch_coverage")
+        parts = [f"status `{status}`"]
+        if isinstance(line_pct, (int, float)):
+            parts.append(f"lines {line_pct:.2f}%")
+        if isinstance(branch_pct, (int, float)):
+            parts.append(f"branches {branch_pct:.2f}%")
+        uncovered = gcov.get("uncovered_lines")
+        if isinstance(uncovered, list) and uncovered:
+            parts.append(f"{len(uncovered)} uncovered line(s)")
+        lines.append(f"- gcov structural coverage: {', '.join(parts)}")
+    if klee:
+        status = klee.get("status", "unknown")
+        ktests = klee.get("ktest_count")
+        suffix = f", {ktests} ktest(s)" if isinstance(ktests, int) else ""
+        lines.append(f"- KLEE symbolic exploration: status `{status}`{suffix}")
+    return "\n".join(lines)
 
 
 def write_reports(
@@ -63,6 +115,15 @@ def write_reports(
     report_files = ["conversion_report.md", "conversion_report.json"]
     if repairs:
         report_files.append(REPAIR_AUDIT_FILENAME)
+
+    schedule = directed_schedule(config)
+    directed_summary = ", ".join(f"`{name}`" for name in schedule) or "_none configured_"
+    vectors = extra_vectors(config)
+    refinement_summary = (
+        ", ".join(f"`{vector.origin}`" for vector in vectors) if vectors else "_none_"
+    )
+    coverage = read_coverage(project.root)
+    coverage_summary = _coverage_lines(coverage)
 
     run_control_section = ''
     if run_control:
@@ -134,12 +195,15 @@ def write_reports(
 ## Test Coverage Summary
 
 - Deterministic random tests: {config.num_tests}
-- Directed cases included by generator: zeros, all-ones, min/max, alternating patterns
+- Directed cases included by generator: {directed_summary}
+- Coverage-refinement vectors replayed first: {refinement_summary}
 - Pointer/array outputs compared by metadata or inferred direction
+{coverage_summary}
 
 ## Phase Results
 
 - Software equivalence: `{state.status_for("software_equivalence")}`
+- Trace consistency (shift-left dual-tier): `{state.status_for("trace_consistency")}`
 - C simulation: `{state.status_for("csim")}`
 - C synthesis: `{state.status_for("csynth")}`
 - C/RTL co-simulation: `{state.status_for("cosim")}`
@@ -170,6 +234,7 @@ def write_reports(
         "generator_prompt_id": generated.generator_prompt_id,
         "testbench_policy_id": LEVERI_TESTBENCH_POLICY_ID,
         "software_equivalence": state.status_for("software_equivalence"),
+        "trace_consistency": state.status_for("trace_consistency"),
         "csim": state.status_for("csim"),
         "csynth": state.status_for("csynth"),
         "cosim": state.status_for("cosim"),
@@ -182,5 +247,8 @@ def write_reports(
         "agent_decision": agent_decision.to_dict(),
         "generated_files": generated_files + report_files,
         "phases": {name: result.to_dict() for name, result in state.phases.items()},
+        "directed_tests": schedule,
+        "extra_vectors": [vector.to_dict() for vector in vectors],
+        "coverage": coverage,
     }
     (project.root / "conversion_report.json").write_text(json.dumps(machine, indent=2), encoding="utf-8")
