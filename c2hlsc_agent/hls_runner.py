@@ -136,19 +136,22 @@ def run_vitis(
         except (subprocess.TimeoutExpired, OSError) as exc:
             push = PhaseResult("vitis_push", "fail", summary=f"project sync to {remote.host} failed: {exc}")
         if push.status != "pass":
-            # Infrastructure failure, not a code defect: mark it "remote vitis unavailable"
-            # so classify_failure treats it as toolchain_unavailable (blocked) and the
-            # auto-repair loop does NOT mutate correct source over a transient network fault.
+            # Infrastructure failure, not a code defect. All three rungs report blocked, so
+            # the reported evidence matches the decision classify_failure already reaches:
+            # a tool that never ran has not judged this design. csim used to report "fail"
+            # here while csynth and cosim reported "blocked" for the identical cause, which
+            # put `csim-fail` in the benchmark's blocker column -- reading as "the agent
+            # produced a design that fails C simulation" when Vitis was simply absent.
             message = f"remote vitis unavailable: project sync to {remote.host} failed: {push.summary or push.stderr.strip()[-400:]}"
             return {
-                "csim": PhaseResult("csim", "fail", summary=message),
+                "csim": PhaseResult("csim", "blocked", summary=message),
                 "csynth": PhaseResult("csynth", "blocked", summary=message),
                 "cosim": PhaseResult("cosim", "blocked", summary=message),
             }
     elif shutil.which("vitis_hls") is None:
         message = "vitis_hls not found on PATH (use --vitis-ssh to run Vitis on a remote Linux host)"
         return {
-            "csim": PhaseResult("csim", "fail", summary=message),
+            "csim": PhaseResult("csim", "blocked", summary=message),
             "csynth": PhaseResult("csynth", "blocked", summary=message),
             "cosim": PhaseResult("cosim", "blocked", summary=message),
         }

@@ -376,7 +376,11 @@ class RemoteVitisTests(unittest.TestCase):
         remote.push.return_value = PhaseResult("vitis_push", "fail", stderr="ssh: no route", summary="ssh: no route")
         with tempfile.TemporaryDirectory() as tmp:
             phases = run_vitis(Path(tmp), True, remote=remote)
-        self.assertEqual(phases["csim"].status, "fail")
+        # A tool that never ran has not judged the design: an unreachable remote Vitis is
+        # blocked on every rung, never a csim failure attributed to the generated code.
+        self.assertEqual(phases["csim"].status, "blocked")
+        self.assertEqual(phases["csynth"].status, "blocked")
+        self.assertEqual(phases["cosim"].status, "blocked")
         self.assertIn("u@h", phases["csim"].summary)
         remote.run_phase.assert_not_called()
 
