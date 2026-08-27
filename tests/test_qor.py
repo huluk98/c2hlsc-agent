@@ -581,6 +581,41 @@ class LocalPPATests(unittest.TestCase):
         self.assertIn("module INV_X1(ZN, A);", text)
         self.assertIn("assign ZN = ~A;", text)
 
+    def test_liberty_implicit_and_is_translated(self):
+        # Liberty uses juxtaposition as AND. Nangate45 writes every NAND/AND/AOI/OAI cell
+        # that way, so an untranslated "A1 A2" emits invalid Verilog and the gate-level
+        # sim cannot compile. Whitespace has to be whitelisted by the unhandled-operator
+        # guard, so this can only be caught by converting it, never by rejecting it.
+        from c2hlsc_agent.local_ppa import _liberty_expr_to_verilog as to_verilog
+
+        self.assertEqual(to_verilog("!(A1 A2)"), "~(A1 & A2)")  # NAND2_X1
+        self.assertEqual(to_verilog("A1 A2"), "A1 & A2")  # AND2_X1 body
+        self.assertEqual(to_verilog("A B C"), "A & B & C")  # 3-input
+        self.assertEqual(to_verilog("!((A1 A2)+(B1 B2))"), "~((A1 & A2)|(B1 & B2))")  # AOI22
+        # An explicitly separated AND must not gain a second operator.
+        self.assertEqual(to_verilog("A * B"), "A & B")
+
+    def test_generate_cell_models_compile_ready_for_nangate_style_nand(self):
+        from c2hlsc_agent.local_ppa import generate_cell_models
+
+        liberty = (
+            'cell (NAND2_X1) {\n'
+            '  pin (A1) { direction : input; }\n'
+            '  pin (A2) { direction : input; }\n'
+            '  pin (ZN) { direction : output; function : "!(A1 A2)"; }\n'
+            '}\n'
+        )
+        netlist = "module top(a, b, z);\n  NAND2_X1 u0 ( .A1(a), .A2(b), .ZN(z) );\nendmodule\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            lib = Path(tmp) / "n.lib"; lib.write_text(liberty, encoding="utf-8")
+            net = Path(tmp) / "net.v"; net.write_text(netlist, encoding="utf-8")
+            out = Path(tmp) / "cells_sim.v"
+            modelled = generate_cell_models(lib, net, out)
+            text = out.read_text(encoding="utf-8")
+        # The cell must be modelled, not skipped, and the assignment must be legal Verilog.
+        self.assertEqual(modelled, 1)
+        self.assertIn("assign ZN = ~(A1 & A2);", text)
+
     def test_generate_cell_models_dff_qn_polarity(self):
         # QN must be the INVERTED state — the original gen_cell_models.py contract.
         from c2hlsc_agent.local_ppa import generate_cell_models

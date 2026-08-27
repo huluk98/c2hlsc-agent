@@ -199,14 +199,29 @@ def _parse_pins(block: str) -> list[tuple[str, str, str | None]]:
 
 
 def _liberty_expr_to_verilog(expr: str) -> str:
-    """Liberty boolean expression -> Verilog. Handles postfix ``'`` negation (innermost
-    first), ``!``, ``*``, ``+``; raises on any operator this translation cannot model."""
+    """Liberty boolean expression -> Verilog.
+
+    Handles postfix ``'`` negation (innermost first), ``!``, ``*``, ``+``, ``^``, and
+    Liberty's IMPLICIT AND -- juxtaposition, where ``"A1 A2"`` means ``A1 & A2``. That
+    form is not exotic: Nangate45 writes every NAND/AND/AOI/OAI cell that way (e.g.
+    NAND2_X1 is ``function : "!(A1 A2)"``), so without it the generated cell models are
+    invalid Verilog and the gate-level sim cannot compile.
+
+    Raises ``ValueError`` on any operator this translation cannot model. The implicit-AND
+    pass must run BEFORE that check: whitespace is necessarily whitelisted there, so an
+    unconverted juxtaposition would otherwise slip through as silently broken output
+    rather than being rejected.
+    """
 
     prev = None
     while prev != expr:
         prev = expr
         expr = re.sub(r"([A-Za-z0-9_]+|\))\s*'", r"~\1", expr)
     expr = expr.replace("!", "~").replace("*", "&").replace("+", "|")
+    # Implicit AND, applied after the explicit operators are normalized so that an
+    # already-separated "A * B" (now "A & B") is left alone: the lookahead only fires
+    # when an operand is followed directly by another operand.
+    expr = re.sub(r"([A-Za-z0-9_)])\s+(?=[A-Za-z0-9_(~])", r"\1 & ", expr)
     unhandled = re.sub(r"[A-Za-z0-9_\s()~&|^]", "", expr)
     if unhandled:
         raise ValueError(f"unhandled liberty operators {unhandled!r} in {expr!r}")
