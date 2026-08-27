@@ -552,6 +552,26 @@ class KleeContainerFallbackTests(unittest.TestCase):
                 ok, reason = module.docker_available()
             self.assertTrue(ok, reason)
 
+    def test_the_automatic_route_refuses_to_pull(self) -> None:
+        """An unrequested multi-GB pull is not an acceptable side effect of `make`.
+
+        On CI this turned a 35-second suite into a 206-second one before it was caught.
+        """
+
+        with tempfile.TemporaryDirectory() as tmp:
+            _, module = self._run_klee_module(Path(tmp))
+            calls = []
+
+            def fake(command, *args, **kwargs):
+                calls.append(command)
+                # image inspect: not present locally
+                return subprocess.CompletedProcess(command, 1, stdout="", stderr="No such image")
+
+            with mock.patch.object(module.subprocess, "run", side_effect=fake):
+                self.assertFalse(module.image_present("klee/klee:latest"))
+            self.assertEqual(calls[0][:3], ["docker", "image", "inspect"])
+            self.assertNotIn("pull", " ".join(calls[0]))
+
     def test_an_automatic_container_failure_skips_and_exits_zero(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project, module = self._run_klee_module(Path(tmp))

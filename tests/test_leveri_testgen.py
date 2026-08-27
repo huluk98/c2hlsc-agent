@@ -1,3 +1,4 @@
+import os
 import shutil
 import tempfile
 import unittest
@@ -140,7 +141,10 @@ class LeVeriTestgenTests(unittest.TestCase):
         project = Path(tmp.name) / "project"
         write_project(project, analysis, generated, cfg)
 
-        run = run_target(project, "klee-coverage")
+        # This test is about the no-KLEE skip path, so the container fallback is turned
+        # off explicitly. Otherwise the result depends on whether the machine happens to
+        # have the klee/klee image cached, which is not what is being tested.
+        run = run_target(project, "klee-coverage", env={**os.environ, "C2HLSC_KLEE_DOCKER": "0"})
         self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
         report = project / "coverage" / "klee_report.json"
         self.assertTrue(report.exists())

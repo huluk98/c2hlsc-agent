@@ -882,8 +882,12 @@ formula and Ubuntu does not package it either -- this falls back to the official
 klee/klee container automatically, so `make klee-coverage` and the refinement loop work
 on a Mac without anything being installed into the host PATH.
 
+The container is used automatically ONLY when its image is already on the machine.
+Pulling it is a multi-gigabyte download, and nothing that calls itself "coverage" should
+start one nobody asked for -- so an absent image reports skipped and says how to opt in.
+
   C2HLSC_KLEE_DOCKER=0   never use the container, skip instead
-  C2HLSC_KLEE_DOCKER=1   use the container even if a native klee exists
+  C2HLSC_KLEE_DOCKER=1   use the container even if a native klee exists, pulling if needed
   C2HLSC_KLEE_IMAGE=...  override the image (default klee/klee:latest)
 '''
 from __future__ import annotations
@@ -969,6 +973,25 @@ def docker_available() -> tuple[bool, str]:
     return True, ""
 
 
+def image_present(image: str) -> bool:
+    '''Whether the image is already local, so using it costs nothing.
+
+    Deliberately does not pull. An automatic route that downloads gigabytes turns a
+    coverage target into a surprise, and on CI it turned a 35-second suite into a
+    206-second one.
+    '''
+    try:
+        probe = subprocess.run(
+            ["docker", "image", "inspect", image],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return probe.returncode == 0
+
+
 def _container_failed(image: str, forced: bool, reason: str, extra: dict) -> int:
     # A container failure is only a FAILURE when the container was asked for.
     #
@@ -1052,6 +1075,27 @@ def run_in_docker(timeout_s: int, forced: bool) -> int:
     return 0
 
 
+def container_route(timeout_s: int, forced: bool) -> tuple[bool, str]:
+    # Whether the container can be used here, and if not, why. Kept separate from main()
+    # so every combination of (native klee, docker, forced) has one obvious answer.
+    image = os.environ.get("C2HLSC_KLEE_IMAGE", DEFAULT_IMAGE)
+    ok, reason = docker_available()
+    if not ok:
+        return False, reason
+    if not forced and not image_present(image):
+        return False, (
+            f"{image} is not pulled locally; run C2HLSC_KLEE_DOCKER=1 once "
+            f"(or `docker pull {image}`) to enable the container route"
+        )
+    return True, ""
+
+
+def skip(reason: str, **extra) -> int:
+    write_report({"status": "skipped", "reason": reason, "remedy": DOCTOR, **extra})
+    print(f"KLEE coverage skipped: {reason} -- {DOCTOR}")
+    return 0
+
+
 def main() -> int:
     forced = os.environ.get("C2HLSC_KLEE_DOCKER", "").strip()
     timeout_s = int(os.environ.get("C2HLSC_KLEE_TIMEOUT", "60"))
@@ -1061,25 +1105,26 @@ def main() -> int:
     klee_include = os.environ.get("KLEE_INCLUDE_DIR") or default_klee_include(klee)
     native_ready = bool(klee and clangxx and klee_include and Path(klee_include).exists())
 
-    if forced == "1" or (not native_ready and forced != "0"):
-        ok, reason = docker_available()
+    # The user asked for the container specifically.
+    if forced == "1":
+        ok, reason = container_route(timeout_s, forced=True)
         if ok:
-            return run_in_docker(timeout_s, forced == "1")
-        if forced == "1":
-            write_report({"status": "skipped", "mode": "docker", "reason": reason, "remedy": DOCTOR})
-            print(f"KLEE coverage skipped: {reason}")
-            return 0
-        if not native_ready:
-            missing = "klee not found" if not klee else ("clang++ not found" if not clangxx else "KLEE include directory not found")
-            write_report({
-                "status": "skipped",
-                "mode": "none",
-                "reason": missing,
-                "docker_reason": reason,
-                "remedy": DOCTOR,
-            })
-            print(f"KLEE coverage skipped: {missing}; container fallback unavailable ({reason}) -- {DOCTOR}")
-            return 0
+            return run_in_docker(timeout_s, True)
+        return skip(reason, mode="docker")
+
+    if not native_ready:
+        missing = (
+            "klee not found" if not klee
+            else "clang++ not found" if not clangxx
+            else "KLEE include directory not found"
+        )
+        if forced == "0":
+            # Explicitly disabled; do not even look at docker.
+            return skip(missing, mode="none", docker_reason="disabled by C2HLSC_KLEE_DOCKER=0")
+        ok, reason = container_route(timeout_s, forced=False)
+        if ok:
+            return run_in_docker(timeout_s, False)
+        return skip(missing, mode="none", docker_reason=reason)
 
     COVERAGE_DIR.mkdir(exist_ok=True)
     bitcode = COVERAGE_DIR / "klee_driver.bc"
