@@ -40,6 +40,36 @@ MAX_AUGMENTED_VECTORS = 8
 # everywhere; the exact 2**63 boundary values are rejected rather than special-cased.
 _INT_LIMIT = 2**63 - 2
 
+# Single-precision float storage: a finite double beyond this becomes +/-inf on BOTH
+# sides of the comparison, and inf-vs-inf fails values_equal (inf - inf is NaN), so an
+# over-range float value would FALSELY fail a correct design. Bound it out instead.
+_FLOAT32_MAX = 3.4028234663852886e38
+
+# Integer storage widths, so a value the C type cannot hold is rejected up front rather
+# than silently truncated into a stimulus nobody asked for. Unknown types (ap_int and
+# friends) fall back to the long long bound.
+_INT_WIDTHS: tuple[tuple[str, int, bool], ...] = (
+    ("uint64", 64, True), ("int64", 64, False),
+    ("uint32", 32, True), ("int32", 32, False),
+    ("uint16", 16, True), ("int16", 16, False),
+    ("uint8", 8, True), ("int8", 8, False),
+    ("unsigned long long", 64, True), ("long long", 64, False),
+    ("unsigned long", 64, True), ("unsigned short", 16, True),
+    ("unsigned char", 8, True), ("unsigned int", 32, True), ("unsigned", 32, True),
+    ("size_t", 64, True), ("long", 64, False), ("short", 16, False),
+    ("char", 8, False), ("int", 32, False),
+)
+
+
+def _int_bounds(c_type: str) -> tuple[int, int]:
+    base = c_type.replace("const", "").replace("volatile", "").replace("*", "").strip()
+    for token, width, unsigned in _INT_WIDTHS:
+        if token in base:
+            if unsigned:
+                return 0, 2**width - 1
+            return -(2 ** (width - 1)), 2 ** (width - 1) - 1
+    return -_INT_LIMIT, _INT_LIMIT
+
 
 def _is_float_type(c_type: str) -> bool:
     return "float" in c_type or "double" in c_type
@@ -49,10 +79,23 @@ def _coerce_number(value: object, c_type: str) -> int | float | None:
     if isinstance(value, bool):
         return None
     if _is_float_type(c_type):
-        if isinstance(value, (int, float)) and math.isfinite(float(value)):
-            return float(value)
+        if not isinstance(value, (int, float)):
+            return None
+        try:
+            as_float = float(value)
+        except OverflowError:
+            # json.loads happily yields ints like 10**400; float() then raises. A model
+            # response must never be able to crash the run, so out-of-range is rejected.
+            return None
+        if not math.isfinite(as_float):
+            return None
+        if "float" in c_type and "double" not in c_type and abs(as_float) > _FLOAT32_MAX:
+            return None
+        return as_float
+    if not isinstance(value, int):
         return None
-    if isinstance(value, int) and abs(value) <= _INT_LIMIT:
+    lo, hi = _int_bounds(c_type)
+    if lo <= value <= hi and abs(value) <= _INT_LIMIT:
         return value
     return None
 

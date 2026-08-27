@@ -5,6 +5,7 @@ import sys
 from dataclasses import dataclass
 
 from .equivalence import VerificationState
+from .run_control import RunBudgetExceeded
 from .hlsc_generator import HLSC_GENERATOR_PROMPT_ID, get_hlsc_generator_contract
 from .leveri_testgen import LEVERI_TESTBENCH_POLICY_ID, get_leveri_testbench_contract
 
@@ -365,6 +366,8 @@ def refine_failure_analysis(
     )
     try:
         payload = extract_json_payload(llm.complete(system, user))
+    except RunBudgetExceeded:
+        raise  # the caller owns budget policy; only llm_calls exhaustion is recoverable
     except Exception as exc:  # noqa: BLE001 -- optional refinement, never fatal
         print(
             f"c2hlsc failure_analyst: refinement call failed ({type(exc).__name__}: {exc}); "
@@ -379,10 +382,11 @@ def refine_failure_analysis(
     next_action = _clean_text(payload.get("next_action"), 400)
     if family not in FAILURE_FAMILIES or owner not in AGENT_NAMES or not next_action:
         return None
+    raw_evidence = payload.get("evidence_needed")
+    if not isinstance(raw_evidence, list):
+        raw_evidence = []  # a scalar or object here must degrade, never crash the loop
     evidence = tuple(
-        cleaned
-        for item in (payload.get("evidence_needed") or [])
-        if (cleaned := _clean_text(item, 120))
+        cleaned for item in raw_evidence if (cleaned := _clean_text(item, 120))
     )[:8]
     return FailureAnalysis(
         family=family,

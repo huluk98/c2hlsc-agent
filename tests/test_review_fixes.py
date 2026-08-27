@@ -258,6 +258,23 @@ class VisibilityAndPortabilityTests(unittest.TestCase):
             os.utime(project / "src" / "hls_top.hpp", (future, future))
             self.assertFalse(_report_is_fresh(project, xml))
 
+    def test_stale_agent_artifacts_removed_on_reconvert_without_flags(self):
+        from c2hlsc_agent.cli import build_parser, run_convert
+
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            (tmp / "in.c").write_text("int f(int a) { return a + 1; }\n", encoding="utf-8")
+            out = tmp / "out"
+            argv = ["convert", "--input", str(tmp / "in.c"), "--top", "f", "--out", str(out)]
+            parser = build_parser()
+            self.assertEqual(run_convert(parser.parse_args(argv + ["--run-id", "r1"])), 0)
+            # simulate a previous agent-flag run's leftovers
+            (out / "contract_proposals.json").write_text("{}", encoding="utf-8")
+            (out / "tb" / "augmented_vectors.json").write_text("{}", encoding="utf-8")
+            self.assertEqual(run_convert(parser.parse_args(argv + ["--run-id", "r2"])), 0)
+            self.assertFalse((out / "contract_proposals.json").exists())
+            self.assertFalse((out / "tb" / "augmented_vectors.json").exists())
+
     def test_generated_scripts_use_the_running_interpreter(self):
         # "python3" is not a command on Windows; sys.executable always is.
         from c2hlsc_agent.leveri_testgen import generate_leveri_testbenches

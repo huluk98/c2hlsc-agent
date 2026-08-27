@@ -151,6 +151,11 @@ def repair_project(
             status = "applied"
             summary = f"Applied {len(changes)} auditable mechanical repair(s); rerun verification from software equivalence."
         elif llm is not None and getattr(config, "use_llm", False):
+            # Memory retrieval is keyed on the DETERMINISTIC family: classify_failure is
+            # stable for the same evidence, while the analyst's refinement is not, and a
+            # refined key would miss cards stored under the regex family (seen live in
+            # dogfooding). The refined decision still steers the repair prompt itself.
+            retrieval_family = decision.family
             analyst_refined = False
             if getattr(config, "use_failure_analyst", True) and _analyst_budget_allows(llm):
                 refined = refine_failure_analysis(decision, state, phase, llm)
@@ -158,7 +163,8 @@ def repair_project(
                     decision = refined
                     analyst_refined = True
             llm_changes, oscillated = _llm_repair(
-                project_dir, analysis, decision, phase, evidence, llm, config=config, history=history
+                project_dir, analysis, decision, phase, evidence, llm, config=config,
+                history=history, retrieval_family=retrieval_family,
             )
             changes.extend(llm_changes)
             if llm_changes:
@@ -220,6 +226,7 @@ def _llm_repair(
     llm: LLMClient,
     config: object | None = None,
     history: list[RepairOutcome] | None = None,
+    retrieval_family: str | None = None,
 ) -> tuple[list[RepairFileChange], bool]:
     """Escalate to an LLM for a minimal patch to the generated HLS-C.
 
@@ -242,9 +249,11 @@ def _llm_repair(
     from .audit_memory import relevant_cards
 
     try:
-        cards = relevant_cards(config, getattr(decision, "family", "unknown"), phase)
-    except OSError:
-        cards = []  # unreadable memory store is a degraded prompt, never a failed repair
+        cards = relevant_cards(
+            config, retrieval_family or getattr(decision, "family", "unknown"), phase
+        )
+    except Exception:  # noqa: BLE001 -- a broken memory store degrades the prompt, only
+        cards = []
     system, user = build_repair_prompt(
         analysis,
         decision,

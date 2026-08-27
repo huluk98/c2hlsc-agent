@@ -503,6 +503,12 @@ def run_convert(args: argparse.Namespace) -> int:
             generated = generate_hls_sources(analysis, config, llm=None)
     project = write_project(out_dir, analysis, generated, config)
     clear_repair_audit(out_dir)
+    # A re-convert without the agent flags must not leave last run's advisory artifacts
+    # lying around as if they described THIS run.
+    if aug_provenance is None:
+        (out_dir / "tb" / "augmented_vectors.json").unlink(missing_ok=True)
+    if not (llm is not None and config.use_llm and config.propose_contract):
+        (out_dir / "contract_proposals.json").unlink(missing_ok=True)
     if aug_provenance is not None:
         vectors, rejections = aug_provenance
         write_provenance(out_dir, vectors, rejections, getattr(llm, "model", None))
@@ -513,15 +519,17 @@ def run_convert(args: argparse.Namespace) -> int:
         )
     if llm is not None and config.use_llm and config.propose_contract:
         try:
-            proposals, proposal_error = propose_contract(analysis, llm)
+            proposals, proposal_rejected, proposal_error = propose_contract(analysis, llm)
         except RunBudgetExceeded as exc:
             _permit_optional_llm_fallback(controller, exc, 'contract proposals')
-            proposals, proposal_error = [], f'budget: {exc}'
+            proposals, proposal_rejected, proposal_error = [], [], f'budget: {exc}'
         proposals_path = write_proposals(
-            out_dir, proposals, getattr(llm, "model", None), proposal_error
+            out_dir, proposals, getattr(llm, "model", None), proposal_error,
+            rejected=proposal_rejected,
         )
         generated.transformations.append(
-            f"contract_planner proposed {len(proposals)} contract refinement(s); "
+            f"contract_planner proposed {len(proposals)} contract refinement(s), "
+            f"{len(proposal_rejected)} field(s) rejected by validation; "
             f"see {proposals_path.name} (advisory, not applied)."
         )
         if args.verbose:

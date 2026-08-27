@@ -48,6 +48,7 @@ def _card_from_outcome(
     top: str,
     project_name: str,
     model: str | None,
+    verified_scope: str,
 ) -> dict[str, object]:
     diff = "\n".join(change.diff for change in outcome.changes if change.diff)
     return {
@@ -61,6 +62,10 @@ def _card_from_outcome(
         "diff_excerpt": diff[:_DIFF_LIMIT],
         "model": model,
         "project": project_name,
+        # What "verified" actually meant for this card: a host-equivalence-only run and
+        # a full-ladder run are very different evidence, and the prompt must not imply
+        # the stronger one when only the weaker happened.
+        "verified_scope": verified_scope,
         "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
 
@@ -75,16 +80,19 @@ def promote_repair_cards(
 ) -> int:
     """Append one card per audited applied repair; returns how many were promoted.
 
-    ``verified`` must mean the FULL requested verification ladder passed AFTER these
-    repairs were applied -- the caller asserts that, this function only refuses to write
-    without it. With ``verified=False``, or memory disabled, nothing is touched (not
-    even the memory directory, so a run that promotes nothing leaves no trace).
+    ``verified`` must mean the verification the run REQUESTED passed end to end AFTER
+    these repairs were applied -- the caller asserts that; this function records the
+    actual scope (``host_equivalence`` vs ``full_ladder``) on every card so the prompt
+    can never imply stronger evidence than the run produced. With ``verified=False``,
+    or memory disabled, nothing is touched (not even the memory directory, so a run
+    that promotes nothing leaves no trace).
     """
 
     if not verified or not getattr(config, "use_repair_memory", True):
         return 0
+    verified_scope = "full_ladder" if getattr(config, "run_vitis", False) else "host_equivalence"
     cards = [
-        _card_from_outcome(outcome, top, project_dir.name, model)
+        _card_from_outcome(outcome, top, project_dir.name, model, verified_scope)
         for outcome in repairs
         if outcome.status in _PROMOTABLE_STATUSES and outcome.changes
     ]
@@ -104,8 +112,12 @@ def load_cards(config: object | None = None) -> list[dict[str, object]]:
     path = memory_path(config)
     if not path.exists():
         return []
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []  # an unreadable store is a degraded prompt, never a failed repair
     cards: list[dict[str, object]] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in text.splitlines():
         line = line.strip()
         if not line:
             continue
@@ -133,6 +145,19 @@ def relevant_cards(
         return []
     cards = [card for card in load_cards(config) if card.get("kind") == "llm"]
     cards.reverse()  # newest first
-    exact = [c for c in cards if c.get("family") == family and c.get("stage") == stage]
-    same_family = [c for c in cards if c.get("family") == family and c not in exact]
-    return (exact + same_family)[:limit]
+    # Content-dedup so one repeated promotion cannot fill the whole retrieval window.
+    seen: set[tuple] = set()
+    unique: list[dict[str, object]] = []
+    for card in cards:
+        key = (card.get("family"), card.get("stage"), card.get("diff_excerpt"))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(card)
+    exact = [c for c in unique if c.get("family") == family and c.get("stage") == stage]
+    same_family = [c for c in unique if c.get("family") == family and c not in exact]
+    # Last tier: same stage, any family. Dogfooding showed the analyst can legitimately
+    # reclassify the family between the run that stored a card and the run that needs
+    # it, and a family-only key then misses cards for the same concrete situation.
+    same_stage = [c for c in unique if c.get("stage") == stage and c not in exact and c not in same_family]
+    return (exact + same_family + same_stage)[:limit]

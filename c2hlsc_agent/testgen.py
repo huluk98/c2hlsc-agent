@@ -28,6 +28,33 @@ def _scalar_decl(arg: FunctionArg) -> str:
     return f"random_value<{arg.c_type}>(rng)"
 
 
+def _implied_length_bound(arg: FunctionArg, arrays: list[FunctionArg]) -> int | None:
+    """Sound stimulus bound for an UNRANGED integer scalar whose name marks it as an
+    array length. Driving such a scalar with full-range randoms sends the GOLDEN C
+    itself out of bounds (dogfooded: `int count` over int[16] buffers segfaulted the
+    reference), so the stimulus -- not the comparison -- is clamped to the smallest
+    matching array's length. This narrows the stimulus DOMAIN only: both sides still
+    receive identical values, so it can never hide a mismatch the way a comparison
+    clamp could; and it is reported in the testbench contract and the conversion
+    report, because it is inferred from a NAME."""
+
+    if arg.scalar_range is not None or "float" in arg.c_type or "double" in arg.c_type:
+        return None
+    bounds = [
+        array.length
+        for array in arrays
+        if array.length and _looks_like_length_name(arg.name, array.name)
+    ]
+    return min(bounds) if bounds else None
+
+
+def _scalar_stimulus(arg: FunctionArg, arrays: list[FunctionArg]) -> str:
+    implied = _implied_length_bound(arg, arrays)
+    if implied is not None:
+        return f"bounded_scalar<{arg.c_type}>(test_idx, rng, 0LL, {implied}LL)"
+    return _scalar_decl(arg)
+
+
 def _storage_type(arg: FunctionArg) -> str:
     return " ".join(token for token in arg.c_type.split() if token not in {"const", "volatile"})
 
@@ -127,7 +154,15 @@ def _contract_comment(fn_args: list[FunctionArg], return_type: str, arrays: list
             lo, hi = arg.scalar_range
             lines.append(f"// - {arg.name}: scalar range=[{lo}, {hi}] with directed boundary tests")
         else:
-            lines.append(f"// - {arg.name}: scalar random stimulus")
+            implied = _implied_length_bound(arg, arrays)
+            if implied is not None:
+                lines.append(
+                    f"// - {arg.name}: scalar UNRANGED but length-like; stimulus clamped to "
+                    f"[0, {implied}] so the golden reference stays in-bounds -- declare "
+                    f"arguments.{arg.name}.range to control this explicitly"
+                )
+            else:
+                lines.append(f"// - {arg.name}: scalar random stimulus")
     return "\n".join(lines)
 
 
@@ -237,11 +272,11 @@ def generate_testbench(analysis: AnalysisResult, config: AgentConfig) -> str:
     for arg in scalars:
         if aug_vectors:
             declarations.append(
-                f"    {arg.c_type} {arg.name} = (test_idx < {num_random}) ? ({_scalar_decl(arg)}) "
+                f"    {arg.c_type} {arg.name} = (test_idx < {num_random}) ? ({_scalar_stimulus(arg, arrays)}) "
                 f": static_cast<{arg.c_type}>(aug_scalar_{arg.name}[test_idx - {num_random}]);"
             )
         else:
-            declarations.append(f"    {arg.c_type} {arg.name} = {_scalar_decl(arg)};")
+            declarations.append(f"    {arg.c_type} {arg.name} = {_scalar_stimulus(arg, arrays)};")
 
     return_compare = ""
     return_capture_ref = ""

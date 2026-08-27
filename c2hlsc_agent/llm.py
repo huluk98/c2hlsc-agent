@@ -17,7 +17,11 @@ API. Four backends are supported:
 Everything stays deterministic and offline by default: if ``--use-llm`` is not requested,
 or no backend resolves, the agents fall back to the conservative mechanical paths. The
 LLM only ever *proposes* candidate HLS-C; the verifier ladder (host equivalence -> CSim
--> CSynth -> CoSim) remains the gate, and the original C file is never handed to the model.
+-> CSynth -> CoSim) remains the gate. The original C is INPUT to the generation-side
+prompts (generator, contract planner, stimulus augmenter -- it is the thing being
+translated and analyzed), but it is never model-WRITABLE, it is never the acceptance
+oracle's answer key, and the repair prompts never include it: a repair sees only the
+failing generated HLS-C and the evidence.
 """
 
 from __future__ import annotations
@@ -444,16 +448,18 @@ def _repair_cards_section(cards: list[dict] | None) -> str:
     for card in cards[:2]:
         family = card.get("family", "?")
         stage = card.get("stage", "?")
+        scope = card.get("verified_scope", "host_equivalence")
         summary = str(card.get("summary", ""))[:200]
         diff = str(card.get("diff_excerpt", "")).strip()[:600]
-        lines.append(f"- [{family} @ {stage}] {summary}")
+        lines.append(f"- [{family} @ {stage} | verified: {scope}] {summary}")
         if diff:
             lines.append(f"```\n{diff}\n```")
     body = "\n".join(lines)
     return f"""
-Audited repairs that fixed similar failures in previously VERIFIED runs (each was
-promoted to memory only after the full verifier passed; adapt the idea, do not copy
-blindly -- this design differs):
+Audited repairs that fixed similar failures in previously verified runs. Each card was
+promoted only after the verification its run REQUESTED passed end to end -- the card
+says which scope that was (host_equivalence, or the full_ladder through CoSim). Adapt
+the idea, do not copy blindly; this design differs:
 {body}
 """
 
@@ -559,7 +565,12 @@ apply to the config. Proposals are recorded, never applied automatically.
 Rules:
 - Only propose values the C source actually justifies; cite the reason from the code.
 - direction is one of input|output|inout. length is the element count the code truly
-  touches. range is [lo, hi] for a scalar's legal domain.
+  touches and MUST be an integer literal. range is [lo, hi] (integers) for a scalar's
+  legal domain.
+- When an array's true bound is another scalar argument (e.g. `count` guards the loop),
+  do NOT put that name in length: propose a `range` on that scalar instead (e.g.
+  {"argument": "count", "range": [0, 16]}) and explain the relationship in the
+  rationale. A sound scalar range is what keeps the testbench stimulus in-bounds.
 - Respond with ONLY a JSON array of objects:
   [{"argument": <name>, "direction": <opt>, "length": <opt int>,
     "range": <opt [lo, hi]>, "rationale": <string>}]
