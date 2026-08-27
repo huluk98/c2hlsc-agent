@@ -1,5 +1,10 @@
 # c2hlsc_agent
 
+**Start here: [`docs/full_workflow.md`](docs/full_workflow.md)** — the full workflow map.
+It shows where every component and every declared agent sits in the real pipeline, what
+each step generates, which artifacts come from a model versus deterministic code, and how
+the verifier ladder, repair loop, run budgets and QoR loop fit together.
+
 ## Ubuntu Server Vitis Quick Triage
 
 Use this workflow on the Ubuntu machine where Vitis HLS is installed. Keep it
@@ -201,6 +206,10 @@ single generation step. The intended agents are:
    only after host equivalence, CSim, synthesis, and CoSim pass again.
 8. `audit_memory_agent`: stores reproducible artifacts and promotes only audited repair
    successes into retrieval memory.
+
+Which of these are live today, which are deterministic code wearing an agent's name, and
+which are still declarative seams is tabulated in
+[`docs/full_workflow.md` §13](docs/full_workflow.md#13-the-eight-agents-which-are-live).
 
 Important correction: Vitis C/RTL CoSim checks generated RTL against the HLS-C design
 under the supplied testbench. It does not, by itself, prove that RTL is equivalent to the

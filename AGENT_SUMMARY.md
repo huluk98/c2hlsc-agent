@@ -2,6 +2,10 @@
 
 *Generated 2026-07-06 at commit `8576b04` (merge of PR #1 "Fix review findings").*
 
+> **Note.** This file is a per-function reference generated at an earlier commit and predates
+> the run controller, the QoR/PPA stack, remote Vitis, the standalone RTL lane, best-of-N and
+> NL-only mode. For the current end-to-end workflow see [`docs/full_workflow.md`](docs/full_workflow.md).
+
 ## How the pipeline fits together
 
 `c2hlsc_agent` converts an ordinary C top function into a Vitis HLS C/C++ project and
