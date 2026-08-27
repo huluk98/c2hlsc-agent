@@ -350,10 +350,14 @@ def _infer_pointer_directions(function: FunctionInfo, config: AgentConfig) -> No
         if arg.name in config.arguments and config.arguments[arg.name].direction:
             continue
         name = re.escape(arg.name)
-        write_pattern = rf"(?:\*\s*{name}|{name}\s*\[[^\]]+\])\s*(?:=(?!=)|\+=|-=|\*=|/=|%=|&=|\|=|\^=|<<=|>>=|\+\+|--)"
+        # One or more subscripts: a 2-D write is `table[i][j] = ...`, so anchoring the
+        # assignment to a single `]` classified every multi-dimensional output array as an
+        # input. That silently emptied the compare set -- the oracle then verified nothing
+        # and reported pass.
+        write_pattern = rf"(?:\*\s*{name}|{name}\s*(?:\[[^\]]+\])+)\s*(?:=(?!=)|\+=|-=|\*=|/=|%=|&=|\|=|\^=|<<=|>>=|\+\+|--)"
         writes = bool(re.search(write_pattern, body))
         body_without_lhs_writes = re.sub(write_pattern, "", body)
-        reads = bool(re.search(rf"(?:\*\s*{name}|{name}\s*\[[^\]]+\]|{name}\s*\+)", body_without_lhs_writes))
+        reads = bool(re.search(rf"(?:\*\s*{name}|{name}\s*(?:\[[^\]]+\])+|{name}\s*\+)", body_without_lhs_writes))
         if writes and reads:
             arg.direction = "inout"
         elif writes:
@@ -416,12 +420,38 @@ def _type_mappings(function: FunctionInfo) -> list[dict[str, str]]:
     return rows
 
 
+def _require_observable_output(function: FunctionInfo, diagnostics: DiagnosticBag) -> None:
+    """Refuse a top whose behaviour nothing can observe.
+
+    The oracle compares the return value and every output/inout argument. When that set is
+    empty there is nothing to assert, so the testbench passes for *any* implementation --
+    an empty function body included. Reporting `pass` for a run that verified nothing is
+    worse than reporting a failure, so this is an error rather than the comment it used to
+    be: a benchmark number built from vacuous passes is not a result.
+    """
+
+    observable = function.return_type != "void" or any(
+        arg.direction in {"output", "inout"} for arg in function.args if arg.is_pointer_like
+    )
+    if observable:
+        return
+    diagnostics.add(
+        "error",
+        "nothing-to-compare",
+        f"'{function.name}' returns void and has no output or inout argument, so the oracle "
+        "would compare nothing and pass for any implementation",
+        function.source_path.name,
+        "Declare the written argument as output/inout in the config if direction inference missed it.",
+    )
+
+
 def analyze_source(input_file: Path, top: str, config: AgentConfig) -> AnalysisResult:
     source = input_file.read_text(encoding="utf-8")
     constants = collect_constants(strip_comments(local_include_text(input_file)))
     diagnostics = DiagnosticBag()
     function = _extract_function(source, top, input_file, config, constants)
     _infer_pointer_directions(function, config)
+    _require_observable_output(function, diagnostics)
     for arg in function.args:
         if arg.is_pointer_like and arg.length is None:
             arg.length = 16
