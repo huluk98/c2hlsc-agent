@@ -138,7 +138,22 @@ def run_sample(ident: str, source: Path, facts: dict[str, str], out: Path,
             data = {}
         status = str(data.get("status", "error"))
         blob = combined + json.dumps(data)[:20000]
-        blocker, detail = (None, "") if status == "pass" else classify(blob)
+        if status == "pass":
+            blocker, detail = None, ""
+        else:
+            blocker, detail = classify(blob)
+            if blocker is None:
+                # A failure that matches no known pattern still has to say something.
+                # Reporting it as "-" hid an oracle mismatch behind the same dash a pass
+                # uses, which is the one thing a blocker column must never do.
+                phase = next(
+                    (name for name in ("software_equivalence", "trace_consistency", "csim", "csynth", "cosim")
+                     if str(data.get(name, "")) not in ("pass", "skipped", "")),
+                    "unknown",
+                )
+                blocker = f"{phase}-{data.get(phase, status)}"
+                mismatches = data.get("mismatches") or []
+                detail = json.dumps(mismatches[0])[:200] if mismatches else f"convert status {status}"
         trace = str(data.get("trace_consistency", ""))
         return Sample(index, status, blocker, detail, trace)
 
