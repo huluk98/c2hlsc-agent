@@ -15,6 +15,7 @@ import unittest
 from pathlib import Path
 
 from c2hlsc_agent.analyze import analyze_source
+from c2hlsc_agent.equivalence import PhaseResult, parse_comparisons
 from c2hlsc_agent.config import AgentConfig
 from c2hlsc_agent.leveri_testgen import generate_leveri_testbenches
 
@@ -106,3 +107,80 @@ class TraceEvidenceTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PhaseEvidenceTest(unittest.TestCase):
+    """`pass` used to mean the absence of a failure, with no record of what was examined.
+
+    A phase comparing 3600 elements and one comparing zero both returned "pass" and were
+    indistinguishable where the verdict is formed. PhaseResult now carries the quantity.
+    """
+
+    def test_counts_are_parsed_from_every_tier(self) -> None:
+        self.assertEqual(
+            parse_comparisons("c2hlsc_agent: all 64 tests passed, seed=7 (compared 545 value(s))"),
+            545,
+        )
+        self.assertEqual(
+            parse_comparisons("dual-tier consistency check passed: 64 cycles, 545 value(s) compared"),
+            545,
+        )
+        self.assertEqual(parse_comparisons("RTL_TB: COMPARED 1024"), 1024)
+
+    def test_no_count_is_not_a_count_of_zero(self) -> None:
+        """None means the phase reports no count; 0 means it ran and examined nothing."""
+
+        self.assertIsNone(parse_comparisons("Vitis csim finished"))
+        self.assertEqual(parse_comparisons("compared 0 value(s)"), 0)
+        self.assertFalse(PhaseResult("p", "pass").is_vacuous)
+        self.assertFalse(PhaseResult("p", "pass", comparisons=1).is_vacuous)
+        self.assertTrue(PhaseResult("p", "pass", comparisons=0).is_vacuous)
+
+
+class OracleRuntimeEvidenceTest(unittest.TestCase):
+    """The declared compare set can be non-empty and still examine nothing at run time."""
+
+    def _testbench(self, length_range: tuple[int, int]) -> str:
+        from c2hlsc_agent.config import ArgumentConfig
+        from c2hlsc_agent.testgen import generate_testbench
+
+        work = Path(tempfile.mkdtemp())
+        (work / "in.c").write_text(
+            "void masked(const int a[16], int out[16], int n) {\n"
+            "  for (int i = 0; i < n; ++i) out[i] = a[i] * 3;\n}\n",
+            encoding="utf-8",
+        )
+        config = AgentConfig(top="masked", input_files=[work / "in.c"], num_tests=50)
+        config.arguments["n"] = ArgumentConfig(range=length_range)
+        return generate_testbench(analyze_source(work / "in.c", "masked", config), config)
+
+    def test_bench_counts_comparisons_and_refuses_zero(self) -> None:
+        bench = self._testbench((0, 16))
+        self.assertIn("long long c2hlsc_comparisons = 0;", bench)
+        self.assertIn("++c2hlsc_comparisons;", bench)
+        self.assertIn("if (c2hlsc_comparisons == 0)", bench)
+        self.assertIn("FAIL compared 0 values across all tests", bench)
+
+    def test_bench_reports_its_evidence_on_success(self) -> None:
+        bench = self._testbench((0, 16))
+        self.assertIn('<< " (compared " << c2hlsc_comparisons << " value(s)"', bench)
+
+
+class TraceRuntimeEvidenceTest(unittest.TestCase):
+    """Active-length clamping can skip every output column and still report consistency."""
+
+    def _comparator(self) -> str:
+        from c2hlsc_agent.leveri_testgen import generate_leveri_testbenches
+
+        analysis, config = _analysis()
+        return generate_leveri_testbenches(analysis, config).compare_script
+
+    def test_comparator_counts_dynamic_comparisons(self) -> None:
+        script = self._comparator()
+        self.assertIn("compared = 0", script)
+        self.assertIn("compared += 1", script)
+
+    def test_comparator_refuses_a_fully_clamped_run(self) -> None:
+        script = self._comparator()
+        self.assertIn("if compared == 0:", script)
+        self.assertIn("clamped away by an", script)

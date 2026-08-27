@@ -528,6 +528,10 @@ def main(argv: list[str]) -> int:
     input_columns = [idx for idx, role in enumerate(golden_roles) if role == "in"]
     output_columns = [idx for idx, role in enumerate(golden_roles) if role == "out"]
     clamped = 0
+    # Dynamic evidence. A non-empty output schema is not proof that anything was compared:
+    # if every element sits beyond its active length, each one is clamped away and the loop
+    # below compares nothing while still reporting consistency.
+    compared = 0
 
     for row_idx, (golden, hls) in enumerate(zip(golden_rows, hls_rows)):
         if len(golden) != len(golden_header) or len(hls) != len(hls_header):
@@ -548,6 +552,7 @@ def main(argv: list[str]) -> int:
                 if element >= limit:
                     clamped += 1
                     continue  # outside the declared active length: not part of the contract
+            compared += 1
             if not values_match(golden[col_idx], hls[col_idx]):
                 fail(
                     "dynamic behaviour",
@@ -571,6 +576,13 @@ def main(argv: list[str]) -> int:
             "insufficient evidence",
             "the paired traces hold no cycles: nothing was executed to compare",
         )
+    if compared == 0:
+        fail(
+            "insufficient evidence",
+            f"every one of the {len(output_columns)} output column(s) was clamped away by an "
+            "active length, so the dynamic tier compared nothing across "
+            f"{len(golden_rows)} cycle(s)",
+        )
 
     notes = []
     if static_stats.get("cfg") is not None:
@@ -581,7 +593,7 @@ def main(argv: list[str]) -> int:
     print(
         "HLS-LeVeri dual-tier consistency check passed: "
         f"{len(golden_rows)} cycles, {len(input_columns)} input columns, "
-        f"{len(output_columns)} output columns" + suffix
+        f"{len(output_columns)} output columns, {compared} value(s) compared" + suffix
     )
     return 0
 

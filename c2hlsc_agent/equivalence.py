@@ -17,6 +17,12 @@ class PhaseResult:
     stderr: str = ""
     log_path: Path | None = None
     summary: str = ""
+    #: How many values this phase actually compared, when it reports one. ``None`` means
+    #: the phase does not report a count, not that it compared nothing -- only a phase that
+    #: emits its own count can be held to it. This exists because `pass` was defined as the
+    #: absence of a failure: without a quantity here, a phase that compared 3600 elements
+    #: and one that compared zero were indistinguishable at the point the verdict is formed.
+    comparisons: int | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -27,7 +33,14 @@ class PhaseResult:
             "stderr": self.stderr[-4000:],
             "log_path": str(self.log_path) if self.log_path else None,
             "summary": self.summary,
+            "comparisons": self.comparisons,
         }
+
+    @property
+    def is_vacuous(self) -> bool:
+        """A phase that reports a count of zero has not agreed with anything."""
+
+        return self.comparisons == 0
 
 
 @dataclass
@@ -151,7 +164,35 @@ def run_command(command: list[str], cwd: Path, phase: str, timeout: int = 120) -
     status = "pass" if proc.returncode == 0 else "fail"
     log_path = cwd / f"{phase}.log"
     log_path.write_text(stdout + "\n--- stderr ---\n" + stderr, encoding="utf-8")
-    return PhaseResult(phase, status, proc.returncode, stdout, stderr, log_path)
+    comparisons = parse_comparisons(stdout)
+    # A phase that says it compared nothing cannot be a pass, whatever its exit code. The
+    # generated benches guard this themselves; this is the same rule held one level up, so
+    # a bench that loses its guard cannot quietly take the ladder with it.
+    if status == "pass" and comparisons == 0:
+        status = "fail"
+    return PhaseResult(phase, status, proc.returncode, stdout, stderr, log_path, comparisons=comparisons)
+
+
+#: Every tier reports what it examined in one of these shapes; the count is the evidence.
+_COMPARISON_PATTERNS = (
+    re.compile(r"compared (\d+) value\(s\)"),          # oracle testbench
+    re.compile(r"(\d+) value\(s\) compared"),          # paired-trace comparator
+    re.compile(r"RTL_TB: COMPARED (\d+)"),             # direct-RTL testbench
+)
+
+
+def parse_comparisons(stdout: str) -> int | None:
+    """The number of values a phase reports having compared, or None if it reports none.
+
+    None and 0 mean different things and must not be conflated: None is "this phase does
+    not report a count", 0 is "this phase ran and examined nothing".
+    """
+
+    for pattern in _COMPARISON_PATTERNS:
+        found = pattern.search(stdout)
+        if found:
+            return int(found.group(1))
+    return None
 
 
 @dataclass
