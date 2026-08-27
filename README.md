@@ -834,7 +834,12 @@ Other subcommands:
 - `refine` — coverage-driven stimulus refinement: measure structural coverage, turn what
   the schedule never reaches into permanent directed cases, and repeat.
 - `doctor` — check every external tool each tier needs and, with `--install`, install the
-  missing ones through Homebrew (macOS) or apt/dnf/pacman (Linux).
+  missing ones through Homebrew (macOS) or apt/dnf/pacman (Linux). Package names are
+  verified against the platform's index before being offered, so it never hands you a
+  command that does not exist. For KLEE specifically: `apt-get install klee` on Debian,
+  `sudo bash scripts/install_klee.sh` on Ubuntu (not packaged there), and on macOS
+  nothing at all — the generated `tb/run_klee.py` uses the official `klee/klee`
+  container as soon as Docker is running.
 - `status` — read the persistent bounded-run ledger without changing it.
 - `components` — inspect the agent component scaffold; runs nothing.
 
