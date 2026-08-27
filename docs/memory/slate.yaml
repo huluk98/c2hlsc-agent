@@ -179,7 +179,7 @@ evidence:
       concurrently, and its output is byte-identical across repeated runs.
     verified_by: artifact
     artifact: docs/memory/artifacts/sweep-parallel-preprocessed.json
-    measured_at: PLACEHOLDER
+    measured_at: 3d844d4
     method: >-
       `python3 scripts/run_hls_eval_sweep.py --data-root <hls_eval_data> --workers 4`,
       compared per design against the serial results in
