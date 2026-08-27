@@ -555,6 +555,23 @@ def main(argv: list[str]) -> int:
                     f"expected={golden[col_idx]} actual={hls[col_idx]}",
                 )
 
+    # A tier that examined nothing has not agreed with anything. Reaching this point with
+    # no output column means every declared output was traced as an input (or none was
+    # declared), so the dynamic half compared zero values and would report "consistent"
+    # for any implementation. Absence of a mismatch is only evidence when a mismatch was
+    # possible, so this is a failure of the check rather than a pass.
+    if not output_columns:
+        fail(
+            "insufficient evidence",
+            "no output column in the trace schema: the dynamic tier compared nothing, so "
+            "consistency here would hold for any implementation",
+        )
+    if not golden_rows:
+        fail(
+            "insufficient evidence",
+            "the paired traces hold no cycles: nothing was executed to compare",
+        )
+
     notes = []
     if static_stats.get("cfg") is not None:
         notes.append(f"CFG {static_stats['cfg']} node(s), def-use {static_stats['ddg']} edge(s)")

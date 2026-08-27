@@ -445,6 +445,26 @@ def _require_observable_output(function: FunctionInfo, diagnostics: DiagnosticBa
     )
 
 
+def _require_a_test_to_run(config: AgentConfig, diagnostics: DiagnosticBag, source: Path) -> None:
+    """Refuse a schedule that drives the design zero times.
+
+    ``num_tests = 0`` produces a testbench that reports "all 0 tests passed" and a run that
+    reports pass, having executed nothing. It is the same vacuity as an empty compare set,
+    reached from the other end.
+    """
+
+    if config.num_tests >= 1:
+        return
+    diagnostics.add(
+        "error",
+        "no-tests-scheduled",
+        f"num_tests is {config.num_tests}, so the oracle would run the design zero times "
+        "and pass without executing anything",
+        source.name,
+        "Set num_tests to at least 1.",
+    )
+
+
 def analyze_source(input_file: Path, top: str, config: AgentConfig) -> AnalysisResult:
     source = input_file.read_text(encoding="utf-8")
     constants = collect_constants(strip_comments(local_include_text(input_file)))
@@ -452,6 +472,7 @@ def analyze_source(input_file: Path, top: str, config: AgentConfig) -> AnalysisR
     function = _extract_function(source, top, input_file, config, constants)
     _infer_pointer_directions(function, config)
     _require_observable_output(function, diagnostics)
+    _require_a_test_to_run(config, diagnostics, input_file)
     for arg in function.args:
         if arg.is_pointer_like and arg.length is None:
             arg.length = 16
