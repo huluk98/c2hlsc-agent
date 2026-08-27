@@ -104,14 +104,36 @@ hand-written RTL implementing the `ap_ctrl_hs` / `ap_memory` contract:
 | yosys synthesis + area parsing | **works** on yosys 0.33 (298 cells, 384.104 um^2) despite the code comment naming 0.6x |
 | liberty -> Verilog cell models | **was broken** — see L1 below; now fixed and verified |
 | gate-level waveform sim | **pass** after the L1 fix; VCD written; sabotage caught with a per-element mismatch |
-| OpenSTA slack/power | not installed, not packaged for Ubuntu — untested |
+| OpenSTA slack/power | **works** — built 3.1.0 from source (see below); worst setup slack 7.69 ns, worst hold 0.07 ns at a 10 ns clock |
+| OpenSTA power | unverified: the test liberty carries no power tables, so `report_power` totals are 0 and the parser correctly declines to report a fabricated zero |
+
+**Toolchain now installed in-container** (survives only while this container lives):
+`iverilog 12.0`, `yosys 0.33` (apt), and **OpenSTA 3.1.0** built from source —
+`git clone https://github.com/parallaxsw/OpenSTA`, CUDD 3.0.0 from
+`github.com/davidkebo/cudd`, then `cmake -DCUDD_DIR=/opt/cudd-3.0.0 .. && make -j4`.
+Symlinked to `~/tools/eda/opensta/bin/sta`, which is one of `resolve_sta_bin`'s default
+probe locations, so the agent discovers it with no flags. Ubuntu archives and
+`github.com` over git are reachable; `release.bambuhls.eu` and the GitHub **API** are not.
+
+The readiness probe went from 4 blocking to 2: only the HLS toolchain and a per-project
+liberty file remain.
+
+**L2 / L3 (fixed, commit `f58228b`).** Found by building OpenSTA and running it.
+(a) The failure note was always empty: OpenSTA writes diagnostics to STDOUT and leaves
+stderr empty, but the note interpolated `sta_proc.stderr`, so a failed run reported
+`"OpenSTA failed: "` with no reason. (b) Only `^Error[: ]` was matched, but OpenSTA labels
+an abort `Critical <n>: ...`; combined with the already-noted "can exit 0 after a Tcl
+error", a Critical would have been read as success and its truncated report parsed as
+measurements. Detection is now the tested helper `sta_failure_line()`. (c)
+`outcome.reports` advertised `sta_report.txt` after the failure path renamed it to
+`sta_report.failed.txt`.
 
 **L1 (fixed, commit `4fd9817`).** Liberty uses juxtaposition as AND; Nangate45 writes every
 NAND/AND/AOI/OAI cell that way (`function : "!(A1 A2)"`). `_liberty_expr_to_verilog` did not
 handle it and emitted invalid Verilog, and the unhandled-operator guard could not catch it
 because whitespace is necessarily whitelisted there. So the cell was emitted broken rather
 than skipped, contradicting the module's stated contract. The gate-level sim could not
-compile against any real standard-cell library. Two regression tests added; suite now 224.
+compile against any real standard-cell library. Two regression tests added. Suite is now **225** (note: commit f58228b's message says 227 — that is wrong, and was not corrected because the branch is published).
 
 **Reproduction assets** live in the scratchpad, not the repo: hand-written `add_scalars.v`
 and `double_all.v` (ap_ctrl_hs + ap_memory), and a minimal `mini45.lib` with INV/BUF/NAND2/
