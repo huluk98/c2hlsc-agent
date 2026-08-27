@@ -108,7 +108,7 @@ mode, which cannot exist without a model.
 
 ### 3.2 Every generated artifact
 
-`write_project` emits 20 tracked files plus `run_all.sh`. Everything in the "Produced by"
+`write_project` emits 21 files. Everything in the "Produced by"
 column marked **deterministic** is byte-reproducible from the analysis result and config.
 
 | Path | Produced by | Deterministic? | Purpose |
