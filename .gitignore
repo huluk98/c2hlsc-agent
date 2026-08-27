@@ -26,3 +26,8 @@ leveri_golden_trace.csv
 leveri_hls_trace.csv
 vitis_hls_bin_path.txt
 run_ledger.jsonl
+
+# CHStone is fetched on demand, never vendored: each program has its own copyright
+# holder and the suite has no unified licence. See scripts/fetch_chstone.py.
+third_party/
+build/
