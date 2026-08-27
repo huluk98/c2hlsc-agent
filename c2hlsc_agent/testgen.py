@@ -163,10 +163,15 @@ def generate_testbench(analysis: AnalysisResult, config: AgentConfig) -> str:
     contract_comment = _contract_comment(fn.args, fn.return_type, arrays, scalars)
     declarations: list[str] = []
     initializers: list[str] = []
+    # static: a real HLS kernel's arrays are megabytes -- knn's searchSpace alone is
+    # 8 MB -- and these are declared inside the per-test loop, so leaving them on the
+    # stack overflows it and the testbench segfaults before it can compare anything.
+    # Every element is written by the initialisation loops on each iteration, so BSS
+    # storage carries no state between tests.
     for arg in arrays:
         storage_type = _storage_type(arg)
-        declarations.append(f"    {storage_type} ref_{arg.name}[{arg.length}] = {{}};")
-        declarations.append(f"    {storage_type} hls_{arg.name}[{arg.length}] = {{}};")
+        declarations.append(f"    static {storage_type} ref_{arg.name}[{arg.length}] = {{}};")
+        declarations.append(f"    static {storage_type} hls_{arg.name}[{arg.length}] = {{}};")
         initializers.append("    " + _init_array(arg, config).replace("\n", "\n    "))
     for arg in scalars:
         declarations.append(f"    {arg.c_type} {arg.name} = {_scalar_decl(arg, config)};")

@@ -199,7 +199,7 @@ def _write_header_line(items: list[str]) -> str:
 def _array_declarations(arrays: list[FunctionArg]) -> list[str]:
     declarations: list[str] = []
     for arg in arrays:
-        declarations.append(f"  {_storage_type(arg)} {arg.name}[{arg.length}] = {{}};")
+        declarations.append(f"  static {_storage_type(arg)} {arg.name}[{arg.length}] = {{}};")
     return declarations
 
 
@@ -564,7 +564,7 @@ def _klee_driver(analysis: AnalysisResult) -> str:
     setup: list[str] = []
     for arg in fn.args:
         if arg.is_pointer_like:
-            declarations.append(f"  {_storage_type(arg)} {arg.name}[{arg.length}] = {{}};")
+            declarations.append(f"  static {_storage_type(arg)} {arg.name}[{arg.length}] = {{}};")
             if arg.direction in {"input", "inout"}:
                 setup.append(f'  klee_make_symbolic({arg.name}, sizeof({arg.name}), "{arg.name}");')
             else:

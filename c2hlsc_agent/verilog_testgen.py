@@ -372,7 +372,7 @@ def _vectors_tb(analysis: AnalysisResult, config: AgentConfig, spec: dict[str, o
         info = array_spec[arg.name]
         storage = _storage_type(arg)
         depth = info["depth"]
-        declarations.append(f"    {storage} ref_{arg.name}[{depth}] = {{}};")
+        declarations.append(f"    static {storage} ref_{arg.name}[{depth}] = {{}};")
         unsigned = "true" if info["signed"] is False else "false"
         if arg.direction in {"input", "inout"}:
             initializers.append(
