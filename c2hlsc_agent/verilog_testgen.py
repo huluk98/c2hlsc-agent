@@ -1024,11 +1024,18 @@ def main() -> int:
     if rtl_dir is None:
         write_report({
             "status": "skipped",
-            "reason": "synthesized RTL not found; run csynth (make vitis) first",
+            "reason": (
+                "synthesized RTL not found; run csynth (make vitis), or point "
+                "C2HLSC_RTL_DIR at any directory of .v/.sv files -- this tier simulates "
+                "whatever RTL it is given and does not care which HLS tool produced it"
+            ),
             "testbench": str(tb.relative_to(ROOT)) if tb.exists() else None,
             "commands": logs,
         })
-        print("RTL cosim skipped: synthesized RTL not found (run synthesis first)")
+        print(
+            "RTL cosim skipped: synthesized RTL not found "
+            "(run synthesis, or set C2HLSC_RTL_DIR to a directory of .v/.sv files)"
+        )
         return 0
 
     stdout = simulate(spec, tb, rtl_dir, logs)
