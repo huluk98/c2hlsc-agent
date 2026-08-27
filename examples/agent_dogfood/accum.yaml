@@ -1,0 +1,12 @@
+input_files: [accum.c]
+top: accum
+num_tests: 6
+arguments:
+  in:
+    direction: input
+    length: 4
+  out:
+    direction: output
+    length: 4
+  n:
+    range: [0, 4]
