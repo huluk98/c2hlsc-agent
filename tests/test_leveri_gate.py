@@ -355,5 +355,61 @@ class LeveriEndToEndTests(unittest.TestCase):
         self.assertEqual(result.status, "pass", result.stdout + result.stderr)
 
 
+def _load_drift_checker():
+    import importlib.util
+
+    script = Path(__file__).resolve().parents[1] / "scripts" / "check_generated_testbenches.py"
+    spec = importlib.util.spec_from_file_location("check_generated_testbenches", script)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class GeneratedTestbenchDriftTests(unittest.TestCase):
+    def _project(self, root: Path) -> Path:
+        analysis, cfg = _vector_add_setup(root)
+        generated = generate_hls_sources(analysis, cfg)
+        project = root / "project"
+        write_project(project, analysis, generated, cfg)
+        return project
+
+    def test_manifest_records_generated_file_hashes(self):
+        import json
+
+        with tempfile.TemporaryDirectory() as tmp:
+            project = self._project(Path(tmp))
+            manifest = json.loads((project / "tb" / "leveri_manifest.json").read_text(encoding="utf-8"))
+        hashes = manifest["generated_file_sha256"]
+        self.assertIn("tb/leveri_golden_tb.cpp", hashes)
+        self.assertIn("tb/leveri_hls_tb.cpp", hashes)
+        self.assertEqual(len(hashes["tb/leveri_golden_tb.cpp"]), 64)
+
+    def test_clean_project_passes_the_drift_check(self):
+        checker = _load_drift_checker()
+        with tempfile.TemporaryDirectory() as tmp:
+            project = self._project(Path(tmp))
+            self.assertEqual(checker.main(["--project", str(project)]), 0)
+
+    def test_hand_edited_testbench_fails_the_drift_check(self):
+        checker = _load_drift_checker()
+        with tempfile.TemporaryDirectory() as tmp:
+            project = self._project(Path(tmp))
+            golden = project / "tb" / "leveri_golden_tb.cpp"
+            golden.write_text(golden.read_text(encoding="utf-8") + "\n// hand edit\n", encoding="utf-8")
+            self.assertEqual(checker.main(["--project", str(project)]), 1)
+
+    def test_missing_generated_file_fails_the_drift_check(self):
+        checker = _load_drift_checker()
+        with tempfile.TemporaryDirectory() as tmp:
+            project = self._project(Path(tmp))
+            (project / "tb" / "leveri_compare.py").unlink()
+            self.assertEqual(checker.main(["--project", str(project)]), 1)
+
+    def test_project_without_manifest_is_skipped_not_failed(self):
+        checker = _load_drift_checker()
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(checker.main(["--project", tmp]), 0)
+
+
 if __name__ == "__main__":
     unittest.main()

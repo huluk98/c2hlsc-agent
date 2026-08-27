@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass
 
@@ -632,7 +633,13 @@ if __name__ == "__main__":
 """
 
 
-def _manifest(analysis: AnalysisResult, config: AgentConfig) -> str:
+def generated_text_sha256(text: str) -> str:
+    """Hash generated testbench text, newline-normalized so Windows checkouts match."""
+
+    return hashlib.sha256(text.replace("\r\n", "\n").encode("utf-8")).hexdigest()
+
+
+def _manifest(analysis: AnalysisResult, config: AgentConfig, file_hashes: dict[str, str] | None = None) -> str:
     fn = analysis.function
     payload = {
         "policy_id": LEVERI_TESTBENCH_POLICY_ID,
@@ -670,6 +677,10 @@ def _manifest(analysis: AnalysisResult, config: AgentConfig) -> str:
             "tb/run_klee.py",
             "tb/leveri_manifest.json",
         ],
+        # SHA-256 of each generated file as rendered (newline-normalized). Generated
+        # testbenches must never be hand-edited — change the contract and regenerate —
+        # and scripts/check_generated_testbenches.py enforces that against these hashes.
+        "generated_file_sha256": dict(file_hashes or {}),
         "arguments": [
             {
                 "name": arg.name,
@@ -693,24 +704,38 @@ def generate_leveri_testbenches(analysis: AnalysisResult, config: AgentConfig) -
 #undef {fn.name}
 }}"""
     hls_include = '#include "../src/hls_top.hpp"'
+    golden_tb = _render_trace_tb(
+        analysis,
+        config,
+        target_name=f"{fn.name}_ref",
+        output_csv="leveri_golden_trace.csv",
+        include_block=golden_include,
+    )
+    hls_tb = _render_trace_tb(
+        analysis,
+        config,
+        target_name=fn.name,
+        output_csv="leveri_hls_trace.csv",
+        include_block=hls_include,
+    )
+    compare_script = _compare_script()
+    gcov_script = _gcov_script()
+    klee_driver = _klee_driver(analysis)
+    klee_script = _klee_script()
+    file_hashes = {
+        "tb/leveri_golden_tb.cpp": generated_text_sha256(golden_tb),
+        "tb/leveri_hls_tb.cpp": generated_text_sha256(hls_tb),
+        "tb/leveri_compare.py": generated_text_sha256(compare_script),
+        "tb/run_gcov.py": generated_text_sha256(gcov_script),
+        "tb/klee_driver.cpp": generated_text_sha256(klee_driver),
+        "tb/run_klee.py": generated_text_sha256(klee_script),
+    }
     return LeVeriTestbenchBundle(
-        golden_tb=_render_trace_tb(
-            analysis,
-            config,
-            target_name=f"{fn.name}_ref",
-            output_csv="leveri_golden_trace.csv",
-            include_block=golden_include,
-        ),
-        hls_tb=_render_trace_tb(
-            analysis,
-            config,
-            target_name=fn.name,
-            output_csv="leveri_hls_trace.csv",
-            include_block=hls_include,
-        ),
-        compare_script=_compare_script(),
-        gcov_script=_gcov_script(),
-        klee_driver=_klee_driver(analysis),
-        klee_script=_klee_script(),
-        manifest_json=_manifest(analysis, config),
+        golden_tb=golden_tb,
+        hls_tb=hls_tb,
+        compare_script=compare_script,
+        gcov_script=gcov_script,
+        klee_driver=klee_driver,
+        klee_script=klee_script,
+        manifest_json=_manifest(analysis, config, file_hashes),
     )

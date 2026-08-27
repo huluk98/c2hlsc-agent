@@ -2,7 +2,8 @@
 param(
     [ValidateRange(0, 2147483647)]
     [int]$Issue = 0,
-    [switch]$RunTests
+    [switch]$RunTests,
+    [string[]]$CheckProject = @()
 )
 
 Set-StrictMode -Version Latest
@@ -106,8 +107,7 @@ if ($LASTEXITCODE -ne 0) {
     $blockers.Add('git diff --check failed.')
 }
 
-if ($RunTests) {
-    Write-Host '== Offline unit tests =='
+if ($RunTests -or $CheckProject.Count -gt 0) {
     $pythonCommand = Get-Command python -ErrorAction SilentlyContinue
     $pythonPrefix = @()
     if (-not $pythonCommand) {
@@ -117,6 +117,22 @@ if ($RunTests) {
     if (-not $pythonCommand) {
         throw 'Neither python nor the Windows py launcher was found.'
     }
+}
+
+if ($CheckProject.Count -gt 0) {
+    Write-Host '== Generated-testbench drift check =='
+    $checkArgs = @()
+    foreach ($project in $CheckProject) {
+        $checkArgs += @('--project', $project)
+    }
+    & $pythonCommand.Source @pythonPrefix scripts/check_generated_testbenches.py @checkArgs
+    if ($LASTEXITCODE -ne 0) {
+        $blockers.Add('Generated LeVeri testbenches drifted from their manifest; regenerate instead of hand-editing.')
+    }
+}
+
+if ($RunTests) {
+    Write-Host '== Offline unit tests =='
     & $pythonCommand.Source @pythonPrefix -m unittest discover -s tests
     if ($LASTEXITCODE -ne 0) {
         $blockers.Add('Offline unit tests failed.')

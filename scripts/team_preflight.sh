@@ -3,9 +3,10 @@ set -euo pipefail
 
 ISSUE=0
 RUN_TESTS=0
+CHECK_PROJECTS=()
 
 usage() {
-  echo "Usage: bash scripts/team_preflight.sh [--issue NUMBER] [--run-tests]"
+  echo "Usage: bash scripts/team_preflight.sh [--issue NUMBER] [--run-tests] [--check-project DIR]..."
 }
 
 while [[ $# -gt 0 ]]; do
@@ -18,6 +19,11 @@ while [[ $# -gt 0 ]]; do
     --run-tests)
       RUN_TESTS=1
       shift
+      ;;
+    --check-project)
+      [[ $# -ge 2 ]] || { usage >&2; exit 64; }
+      CHECK_PROJECTS+=("$2")
+      shift 2
       ;;
     -h|--help)
       usage
@@ -107,8 +113,7 @@ if ! git diff --check; then
   BLOCKERS+=("git diff --check failed.")
 fi
 
-if (( RUN_TESTS == 1 )); then
-  echo "== Offline unit tests =="
+if (( RUN_TESTS == 1 )) || (( ${#CHECK_PROJECTS[@]} > 0 )); then
   if command -v python3 >/dev/null 2>&1; then
     PYTHON_BIN="$(command -v python3)"
   elif command -v python >/dev/null 2>&1; then
@@ -117,6 +122,21 @@ if (( RUN_TESTS == 1 )); then
     echo "Neither python3 nor python was found." >&2
     exit 127
   fi
+fi
+
+if (( ${#CHECK_PROJECTS[@]} > 0 )); then
+  echo "== Generated-testbench drift check =="
+  CHECK_ARGS=()
+  for project in "${CHECK_PROJECTS[@]}"; do
+    CHECK_ARGS+=(--project "$project")
+  done
+  if ! "$PYTHON_BIN" scripts/check_generated_testbenches.py "${CHECK_ARGS[@]}"; then
+    BLOCKERS+=("Generated LeVeri testbenches drifted from their manifest; regenerate instead of hand-editing.")
+  fi
+fi
+
+if (( RUN_TESTS == 1 )); then
+  echo "== Offline unit tests =="
   if ! "$PYTHON_BIN" -m unittest discover -s tests; then
     BLOCKERS+=("Offline unit tests failed.")
   fi
