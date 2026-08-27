@@ -216,8 +216,12 @@ python -m c2hlsc_agent components --component hlsc_repair_agent
 python -m c2hlsc_agent components --json
 ```
 
-Two documents go with it:
+Three documents go with it:
 
+- [`docs/input_contract.md`](docs/input_contract.md) — **start here to run your own
+  design**: what the C analyzer accepts and rejects, every `config.yaml` key with its
+  default and effect, and a map of every artifact a run emits and what each one is
+  evidence for.
 - [`docs/workflow_end_to_end.md`](docs/workflow_end_to_end.md) — the complete walkthrough
   from an input C file or NL spec to a verified (and optionally PPA-optimized) project:
   every stage, gate, artifact, budget, failure family, and exit code.
