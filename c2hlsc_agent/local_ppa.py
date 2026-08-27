@@ -302,6 +302,20 @@ def generate_cell_models(liberty: Path, netlist: Path, out_path: Path) -> int:
     return modeled
 
 
+# OpenSTA labels an abort "Critical <n>: ..." as well as "Error ...", writes both to
+# STDOUT while leaving stderr empty, and can still exit 0 after a Tcl error. So neither
+# the exit code nor stderr is a sufficient verdict, and a Critical leaves a
+# plausible-looking partial report behind that must never be parsed as measurements.
+_STA_FAILURE_RE = re.compile(r"^(?:Error|Critical)\b.*$", re.M)
+
+
+def sta_failure_line(text: str) -> str | None:
+    """First OpenSTA diagnostic that invalidates a timing report, or ``None``."""
+
+    match = _STA_FAILURE_RE.search(text or "")
+    return match.group(0) if match else None
+
+
 def _run(cmd: list[str], cwd: Path, timeout: int) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout)
 
@@ -436,13 +450,21 @@ def run_local_ppa(
             sta_text = sta_proc.stdout + sta_proc.stderr
             (syn_dir / "sta_report.txt").write_text(sta_text, encoding="utf-8")
             outcome.reports.append(str(syn_dir / "sta_report.txt"))
-            # This OpenSTA build can exit 0 after a Tcl error; scan for Error lines too.
-            error_line = re.search(r"^Error[: ].*$", sta_text, re.M)
+            error_line = sta_failure_line(sta_text)
             if sta_proc.returncode != 0 or error_line:
                 outcome.status = "fail"
-                outcome.note = f"OpenSTA failed: {(error_line.group(0) if error_line else sta_proc.stderr.strip())[-300:]}"
+                # OpenSTA writes its diagnostics to STDOUT and leaves stderr empty, so
+                # reporting stderr alone yields "OpenSTA failed:" with no reason at all.
+                detail = (
+                    error_line.group(0)
+                    if error_line
+                    else (sta_proc.stderr.strip() or sta_text.strip() or f"exit {sta_proc.returncode}")
+                )
+                outcome.note = f"OpenSTA failed: {detail[-300:]}"
                 # Do not let a failed STA's partial report be parsed as measurements.
-                (syn_dir / "sta_report.txt").rename(syn_dir / "sta_report.failed.txt")
+                failed = syn_dir / "sta_report.failed.txt"
+                (syn_dir / "sta_report.txt").rename(failed)
+                outcome.reports[-1] = str(failed)  # the path we advertise must exist
             else:
                 outcome.status = "ok"
 

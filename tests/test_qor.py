@@ -581,6 +581,23 @@ class LocalPPATests(unittest.TestCase):
         self.assertIn("module INV_X1(ZN, A);", text)
         self.assertIn("assign ZN = ~A;", text)
 
+    def test_sta_failure_line_detects_critical_not_just_error(self):
+        # OpenSTA aborts a report with "Critical <n>: ..." and can still exit 0, writing
+        # every diagnostic to stdout while leaving stderr empty. Matching only "Error"
+        # would treat the resulting partial report as valid measurements.
+        from c2hlsc_agent.local_ppa import sta_failure_line
+
+        critical = "==== WORST SETUP (max) PATHS ====\nCritical 242: TableModel.cc line 652, unsupported table axes\n"
+        self.assertEqual(
+            sta_failure_line(critical),
+            "Critical 242: TableModel.cc line 652, unsupported table axes",
+        )
+        self.assertEqual(sta_failure_line("Error: no such command"), "Error: no such command")
+        # Warnings are routine on a real liberty and must not invalidate the report.
+        self.assertIsNone(sta_failure_line("Warning 1251: unsupported model axis."))
+        self.assertIsNone(sta_failure_line("worst slack max 7.69\nworst slack min 0.07"))
+        self.assertIsNone(sta_failure_line(""))
+
     def test_liberty_implicit_and_is_translated(self):
         # Liberty uses juxtaposition as AND. Nangate45 writes every NAND/AND/AOI/OAI cell
         # that way, so an untranslated "A1 A2" emits invalid Verilog and the gate-level
