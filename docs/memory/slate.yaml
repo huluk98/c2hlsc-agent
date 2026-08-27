@@ -234,7 +234,7 @@ evidence:
       without changing any verdict.
     verified_by: test
     test: tests/test_analyze.py::AnalyzeTests::test_write_through_dereferenced_array_pointer_is_seen
-    fixed_in: PLACEHOLDER
+    fixed_in: be3944f
     result: >-
       no-observable-output fell from 26 designs to 3; the sweep stayed at 38/104.
       The 22 now fail with `cannot convert 'double*' to 'double (*)[40]'`, which
@@ -250,7 +250,7 @@ evidence:
       --auto-repair gained 0 designs and lost 0.
     verified_by: artifact
     artifact: docs/memory/artifacts/sweep-repair-loop.json
-    measured_at: PLACEHOLDER
+    measured_at: be3944f
     method: >-
       `scripts/run_hls_eval_sweep.py --auto-repair`, compared per design against
       the same sweep without it.
@@ -267,7 +267,7 @@ evidence:
       40 are testbench-harness limits and 20 are properties of the input.
     verified_by: artifact
     artifact: docs/memory/artifacts/sweep-q008.json
-    measured_at: PLACEHOLDER
+    measured_at: be3944f
     breakdown: >-
       29 flat testbench versus an N-D parameter; 10 rejected before generation ever
       runs; 8 stimulus cannot build the parameter type; 7 references already written
