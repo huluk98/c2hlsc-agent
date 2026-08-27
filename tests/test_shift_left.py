@@ -34,9 +34,18 @@ from c2hlsc_agent.stimulus import ExtraVector, StimulusError, render_helpers, va
 from c2hlsc_agent import toolchain
 
 
-HAVE_BUILD = shutil.which("g++") is not None and shutil.which("make") is not None
-HAVE_GCOV = HAVE_BUILD and shutil.which("gcov") is not None
-HAVE_KLEE = HAVE_GCOV and shutil.which("klee") is not None and shutil.which("clang++") is not None
+from support import (  # noqa: E402 - tests/ is added to sys.path above
+    BUILD_REASON,
+    GCOV_REASON,
+    HAVE_BUILD,
+    HAVE_GCOV,
+    HAVE_KLEE,
+    HAVE_MAKE,
+    HAVE_SYMLINKS,
+    KLEE_REASON,
+    run_make,
+    run_target,
+)
 
 VECTOR_ADD = """#include <stdint.h>
 void vector_add(const int32_t *a, const int32_t *b, int32_t *out, int n) {
@@ -219,9 +228,9 @@ class StaticStructuralTierTests(unittest.TestCase):
             self.compare.cfg_signature(self.compare.normalize_source(hls, "f")),
         )
 
-    @unittest.skipUnless(HAVE_BUILD, "g++ and make are required")
+    @unittest.skipUnless(HAVE_BUILD, BUILD_REASON)
     def test_one_sided_harness_change_fails_the_run(self) -> None:
-        clean = subprocess.run(["make", "-C", str(self.project), "leveri-test"], capture_output=True, text=True)
+        clean = run_target(self.project, "leveri-test")
         self.assertEqual(clean.returncode, 0, clean.stdout + clean.stderr)
 
         hls_tb = self.project / "tb" / "leveri_hls_tb.cpp"
@@ -232,7 +241,7 @@ class StaticStructuralTierTests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
-        broken = subprocess.run(["make", "-C", str(self.project), "leveri-test"], capture_output=True, text=True)
+        broken = run_target(self.project, "leveri-test")
         self.assertNotEqual(broken.returncode, 0)
         self.assertIn("static control-flow check failed", broken.stdout + broken.stderr)
 
@@ -266,7 +275,7 @@ class ExtraVectorTests(unittest.TestCase):
         config = AgentConfig(directed_tests=["zeros"])
         self.assertNotIn("c2hlsc_extra", render_helpers(config, "test_idx"))
 
-    @unittest.skipUnless(HAVE_BUILD, "g++ and make are required")
+    @unittest.skipUnless(HAVE_BUILD, BUILD_REASON)
     def test_refined_project_still_builds_and_passes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project, _, _ = _project(
@@ -285,12 +294,12 @@ class ExtraVectorTests(unittest.TestCase):
                     ExtraVector({"a": [0, 0, 0, 0], "b": [0, 0, 0, 0], "n": 0}, origin="klee:test2"),
                 ],
             )
-            run = subprocess.run(["make", "-C", str(project), "test"], capture_output=True, text=True)
+            run = run_target(project, "test")
             self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
             self.assertIn("all 6 tests passed", run.stdout)
             self.assertIn("+2 refinement vector(s)", run.stdout)
 
-            trace = subprocess.run(["make", "-C", str(project), "leveri-test"], capture_output=True, text=True)
+            trace = run_target(project, "leveri-test")
             self.assertEqual(trace.returncode, 0, trace.stdout + trace.stderr)
             rows = (project / "leveri_golden_trace.csv").read_text(encoding="utf-8").strip().splitlines()
             self.assertEqual(len(rows), 2 + 6)  # header + roles + 4 scheduled + 2 refinement
@@ -380,7 +389,7 @@ class RefinementLoopTests(unittest.TestCase):
             self.assertIn("doctor --install", outcome.summary)
             self.assertTrue((project / "coverage_refinement.json").exists())
 
-    @unittest.skipUnless(HAVE_GCOV, "g++, make and gcov are required")
+    @unittest.skipUnless(HAVE_GCOV, GCOV_REASON)
     def test_widening_fallback_reaches_the_target(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project, analysis, config = self._picky(Path(tmp))
@@ -394,11 +403,11 @@ class RefinementLoopTests(unittest.TestCase):
             report = json.loads((project / "coverage_refinement.json").read_text(encoding="utf-8"))
             self.assertEqual(report["status"], "met")
 
-    @unittest.skipUnless(HAVE_GCOV, "g++, make and gcov are required")
+    @unittest.skipUnless(HAVE_GCOV, GCOV_REASON)
     def test_coverage_report_pinpoints_the_unreached_branch(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project, _, _ = self._picky(Path(tmp))
-            run = subprocess.run(["make", "-C", str(project), "gcov-coverage"], capture_output=True, text=True)
+            run = run_target(project, "gcov-coverage")
             self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
             report = json.loads((project / "coverage" / "gcov_report.json").read_text(encoding="utf-8"))
             self.assertEqual(report["status"], "pass")
@@ -407,16 +416,11 @@ class RefinementLoopTests(unittest.TestCase):
             self.assertIn("input.c", report["measured_files"])
             self.assertIn("src/hls_top.cpp", report["measured_files"])
 
-    @unittest.skipUnless(HAVE_GCOV, "g++, make and gcov are required")
+    @unittest.skipUnless(HAVE_GCOV, GCOV_REASON)
     def test_coverage_target_gates_the_target(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project, _, _ = self._picky(Path(tmp))
-            run = subprocess.run(
-                ["make", "-C", str(project), "gcov-coverage"],
-                capture_output=True,
-                text=True,
-                env={**os.environ, "C2HLSC_MIN_COVERAGE": "99"},
-            )
+            run = run_target(project, "gcov-coverage", env={**os.environ, "C2HLSC_MIN_COVERAGE": "99"})
             self.assertNotEqual(run.returncode, 0)
             self.assertIn("below C2HLSC_MIN_COVERAGE", run.stdout)
 
@@ -432,7 +436,7 @@ class RefinementLoopTests(unittest.TestCase):
             self.assertIn("c2hlsc_extra_count = 1", (project / "tb" / "testbench.cpp").read_text(encoding="utf-8"))
 
 
-@unittest.skipUnless(HAVE_KLEE, "a native klee and clang++ are required")
+@unittest.skipUnless(HAVE_KLEE, KLEE_REASON)
 class SymbolicRefinementTests(unittest.TestCase):
     """The KLEE path, against real KLEE.
 
@@ -469,9 +473,7 @@ class SymbolicRefinementTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             project, analysis, config = self._needle(Path(tmp))
             report = json.loads(
-                subprocess.run(
-                    ["make", "-C", str(project), "klee-coverage"], capture_output=True, text=True
-                ).stdout
+                run_target(project, "klee-coverage").stdout
                 and (project / "coverage" / "klee_report.json").read_text(encoding="utf-8")
             )
             self.assertEqual(report["mode"], "native")
@@ -494,7 +496,7 @@ class SymbolicRefinementTests(unittest.TestCase):
             outcome = refine_project(project, analysis, config, target=100.0, max_rounds=3, allow_widen=False)
             self.assertEqual(outcome.status, "met")
             for target in ("test", "leveri-test"):
-                run = subprocess.run(["make", "-C", str(project), target], capture_output=True, text=True)
+                run = run_target(project, target)
                 self.assertEqual(run.returncode, 0, f"{target}: {run.stdout}{run.stderr}")
 
 
@@ -610,7 +612,7 @@ class InterpreterPortabilityTests(unittest.TestCase):
         self.assertIn('EXE = ".exe" if os.name == "nt" else ""', driver)
         self.assertIn("sys.executable", driver)
 
-    @unittest.skipUnless(shutil.which("g++") or shutil.which("clang++"), "a C++ compiler is required")
+    @unittest.skipUnless(HAVE_BUILD, BUILD_REASON)
     def test_the_host_tier_runs_with_no_make_on_path(self) -> None:
         """The native-Windows scenario: a compiler and Python, no make and no shell."""
 
@@ -639,6 +641,27 @@ class InterpreterPortabilityTests(unittest.TestCase):
                 )
                 self.assertEqual(run.returncode, 0, f"{target}: {run.stdout}{run.stderr}")
 
+    @unittest.skipUnless(HAVE_BUILD and HAVE_MAKE, "a C++ compiler and make are required")
+    def test_the_makefile_alias_still_forwards_to_the_driver(self) -> None:
+        """make is optional, but while it exists it must reach the same recipes."""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            project, _, _ = _project(
+                Path(tmp),
+                VECTOR_ADD,
+                "vector_add",
+                {
+                    "a": ArgumentConfig(direction="input", length=4),
+                    "b": ArgumentConfig(direction="input", length=4),
+                    "out": ArgumentConfig(direction="output", length=4),
+                    "n": ArgumentConfig(range=(0, 4)),
+                },
+                num_tests=4,
+            )
+            run = run_make(project, "test")
+            self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+            self.assertIn("host_build.py", run.stdout)
+
     def test_run_command_kills_the_process_tree_on_windows(self) -> None:
         from c2hlsc_agent import equivalence
 
@@ -652,7 +675,7 @@ class InterpreterPortabilityTests(unittest.TestCase):
         runner.assert_called_once()
         self.assertEqual(runner.call_args[0][0], ["taskkill", "/PID", "4321", "/T", "/F"])
 
-    @unittest.skipUnless(HAVE_BUILD, "g++ and make are required")
+    @unittest.skipUnless(HAVE_BUILD and HAVE_SYMLINKS, "a C++ compiler and symlink support are required")
     def test_the_rung_passes_with_no_python3_on_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

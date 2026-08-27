@@ -11,6 +11,18 @@ build/
 dist/
 *.log
 c2hlsc_project/
+# Host-tier binaries built by tb/host_build.py, on every platform.
 c2hlsc_tb
+leveri_golden_tb
+leveri_hls_tb
+rtl_vectors_tb
+*.exe
+*.obj
+*.pdb
+*.ilk
+coverage/
+rtl_vectors/
+leveri_golden_trace.csv
+leveri_hls_trace.csv
 vitis_hls_bin_path.txt
 run_ledger.jsonl

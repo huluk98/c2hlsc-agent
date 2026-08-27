@@ -47,16 +47,21 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $parseErrors = $null
-          [System.Management.Automation.Language.Parser]::ParseFile(
-            (Resolve-Path 'scripts/team_preflight.ps1'),
-            [ref]$null,
-            [ref]$parseErrors
-          ) | Out-Null
-          if ($parseErrors.Count -gt 0) {
-            $parseErrors | Format-List
-            exit 1
+          $failed = $false
+          foreach ($script in 'scripts/team_preflight.ps1', 'scripts/setup_windows.ps1') {
+            $parseErrors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path $script),
+              [ref]$null,
+              [ref]$parseErrors
+            ) | Out-Null
+            if ($parseErrors.Count -gt 0) {
+              Write-Host "::error file=$script::PowerShell parse errors"
+              $parseErrors | Format-List
+              $failed = $true
+            }
           }
+          if ($failed) { exit 1 }
       - name: Validate Python helper syntax
         run: python -m py_compile scripts/verify_github_guardrails.py
       - name: Install package
@@ -66,6 +71,22 @@ jobs:
         # pass fully offline, exercising the deterministic generator/repair and the
         # LLM-unavailable fallback paths.
         run: python -m unittest discover -s tests
+
+      - name: Convert an example with no make on PATH
+        if: runner.os == 'Windows'
+        # The host tier must work with native Windows tools only. The runner has a
+        # GCC-style compiler; make is deliberately not used, so this fails if anything
+        # reintroduces a make or POSIX-shell dependency on the path to a verdict.
+        shell: pwsh
+        run: |
+          python -m c2hlsc_agent convert `
+            --input examples/vector_add/input.c `
+            --top vector_add `
+            --config examples/vector_add/config.yaml `
+            --out build/ci_windows
+          $report = Get-Content build/ci_windows/conversion_report.json | ConvertFrom-Json
+          Write-Host "software_equivalence=$($report.software_equivalence) trace_consistency=$($report.trace_consistency)"
+          if ($report.status -ne 'pass') { throw "conversion status was $($report.status)" }
 
   lint:
     name: Lint

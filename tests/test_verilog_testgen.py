@@ -22,6 +22,10 @@ from c2hlsc_agent.verilog_testgen import (
     get_rtl_testbench_contract,
 )
 
+from support import (  # noqa: E402 - tests/ is on sys.path via unittest discover
+    run_target,
+)
+
 
 # Correct depth-4 stand-in for Vitis-synthesized RTL: ap_ctrl_hs block control with
 # single-port ap_memory arrays (registered one-cycle read latency) and an ap_none scalar.
@@ -319,7 +323,7 @@ class VerilogTestgenTests(unittest.TestCase):
     @unittest.skipUnless(_tools("g++", "make", "python3"), "g++, make, python3 required")
     def test_vectors_build_and_counts(self):
         project = self._write_project(num_tests=8)
-        run = subprocess.run(["make", "-C", str(project), "rtl-vectors"], text=True, capture_output=True)
+        run = run_target(project, "rtl-vectors")
         self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
         vdir = project / "rtl_vectors"
         self.assertEqual(len((vdir / "rtl_vec_a.mem").read_text().split()), 8 * 4)

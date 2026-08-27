@@ -614,6 +614,42 @@ sessions inherit the repository-specific engineering and evidence rules in
 and Ubuntu preflight commands live in `scripts/team_preflight.ps1` and
 `scripts/team_preflight.sh`.
 
+## Windows quickstart (native, no WSL)
+
+Clone and run one command:
+
+```powershell
+git clone https://github.com/huluk98/c2hlsc-agent.git
+cd c2hlsc-agent
+powershell -ExecutionPolicy Bypass -File scripts\setup_windows.ps1
+```
+
+It installs the package, reports which tools each verification tier needs, and runs the
+offline test suite. Add `-InstallTools` to have it install the missing ones through winget.
+
+What you actually need:
+
+| Need | Answer |
+| --- | --- |
+| Python 3.10+ | Any name — the agent passes its own interpreter through, so `python` vs `python3` never matters |
+| A C++ compiler | `winget install LLVM.LLVM` (clang++), or MSYS2 `mingw-w64-gcc`. **MSVC (`cl.exe`) will not work** — GCC-style flags |
+| `make` | **Not needed.** Every recipe lives in the generated `tb/host_build.py`; the Makefile is just an alias |
+| A POSIX shell | **Not needed.** `run_all.py` is the shell-free sibling of `run_all.sh` |
+| Vitis HLS | Linux-only. Run it remotely with `--vitis-ssh user@linux-host`; everything else stays local |
+
+Then convert something:
+
+```powershell
+python -m c2hlsc_agent convert --input examples\vector_add\input.c --top vector_add `
+  --config examples\vector_add\config.yaml --out build\vector_add
+python -m c2hlsc_agent doctor
+```
+
+Line endings are pinned by `.gitattributes`, so a Windows clone does not silently rewrite
+shell scripts or TCL to CRLF and break them on the Linux synthesis host. CI runs the full
+suite on `windows-latest` and converts an example there with `make` unused, so the native
+path stays working.
+
 ## Install
 
 From the repository root:

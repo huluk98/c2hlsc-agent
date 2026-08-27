@@ -1,5 +1,4 @@
 import shutil
-import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -18,6 +17,14 @@ from c2hlsc_agent.leveri_testgen import (
     LEVERI_TESTBENCH_SYSTEM_PROMPT,
     generate_leveri_testbenches,
     get_leveri_testbench_contract,
+)
+
+from support import (  # noqa: E402 - tests/ is on sys.path via unittest discover
+    BUILD_REASON,
+    GCOV_REASON,
+    HAVE_BUILD,
+    HAVE_GCOV,
+    run_target,
 )
 
 
@@ -93,7 +100,7 @@ class LeVeriTestgenTests(unittest.TestCase):
         self.assertIn("cfg_signature", bundle.compare_script)
         self.assertIn("ddg_signature", bundle.compare_script)
 
-    @unittest.skipUnless(shutil.which("g++") and shutil.which("make") and shutil.which("python3"), "g++, make, and python3 are required")
+    @unittest.skipUnless(HAVE_BUILD, BUILD_REASON)
     def test_project_leveri_trace_check_passes(self):
         analysis, cfg = self._analysis()
         generated = generate_hls_sources(analysis, cfg)
@@ -102,11 +109,11 @@ class LeVeriTestgenTests(unittest.TestCase):
         project = Path(tmp.name) / "project"
         write_project(project, analysis, generated, cfg)
 
-        run = subprocess.run(["make", "-C", str(project), "leveri-test"], text=True, capture_output=True)
+        run = run_target(project, "leveri-test")
         self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
         self.assertIn("HLS-LeVeri dual-tier consistency check passed", run.stdout)
 
-    @unittest.skipUnless(shutil.which("g++") and shutil.which("gcov") and shutil.which("make") and shutil.which("python3"), "g++, gcov, make, and python3 are required")
+    @unittest.skipUnless(HAVE_GCOV, GCOV_REASON)
     def test_project_gcov_coverage_target_writes_report(self):
         analysis, cfg = self._analysis()
         generated = generate_hls_sources(analysis, cfg)
@@ -115,13 +122,13 @@ class LeVeriTestgenTests(unittest.TestCase):
         project = Path(tmp.name) / "project"
         write_project(project, analysis, generated, cfg)
 
-        run = subprocess.run(["make", "-C", str(project), "gcov-coverage"], text=True, capture_output=True)
+        run = run_target(project, "gcov-coverage")
         self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
         report = project / "coverage" / "gcov_report.json"
         self.assertTrue(report.exists())
         self.assertIn('"status": "pass"', report.read_text(encoding="utf-8"))
 
-    @unittest.skipUnless(shutil.which("make") and shutil.which("python3"), "make and python3 are required")
+    @unittest.skipUnless(HAVE_BUILD, BUILD_REASON)
     def test_project_klee_target_skips_cleanly_when_klee_missing(self):
         if shutil.which("klee"):
             self.skipTest("this test only checks the portable no-KLEE fallback")
@@ -132,7 +139,7 @@ class LeVeriTestgenTests(unittest.TestCase):
         project = Path(tmp.name) / "project"
         write_project(project, analysis, generated, cfg)
 
-        run = subprocess.run(["make", "-C", str(project), "klee-coverage"], text=True, capture_output=True)
+        run = run_target(project, "klee-coverage")
         self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
         report = project / "coverage" / "klee_report.json"
         self.assertTrue(report.exists())

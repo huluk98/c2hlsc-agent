@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import importlib
-import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -25,11 +24,14 @@ from c2hlsc_agent.components import (
 )
 from c2hlsc_agent.config import load_config
 from c2hlsc_agent.equivalence import PhaseResult, VerificationState
+from support import (  # noqa: E402 - tests/ is on sys.path via unittest discover
+    HAVE_BUILD,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
 EXAMPLE = ROOT / "examples" / "vector_add"
-HOST_TOOLS = shutil.which("g++") is not None and shutil.which("make") is not None
+HOST_TOOLS = HAVE_BUILD
 
 
 def _resolves(dotted: str) -> bool:
@@ -170,7 +172,7 @@ class ComponentContractTests(unittest.TestCase):
         self.assertNotIn("blocked", ADVANCING_STATUSES)
 
 
-@unittest.skipUnless(HOST_TOOLS, "host equivalence needs g++ and make")
+@unittest.skipUnless(HOST_TOOLS, "host equivalence needs a C++ compiler")
 class ComponentPipelineTests(unittest.TestCase):
     def test_run_stages_converts_the_vector_add_example(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

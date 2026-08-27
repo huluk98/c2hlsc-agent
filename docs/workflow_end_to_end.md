@@ -683,8 +683,14 @@ killed with `taskkill /T` (there are no POSIX process groups, so without it a hu
 or simulator leaves orphaned children holding output files open), and `doctor` uses
 `winget`, with every package id verified by `winget show` before it is offered.
 
-Verified by running a full conversion with `make`, `bash` and `sh` all absent from `PATH`:
-both host rungs pass and the run exits 0.
+Verified two ways: a full conversion here with `make`, `bash` and `sh` all absent from
+`PATH` (both host rungs pass, exit 0), and a CI step on `windows-latest` that converts
+`examples/vector_add` and asserts the report status. The test suite runs the same way —
+guards ask for a *compiler*, not for `make`, so 278 of 284 tests execute on a machine
+without it rather than skipping.
+
+For a fresh Windows clone: `powershell -ExecutionPolicy Bypass -File scripts\setup_windows.ps1`
+installs the package, checks the tools, and runs the suite.
 
 ### When a tool is missing
 
