@@ -162,7 +162,7 @@ def _parse_arg(raw: str, metadata: ArgumentConfig | None = None) -> FunctionArg:
     is_const = "const" in c_type.split()
     if metadata is None:
         metadata = ArgumentConfig()
-    direction = metadata.direction or ("input" if is_const or pointer_depth == 0 and not array_dims else "inout")
+    direction = metadata.direction or ("input" if is_const or (pointer_depth == 0 and not array_dims) else "inout")
     length = metadata.length
     if length is None:
         for dim in array_dims:

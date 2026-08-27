@@ -666,7 +666,7 @@ def _read_evidence(paths: list[str], inline: str) -> str:
 
 
 def _external_failure_state(stage: str, evidence: str, run_vitis: bool):
-    from .equivalence import PhaseResult, VerificationState
+    from .equivalence import PhaseResult
 
     state = VerificationState()
     phases = ["software_equivalence", "trace_consistency"]
