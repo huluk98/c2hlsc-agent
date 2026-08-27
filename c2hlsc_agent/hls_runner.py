@@ -198,10 +198,12 @@ def _gate_cosim_on_log(result: PhaseResult) -> PhaseResult:
         except OSError:
             pass
     verdict = evaluate_cosim_verdict(result.status, haystack)
-    if verdict.status == "fail":
+    # 'blocked' travels the same route as 'fail': neither is a pass, but blocked says the
+    # tool never judged the design rather than that the design was wrong.
+    if verdict.status in {"fail", "blocked"}:
         return PhaseResult(
             result.name,
-            "fail",
+            verdict.status,
             result.returncode,
             result.stdout,
             result.stderr,
