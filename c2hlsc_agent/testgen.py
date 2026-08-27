@@ -74,11 +74,33 @@ def _init_array(arg: FunctionArg, config: AgentConfig) -> str:
     }}"""
 
 
+def multi_dim_cast(arg: FunctionArg) -> str:
+    """The pointer-to-array type a multi-dimensional parameter decays to, or ``""``.
+
+    The testbench keeps one flat buffer per array argument, which is the right shape for
+    the stimulus and comparison loops and is layout-identical to the declared array. But
+    a parameter written `int a[N][60]` is `int (*)[60]`, not `int *`, so passing the flat
+    buffer straight through is a type error. The cast reinterprets the same bytes with
+    the shape the callee declares.
+    """
+
+    if len(arg.array_dims) < 2:
+        return ""
+    trailing = arg.array_dims[1:]
+    if not all(dim.strip() for dim in trailing):
+        return ""
+    suffix = "".join(f"[{dim.strip()}]" for dim in trailing)
+    base = arg.c_type.replace("const", "").strip()
+    return f"{base} (*){suffix}"
+
+
 def _call_args(prefix: str, args: list[FunctionArg]) -> str:
     values: list[str] = []
     for arg in args:
         if arg.is_pointer_like:
-            values.append(f"{prefix}_{arg.name}")
+            name = f"{prefix}_{arg.name}"
+            cast = multi_dim_cast(arg)
+            values.append(f"reinterpret_cast<{cast}>({name})" if cast else name)
         else:
             values.append(arg.name)
     return ", ".join(values)

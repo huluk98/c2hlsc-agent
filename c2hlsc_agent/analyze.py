@@ -283,11 +283,18 @@ def _parse_arg(
         # A bound is rarely a bare literal in real HLS code: `float a[NUM_FEATURE]` and
         # `float b[ROWS*COLS]` are the norm. Resolving them keeps the testbench buffers
         # the size the design actually indexes, instead of silently falling back to 16.
-        for dim in array_dims:
-            value = eval_const_expr(dim, constants or {})
-            if value is not None and value > 0:
-                length = value
-                break
+        resolved = [eval_const_expr(dim, constants or {}) for dim in array_dims]
+        usable = [v for v in resolved if v is not None and v > 0]
+        if usable and len(usable) == len(array_dims):
+            # Every dimension of a multi-dimensional parameter counts: `int a[N][60]`
+            # holds N*60 elements, and sizing the buffer from the first dimension alone
+            # would under-allocate it by a factor of 60.
+            total = 1
+            for value in usable:
+                total *= value
+            length = total
+        elif usable:
+            length = usable[0]
     return FunctionArg(
         raw=raw,
         name=name,

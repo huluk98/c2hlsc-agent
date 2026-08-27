@@ -5,6 +5,7 @@ from dataclasses import dataclass
 
 from .analyze import AnalysisResult, FunctionArg, active_length_arg
 from .config import AgentConfig
+from .testgen import multi_dim_cast
 from .stimulus import (
     directed_index_decl,
     directed_schedule,
@@ -122,7 +123,11 @@ def _init_array(arg: FunctionArg, config: AgentConfig) -> str:
 
 
 def _call_args(args: list[FunctionArg]) -> str:
-    return ", ".join(arg.name for arg in args)
+    values = []
+    for arg in args:
+        cast = multi_dim_cast(arg)
+        values.append(f"reinterpret_cast<{cast}>({arg.name})" if cast else arg.name)
+    return ", ".join(values)
 
 
 def _columns(function_args: list[FunctionArg], return_type: str) -> list[dict[str, object]]:

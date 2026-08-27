@@ -4,6 +4,7 @@ import json
 import re
 from dataclasses import dataclass
 
+from .testgen import multi_dim_cast
 from .analyze import AnalysisResult, FunctionArg, active_length_arg, looks_like_length_name
 from .config import AgentConfig
 
@@ -395,7 +396,12 @@ def _vectors_tb(analysis: AnalysisResult, config: AgentConfig, spec: dict[str, o
 
     call_args = []
     for arg in fn.args:
-        call_args.append(f"ref_{arg.name}" if arg.is_pointer_like else arg.name)
+        if arg.is_pointer_like:
+            cast = multi_dim_cast(arg)
+            name = f"ref_{arg.name}"
+            call_args.append(f"reinterpret_cast<{cast}>({name})" if cast else name)
+        else:
+            call_args.append(arg.name)
     return_prefix = f"{fn.return_type} ref_ret = " if fn.return_type != "void" else ""
 
     for arg in arrays:
