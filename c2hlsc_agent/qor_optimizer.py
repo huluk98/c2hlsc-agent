@@ -211,13 +211,21 @@ def _synth_metrics(project_dir: Path, remote: RemoteVitis | None) -> tuple[QoRMe
 def _report_is_fresh(project_dir: Path, xml: Path) -> bool:
     """A csynth report is only trusted when it is at least as new as the sources it
     claims to describe. Stale reports arise from ``repair`` (rewrites src without
-    re-running Vitis) and from this optimizer's own rollback path."""
+    re-running Vitis) and from this optimizer's own rollback path.
+
+    The header counts: ``_repair_missing_standard_includes`` writes ``hls_top.hpp`` and
+    nothing else, so omitting it let a header-only repair leave a stale report looking
+    fresh, and the optimizer would then baseline against the previous design."""
 
     try:
         report_mtime = xml.stat().st_mtime
         newest_input = max(
             p.stat().st_mtime
-            for p in (project_dir / "src" / "hls_top.cpp", project_dir / "tb" / "testbench.cpp")
+            for p in (
+                project_dir / "src" / "hls_top.cpp",
+                project_dir / "src" / "hls_top.hpp",
+                project_dir / "tb" / "testbench.cpp",
+            )
             if p.exists()
         )
     except (OSError, ValueError):

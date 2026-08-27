@@ -11,6 +11,7 @@ from .equivalence import VerificationState
 from .hlsc_repair_agent import REPAIR_AUDIT_FILENAME, RepairOutcome
 from .hls_project import ProjectFiles
 from .leveri_testgen import LEVERI_TESTBENCH_POLICY_ID
+from .testgen import active_length_map
 
 
 def _table(headers: list[str], rows: list[list[str]]) -> str:
@@ -46,6 +47,15 @@ def write_reports(
     arg_rows = [[arg.name, arg.c_type, arg.direction, str(arg.length or ""), arg.interface or config.interface_mode] for arg in fn.args]
     type_rows = [[row["name"], row["original"], row["generated"]] for row in analysis.type_mappings]
     pragma_rows = [[row["argument"], row["pragma"], row["reason"]] for row in generated.interface_pragmas]
+    clamped = active_length_map(analysis)
+    clamp_rows = [
+        [
+            name,
+            f"first `{scalar}` elements only",
+            f"`{scalar}` was inferred to be the active length; elements beyond it are NOT compared",
+        ]
+        for name, scalar in sorted(clamped.items())
+    ]
     unsupported_rows = [[d.severity, d.code, d.message, d.suggestion or ""] for d in analysis.unsupported_constructs]
     generated_files = [str(path.relative_to(project.root)) for path in project.generated_files]
     agent_decision = classify_failure(state, config.run_vitis, analysis.diagnostics.has_errors)
@@ -120,6 +130,10 @@ def write_reports(
 ## Interface Pragmas
 
 {_table(["Argument", "Pragma", "Reason"], pragma_rows)}
+## Output Comparison Scope
+
+{"_Every element of every array argument is compared._" if not clamp_rows else _table(["Argument", "Compared range", "Why"], clamp_rows)}
+{"" if not clamp_rows else "A clamped range narrows what equivalence checks. If one of these scalars is not really the array's active length, differences past it will not be reported. Set `arguments.<name>.length` or remove the scalar's `range` to compare in full." + chr(10)}
 ## Transformations
 
 {chr(10).join(f"- {item}" for item in generated.transformations)}
@@ -167,6 +181,7 @@ def write_reports(
         'run_control': run_control,
         "status": status,
         "top": fn.name,
+        "output_comparison_clamped": clamped,
         "generator_prompt_id": generated.generator_prompt_id,
         "testbench_policy_id": LEVERI_TESTBENCH_POLICY_ID,
         "software_equivalence": state.status_for("software_equivalence"),

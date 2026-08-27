@@ -5,6 +5,7 @@ import json
 import sys
 from pathlib import Path
 
+from .agent_loop import classify_failure
 from .analyze import analyze_source
 from .candidates import select_best_candidate
 from .config import AgentConfig, load_config, merge_cli_config
@@ -279,6 +280,22 @@ def _permit_optional_llm_fallback(
     raise SystemExit(f'{stage} stopped: {exc}') from exc
 
 
+def _blocked_reason(state, config: AgentConfig, analysis) -> str | None:
+    """The classifier's reason when the run is stuck on the ENVIRONMENT rather than on a
+    defect in the design -- a missing toolchain, an unreachable remote host.
+
+    Such a run must close as ``blocked`` and be handed to a human: closing it ``failed``
+    with "no safe repair changed the failing project" points the reader at the design,
+    which is exactly the wrong place to look, and leaves anything reading the ledger
+    unable to tell a missing tool from a wrong answer.
+    """
+
+    decision = classify_failure(state, config.run_vitis, analysis.diagnostics.has_errors)
+    if decision.status != 'blocked':
+        return None
+    return f'{decision.family}: {decision.next_action}'
+
+
 def run_convert(args: argparse.Namespace) -> int:
     config = merge_cli_config(load_config(Path(args.config).resolve() if args.config else None), args)
     nl_only = bool(config.nl_spec) and not config.input_files
@@ -481,10 +498,11 @@ def run_convert(args: argparse.Namespace) -> int:
                 'the same source and failure recurred; stopping oscillation',
             )
             break
+        blocked = _blocked_reason(state, config, analysis)
         if not config.auto_repair:
             controller.finish(
-                RunStatus.FAILED,
-                'verification failed and automatic repair is disabled',
+                RunStatus.BLOCKED if blocked else RunStatus.FAILED,
+                blocked or 'verification failed and automatic repair is disabled',
             )
             if args.verbose:
                 print(
@@ -526,9 +544,10 @@ def run_convert(args: argparse.Namespace) -> int:
         if args.verbose:
             print(f"Repair iteration {completed_iterations}: {repair.summary}")
         if not repair.changed:
+            blocked = _blocked_reason(state, config, analysis)
             controller.finish(
-                RunStatus.FAILED,
-                'no safe repair changed the failing project',
+                RunStatus.BLOCKED if blocked else RunStatus.FAILED,
+                blocked or 'no safe repair changed the failing project',
             )
             break
         signature = _project_signature(out_dir)

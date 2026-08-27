@@ -188,7 +188,6 @@ def run_vitis(
             return phases
 
         phases["cosim"] = _run_vitis_phase(project_dir, "cosim", remote, hls_bin=hls_bin)
-        phases["cosim"] = _gate_cosim_on_log(phases["cosim"])
         return phases
     finally:
         if remote is not None:
@@ -196,9 +195,36 @@ def run_vitis(
                 remote.pull(project_dir)
             except (subprocess.TimeoutExpired, OSError):
                 pass  # best-effort artifact pull; phase logs are already local
+        # Gate AFTER the pull so Vitis's own simulation report is on local disk and can
+        # be read too -- the console transcript is no longer the only witness. Mutating
+        # `phases` here is deliberate: `return phases` hands back this same dict, and a
+        # non-pass status is returned unchanged, so the early-return paths are unaffected.
+        phases["cosim"] = _gate_cosim_on_log(phases["cosim"], project_dir)
 
 
-def _gate_cosim_on_log(result: PhaseResult) -> PhaseResult:
+def _cosim_report_text(project_dir: Path | None) -> str:
+    """Vitis's own simulation reports, once the remote pull has brought them local.
+
+    The console transcript can be truncated or, on a transport hiccup, lost entirely,
+    so the written report is a second independent witness for the same verdict.
+    """
+
+    if project_dir is None:
+        return ""
+    root = project_dir / "c2hlsc_project"
+    if not root.is_dir():
+        return ""
+    parts: list[str] = []
+    for path in sorted(root.glob("*/sim/report/*")):
+        if path.is_file() and path.suffix in ("", ".log", ".rpt", ".txt"):
+            try:
+                parts.append(path.read_text(encoding="utf-8", errors="replace"))
+            except OSError:
+                continue
+    return "\n".join(parts)
+
+
+def _gate_cosim_on_log(result: PhaseResult, project_dir: Path | None = None) -> PhaseResult:
     """Vitis can exit 0 while the CoSim log reports a mismatch. Downgrade pass->fail when
     the log carries an explicit co-simulation failure marker, so a zero exit code cannot
     silently defeat the C/RTL equivalence gate. Works for the remote path too: the local
@@ -211,6 +237,7 @@ def _gate_cosim_on_log(result: PhaseResult) -> PhaseResult:
             haystack += "\n" + result.log_path.read_text(encoding="utf-8", errors="replace").lower()
         except OSError:
             pass
+    haystack += "\n" + _cosim_report_text(project_dir).lower()
     verdict = evaluate_cosim_verdict(result.status, haystack)
     if verdict.status == "fail":
         return PhaseResult(

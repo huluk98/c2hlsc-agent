@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 
 from .analyze import AnalysisResult, FunctionArg
@@ -12,6 +13,44 @@ from .llm import (
     extract_hls_source,
     extract_reference_c,
 )
+
+
+_INTERFACE_PRAGMA_RE = re.compile(r"^[ \t]*#pragma[ \t]+HLS[ \t]+INTERFACE\b[^\n]*", re.I | re.M)
+_PRAGMA_PORT_RE = re.compile(r"\bport\s*=\s*(\w+)", re.I)
+_PRAGMA_MODE_RE = re.compile(
+    r"\b(s_axilite|m_axi|ap_memory|ap_fifo|ap_none|ap_vld|ap_ovld|ap_ack|ap_hs|axis|bram)\b", re.I
+)
+
+
+def interface_pragmas_in(
+    source: str,
+    configured_mode: str = "default",
+    array_args: frozenset[str] | set[str] | tuple[str, ...] = (),
+) -> list[dict[str, str]]:
+    """Read the INTERFACE pragmas actually present in a generated translation unit.
+
+    The deterministic generator knows what it emitted, but a model-written unit is
+    opaque: without this the report's pragma ledger said "_None_" while the source was
+    full of pragmas, and a silently different hardware contract left no trace anywhere in
+    the run. Neither host equivalence nor CSim can observe a port protocol, so the report
+    is the only place a mismatch can surface.
+    """
+
+    rows: list[dict[str, str]] = []
+    for line in _INTERFACE_PRAGMA_RE.findall(source):
+        text = " ".join(line.split())
+        port = _PRAGMA_PORT_RE.search(text)
+        mode = _PRAGMA_MODE_RE.search(text)
+        chosen = mode.group(1).lower() if mode else None
+        name = port.group(1) if port else "-"
+        reason = "declared in the generated source"
+        # Only an ARRAY port carries interface_mode. s_axilite on a scalar or on the
+        # return is the control interface and is what the deterministic generator emits
+        # under every mode, so flagging it would make the mismatch signal worthless.
+        if chosen and name in array_args and configured_mode not in ("default", chosen):
+            reason += f"; DIFFERS from the configured interface_mode={configured_mode!r}"
+        rows.append({"argument": name, "pragma": text, "reason": reason})
+    return rows
 
 
 @dataclass
@@ -130,7 +169,11 @@ def _llm_candidate(
             "Verifier-gated: output is checked by host equivalence and Vitis CSim/CSynth/CoSim; "
             "failures trigger repair or fall back to the conservative copy.",
         ],
-        interface_pragmas=[],
+        interface_pragmas=interface_pragmas_in(
+            source,
+            getattr(config, "interface_mode", "default"),
+            array_args={arg.name for arg in analysis.function.args if arg.is_pointer_like},
+        ),
     )
 
 

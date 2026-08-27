@@ -410,6 +410,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 
@@ -456,7 +457,7 @@ def main() -> int:
         [cxx, *flags, *extra, "tb/leveri_hls_tb.cpp", "src/hls_top.cpp", "-o", "coverage/leveri_hls_tb"],
         ["coverage/leveri_golden_tb"],
         ["coverage/leveri_hls_tb"],
-        ["python3", "tb/leveri_compare.py", "leveri_golden_trace.csv", "leveri_hls_trace.csv"],
+        [sys.executable, "tb/leveri_compare.py", "leveri_golden_trace.csv", "leveri_hls_trace.csv"],
     ]
     command_logs: list[dict[str, object]] = []
     try:
@@ -516,6 +517,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 

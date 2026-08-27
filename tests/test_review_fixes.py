@@ -129,3 +129,147 @@ class WindowsLauncherTests(unittest.TestCase):
         self.assertEqual(result.status, "fail")
         self.assertIn("vitis_hls not found", result.summary)
         self.assertEqual(classify_log_family("csim", result.summary), "toolchain_unavailable")
+
+
+class VisibilityAndPortabilityTests(unittest.TestCase):
+    """The batch that makes silent behaviour visible, plus the generated-project
+    portability fix. None of these change what passes or fails a verification."""
+
+    def _analysis(self, source: str, top: str, arguments: dict | None = None):
+        from c2hlsc_agent.analyze import analyze_source
+        from c2hlsc_agent.config import AgentConfig, ArgumentConfig
+
+        cfg = AgentConfig(top=top, arguments=arguments or {})
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "in.c"
+            src.write_text(source, encoding="utf-8")
+            return analyze_source(src, top, cfg)
+
+    def test_clamped_output_comparison_is_reported(self):
+        # A scalar named like a length, with a declared range, silently narrows the
+        # comparison. The report has to say so -- it is inferred from a NAME.
+        from c2hlsc_agent.config import ArgumentConfig
+        from c2hlsc_agent.testgen import active_length_map
+
+        analysis = self._analysis(
+            "void thresh(const int *in, int *out, int n) {\n"
+            "  for (int i = 0; i < 16; i++) out[i] = (in[i] > n) ? 1 : 0;\n}\n",
+            "thresh",
+            {
+                "in": ArgumentConfig(direction="input", length=16),
+                "out": ArgumentConfig(direction="output", length=16),
+                "n": ArgumentConfig(range=(0, 16)),
+            },
+        )
+        self.assertEqual(active_length_map(analysis), {"in": "n", "out": "n"})
+
+    def test_unclamped_design_reports_nothing(self):
+        from c2hlsc_agent.config import ArgumentConfig
+        from c2hlsc_agent.testgen import active_length_map
+
+        analysis = self._analysis(
+            "void dbl(const int in[8], int out[8]) {\n"
+            "  for (int i = 0; i < 8; i++) out[i] = in[i] * 2;\n}\n",
+            "dbl",
+            {"in": ArgumentConfig(direction="input"), "out": ArgumentConfig(direction="output")},
+        )
+        self.assertEqual(active_length_map(analysis), {})
+
+    def test_interface_pragma_ledger_reads_the_generated_source(self):
+        # Previously the ledger was always empty for a model-written unit, so a changed
+        # hardware contract left no trace in any artifact of the run.
+        from c2hlsc_agent.convert import interface_pragmas_in
+
+        source = (
+            '#include "hls_top.hpp"\n'
+            "void f(const int *a, int *out, int n) {\n"
+            "#pragma HLS INTERFACE mode=m_axi port=a offset=slave bundle=gmem\n"
+            "#pragma HLS INTERFACE mode=m_axi port=out offset=slave bundle=gmem\n"
+            "#pragma HLS INTERFACE mode=s_axilite port=n\n"
+            "#pragma HLS INTERFACE mode=s_axilite port=return\n"
+            "}\n"
+        )
+        rows = interface_pragmas_in(source, "ap_memory", array_args={"a", "out"})
+        self.assertEqual([r["argument"] for r in rows], ["a", "out", "n", "return"])
+        # Array ports genuinely changed mode: flag them.
+        self.assertIn("DIFFERS", rows[0]["reason"])
+        self.assertIn("DIFFERS", rows[1]["reason"])
+        # s_axilite on a scalar and on the return is the control interface under every
+        # mode, including ap_memory. Flagging it would make the signal worthless.
+        self.assertNotIn("DIFFERS", rows[2]["reason"])
+        self.assertNotIn("DIFFERS", rows[3]["reason"])
+
+    def test_blocked_classification_closes_the_run_blocked(self):
+        from c2hlsc_agent.cli import _blocked_reason
+        from c2hlsc_agent.config import AgentConfig
+        from c2hlsc_agent.equivalence import PhaseResult, VerificationState
+
+        analysis = self._analysis("int f(int a) { return a; }\n", "f")
+        config = AgentConfig(top="f", run_vitis=True)
+
+        state = VerificationState()
+        state.add_phase(PhaseResult("software_equivalence", "pass"))
+        state.add_phase(PhaseResult("csim", "fail", summary="vitis_hls not found on PATH"))
+        reason = _blocked_reason(state, config, analysis)
+        self.assertIsNotNone(reason)
+        self.assertIn("toolchain_unavailable", reason)
+
+        # A genuine behavioural failure must still close the run FAILED, not blocked.
+        state2 = VerificationState()
+        state2.add_phase(PhaseResult("software_equivalence", "fail", stdout="Mismatch test=0 ..."))
+        self.assertIsNone(_blocked_reason(state2, config, analysis))
+
+    def test_cosim_gate_also_reads_the_pulled_sim_report(self):
+        # The gate used to run BEFORE the remote artifact pull, so the console transcript
+        # was its only witness. Vitis's own report is a second, independent one.
+        from c2hlsc_agent.equivalence import PhaseResult
+        from c2hlsc_agent.hls_runner import _gate_cosim_on_log
+
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            report = project / "c2hlsc_project" / "solution1" / "sim" / "report"
+            report.mkdir(parents=True)
+            (report / "cosim.log").write_text(
+                "*** C/RTL co-simulation finished: FAIL ***\n", encoding="utf-8"
+            )
+            clean_pass = PhaseResult("cosim", "pass", 0, stdout="all good", stderr="")
+            gated = _gate_cosim_on_log(clean_pass, project)
+        self.assertEqual(gated.status, "fail")
+        self.assertIn("co-simulation failure", gated.summary)
+
+    def test_header_only_change_invalidates_the_synthesis_report(self):
+        # _repair_missing_standard_includes writes hls_top.hpp and nothing else.
+        import os
+        import time
+        from c2hlsc_agent.qor_optimizer import _report_is_fresh
+
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            (project / "src").mkdir()
+            (project / "tb").mkdir()
+            (project / "src" / "hls_top.cpp").write_text("x", encoding="utf-8")
+            (project / "tb" / "testbench.cpp").write_text("x", encoding="utf-8")
+            (project / "src" / "hls_top.hpp").write_text("x", encoding="utf-8")
+            xml = project / "csynth.xml"
+            xml.write_text("<x/>", encoding="utf-8")
+            self.assertTrue(_report_is_fresh(project, xml))
+            # touch only the header, into the future so the filesystem clock cannot tie
+            future = time.time() + 60
+            os.utime(project / "src" / "hls_top.hpp", (future, future))
+            self.assertFalse(_report_is_fresh(project, xml))
+
+    def test_generated_scripts_use_the_running_interpreter(self):
+        # "python3" is not a command on Windows; sys.executable always is.
+        from c2hlsc_agent.leveri_testgen import generate_leveri_testbenches
+        from c2hlsc_agent.verilog_testgen import generate_verilog_testbenches
+        from c2hlsc_agent.config import AgentConfig
+
+        analysis = self._analysis("int f(int a) { return a; }\n", "f")
+        config = AgentConfig(top="f")
+        gcov = generate_leveri_testbenches(analysis, config).gcov_script
+        rtl = generate_verilog_testbenches(analysis, config).run_script
+        for name, script in (("run_gcov.py", gcov), ("run_rtl_sim.py", rtl)):
+            with self.subTest(script=name):
+                self.assertNotIn('"python3"', script)
+                self.assertIn("sys.executable", script)
+                self.assertIn("import sys", script)

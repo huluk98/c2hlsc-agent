@@ -131,6 +131,26 @@ def _contract_comment(fn_args: list[FunctionArg], return_type: str, arrays: list
     return "\n".join(lines)
 
 
+def active_length_map(analysis: AnalysisResult) -> dict[str, str]:
+    """Arrays whose output comparison is CLAMPED, mapped to the scalar doing the clamping.
+
+    Surfaced because the clamp narrows what equivalence actually checks: elements beyond
+    the active length are never compared, so a design that differs only there still
+    passes. That is inferred from an argument's NAME plus a declared range, so a reader
+    has to be told it happened rather than left to deduce it.
+    """
+
+    scalars = [arg for arg in analysis.function.args if not arg.is_pointer_like]
+    clamped: dict[str, str] = {}
+    for arg in analysis.function.args:
+        if not arg.is_pointer_like:
+            continue
+        scalar = _active_length_arg(arg, scalars)
+        if scalar is not None:
+            clamped[arg.name] = scalar.name
+    return clamped
+
+
 def generate_testbench(analysis: AnalysisResult, config: AgentConfig) -> str:
     fn = analysis.function
     arrays = [arg for arg in fn.args if arg.is_pointer_like]
