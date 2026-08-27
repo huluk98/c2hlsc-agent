@@ -1,0 +1,7 @@
+# CHStone dfadd: IEEE-754 double add on raw 64-bit patterns.
+# Inputs are IEEE-754 bit patterns; full-range random stimulus is the intended
+# domain, with the directed patterns covering corner encodings first.
+top: dfadd_top
+input: input.c
+num_tests: 200
+seed: 1

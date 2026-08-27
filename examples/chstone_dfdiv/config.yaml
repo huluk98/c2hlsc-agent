@@ -1,0 +1,7 @@
+# CHStone dfdiv: IEEE-754 double divide on raw 64-bit patterns.
+# Inputs are IEEE-754 bit patterns; full-range random stimulus is the intended
+# domain, with the directed patterns covering corner encodings first.
+top: dfdiv_top
+input: input.c
+num_tests: 200
+seed: 1
