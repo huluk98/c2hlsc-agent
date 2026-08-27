@@ -5,7 +5,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from c2hlsc_agent.analyze import analyze_source, unsupported_in_generated
+from c2hlsc_agent.analyze import _parse_arg, analyze_source, unsupported_in_generated
 from c2hlsc_agent.config import AgentConfig, ArgumentConfig
 
 
@@ -293,6 +293,93 @@ class AnalyzeTests(unittest.TestCase):
         result = analyze_source(path, "k", cfg)
         ranges = {arg.name: arg.scalar_range for arg in result.function.args}
         self.assertEqual(ranges["n"], (0, 8))
+
+    def test_write_through_dereferenced_array_pointer_is_seen(self):
+        # Regression: AES writes its state as `(*state)[i][j] ^= ...`. The write
+        # pattern matched neither the parenthesised deref nor the subscripts after
+        # it, so `state` was called an input, nothing was comparable, and the design
+        # was refused as unevaluable rather than verified.
+        path = self._write(
+            """
+            void AddRoundKey(unsigned char round, unsigned char (*state)[4][4], const unsigned char *rk) {
+              for (int i = 0; i < 4; ++i)
+                for (int j = 0; j < 4; ++j)
+                  (*state)[i][j] ^= rk[i * 4 + j];
+            }
+            """
+        )
+        cfg = AgentConfig(top="AddRoundKey", arguments={"rk": ArgumentConfig(length=16)})
+        result = analyze_source(path, "AddRoundKey", cfg)
+        directions = {arg.name: arg.direction for arg in result.function.args}
+        self.assertIn(directions["state"], {"output", "inout"})
+        codes = {d.code for d in result.diagnostics.items if d.severity == "error"}
+        self.assertNotIn("no-observable-output", codes)
+
+    def test_write_through_struct_arrow_is_seen(self):
+        path = self._write(
+            """
+            struct Acc { int total; };
+            void k(struct Acc *out, const int *in, int n) {
+              out->total = 0;
+              for (int i = 0; i < n; ++i) out->total += in[i];
+            }
+            """
+        )
+        cfg = AgentConfig(top="k", arguments={"in": ArgumentConfig(length=8), "out": ArgumentConfig(length=1)})
+        result = analyze_source(path, "k", cfg)
+        directions = {arg.name: arg.direction for arg in result.function.args}
+        self.assertIn(directions["out"], {"output", "inout"})
+
+    def test_write_through_multi_dimensional_subscript_is_seen(self):
+        path = self._write(
+            """
+            void k(int out[4][4], const int *in) {
+              for (int i = 0; i < 4; ++i)
+                for (int j = 0; j < 4; ++j) out[i][j] = in[0];
+            }
+            """
+        )
+        cfg = AgentConfig(top="k", arguments={"in": ArgumentConfig(length=4)})
+        result = analyze_source(path, "k", cfg)
+        directions = {arg.name: arg.direction for arg in result.function.args}
+        self.assertIn(directions["out"], {"output", "inout"})
+
+    def test_pointer_to_array_parameter_name_and_type(self):
+        # Regression: the parentheses in `T (*p)[4][4]` bind the star to the name, so
+        # a naive split left the closing paren stuck to it -- the argument was called
+        # 'state)' and that name flowed into the config, the report and the testbench.
+        arg = _parse_arg("unsigned char (*state)[4][4]")
+        self.assertEqual(arg.name, "state")
+        self.assertEqual(arg.c_type, "unsigned char")
+        self.assertEqual(arg.pointer_depth, 1)
+
+    def test_multi_dimensional_bound_uses_the_product(self):
+        # The testbench models every array argument as one flat buffer, so taking
+        # only the first dimension under-allocates and the test indexes past its own
+        # array.
+        self.assertEqual(_parse_arg("int out[4][4]").length, 16)
+        self.assertEqual(_parse_arg("double a[40][40]").length, 1600)
+        self.assertEqual(_parse_arg("unsigned char (*s)[4][4]").length, 16)
+        self.assertEqual(_parse_arg("int a[16]").length, 16)
+
+    def test_read_only_pointer_survives_the_wider_write_patterns(self):
+        path = self._write(
+            """
+            int k(const int *in, int *out, int n) {
+              int acc = 0;
+              for (int i = 0; i < n; ++i) acc += in[i];
+              out[0] = acc;
+              return acc;
+            }
+            """
+        )
+        cfg = AgentConfig(
+            top="k", arguments={"in": ArgumentConfig(length=8), "out": ArgumentConfig(length=1)}
+        )
+        result = analyze_source(path, "k", cfg)
+        directions = {arg.name: arg.direction for arg in result.function.args}
+        self.assertEqual(directions["in"], "input")
+        self.assertIn(directions["out"], {"output", "inout"})
 
     def test_pointer_arithmetic_and_stdlib_are_reported(self):
         path = self._write(

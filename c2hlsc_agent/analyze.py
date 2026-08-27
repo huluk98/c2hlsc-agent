@@ -144,6 +144,11 @@ def _constant_dim(dim: str) -> int | None:
     return value if value is not None and value > 0 else None
 
 
+# `T (*p)[4][4]` -- a pointer to an array, as AES spells its state. The parentheses
+# bind the star to the name, so a naive split leaves the closing paren stuck to it.
+_POINTER_TO_ARRAY = re.compile(r"\(\s*(?P<stars>\*+)\s*(?P<name>[A-Za-z_]\w*)\s*\)")
+
+
 def _parse_arg(raw: str, metadata: ArgumentConfig | None = None) -> FunctionArg:
     raw = raw.strip()
     # `restrict` is a C99 keyword that is not valid C++. Drop it from the parameter text
@@ -152,6 +157,14 @@ def _parse_arg(raw: str, metadata: ArgumentConfig | None = None) -> FunctionArg:
     raw = re.sub(r"\s+", " ", raw).strip()
     array_dims = re.findall(r"\[([^\]]*)\]", raw)
     raw_no_arrays = re.sub(r"\[[^\]]*\]", "", raw).strip()
+
+    declarator = _POINTER_TO_ARRAY.search(raw_no_arrays)
+    if declarator:
+        pointer_depth = len(declarator.group("stars"))
+        name = declarator.group("name")
+        c_type = raw_no_arrays[: declarator.start()].strip()
+        return _finish_arg(raw, name, c_type, pointer_depth, array_dims, metadata)
+
     pointer_depth = raw_no_arrays.count("*")
     tokens = raw_no_arrays.replace("*", " * ").split()
     if not tokens:
@@ -159,18 +172,38 @@ def _parse_arg(raw: str, metadata: ArgumentConfig | None = None) -> FunctionArg:
     name = tokens[-1]
     type_tokens = [t for t in tokens[:-1] if t not in {"*", "restrict", "__restrict", "__restrict__"}]
     c_type = " ".join(type_tokens).strip()
-    c_type = re.sub(r"\s+", " ", c_type)
+    return _finish_arg(raw, name, c_type, pointer_depth, array_dims, metadata)
+
+
+def _finish_arg(
+    raw: str,
+    name: str,
+    c_type: str,
+    pointer_depth: int,
+    array_dims: list[str],
+    metadata: ArgumentConfig | None,
+) -> FunctionArg:
+    c_type = re.sub(r"\s+", " ", c_type).strip()
     is_const = "const" in c_type.split()
     if metadata is None:
         metadata = ArgumentConfig()
     direction = metadata.direction or ("input" if is_const or pointer_depth == 0 and not array_dims else "inout")
     length = metadata.length
     if length is None:
-        for dim in array_dims:
-            folded = _constant_dim(dim)
-            if folded is not None:
-                length = folded
-                break
+        # The testbench models every array argument as one flat buffer, so a
+        # multi-dimensional bound contributes its product. Taking only the first
+        # dimension under-allocates and the generated test indexes past its own array.
+        folded = [_constant_dim(dim) for dim in array_dims]
+        if folded and all(value is not None for value in folded):
+            product = 1
+            for value in folded:
+                product *= value
+            length = product
+        else:
+            for value in folded:
+                if value is not None:
+                    length = value
+                    break
     return FunctionArg(
         raw=raw,
         name=name,
@@ -206,6 +239,9 @@ def _extract_function(source: str, top: str, source_path: Path, config: AgentCon
 
 def _guess_arg_name(raw: str) -> str:
     raw_no_arrays = re.sub(r"\[[^\]]*\]", "", raw).strip()
+    declarator = _POINTER_TO_ARRAY.search(raw_no_arrays)
+    if declarator:
+        return declarator.group("name")
     return raw_no_arrays.replace("*", " * ").split()[-1]
 
 
@@ -243,10 +279,32 @@ def _infer_pointer_directions(function: FunctionInfo, config: AgentConfig) -> li
             unprovable.append(arg.name)
             continue
         name = re.escape(arg.name)
-        write_pattern = rf"(?:\*\s*{name}|{name}\s*\[[^\]]+\])\s*(?:=(?!=)|\+=|-=|\*=|/=|%=|&=|\|=|\^=|<<=|>>=|\+\+|--)"
+        # Every spelling of a write through this argument. The parenthesised and
+        # arrow forms matter for pointers to arrays and to structs: AES writes its
+        # state as `(*state)[i][j] ^= ...`, which reads as no write at all unless
+        # the deref is matched with the subscripts that follow it.
+        write_targets = "|".join(
+            (
+                rf"\*\s*{name}",                                 # *p =
+                rf"{name}(?:\s*\[[^\]]+\])+",                    # p[i] =, p[i][j] =
+                rf"\(\s*\*\s*{name}\s*\)(?:\s*\[[^\]]+\])*",  # (*p)[i][j] =, (*p) =
+                rf"{name}\s*->\s*\w+",                          # p->field =
+            )
+        )
+        write_ops = r"(?:=(?!=)|\+=|-=|\*=|/=|%=|&=|\|=|\^=|<<=|>>=|\+\+|--)"
+        write_pattern = rf"(?:{write_targets})\s*{write_ops}"
         writes = bool(re.search(write_pattern, body))
         body_without_lhs_writes = re.sub(write_pattern, "", body)
-        reads = bool(re.search(rf"(?:\*\s*{name}|{name}\s*\[[^\]]+\]|{name}\s*\+)", body_without_lhs_writes))
+        read_pattern = "|".join(
+            (
+                rf"\*\s*{name}",
+                rf"{name}\s*\[[^\]]+\]",
+                rf"\(\s*\*\s*{name}\s*\)",
+                rf"{name}\s*->\s*\w+",
+                rf"{name}\s*\+",
+            )
+        )
+        reads = bool(re.search(rf"(?:{read_pattern})", body_without_lhs_writes))
         if writes and reads:
             arg.direction = "inout"
         elif writes:

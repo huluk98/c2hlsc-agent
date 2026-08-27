@@ -73,6 +73,39 @@ decisions:
     supersedes: null
     evidence: [E003, E004]
 
+  - id: D005
+    question: >-
+      Should pointer direction inference learn the dereferenced-array and arrow
+      write forms (Q008)?
+    answer: >-
+      Yes. Implemented, together with the pointer-to-array parameter parse it
+      depends on.
+    decided_by: human
+    decided_on: 2026-08-27
+    supersedes: null
+    closes: [Q008]
+    evidence: [E009]
+    outcome: >-
+      22 designs moved from a blanket static refusal to a named compile blocker.
+      No design changed verdict: the fix was necessary but not sufficient, and it
+      exposed Q010 as the dominant remaining lever.
+
+  - id: D006
+    question: >-
+      Was Bambu, or any open-source HLS backend, ever part of this project?
+    answer: >-
+      No. Vitis is the only HLS backend this repository has ever had. Bambu
+      appears in no file and in no commit on any branch; it was never scratched
+      because it was never started.
+    decided_by: human
+    decided_on: 2026-08-27
+    supersedes: null
+    note: >-
+      Recorded so the question does not recur. `git log --all -S bambu -i` returns
+      nothing, as does a grep of the working tree. The C2HLSC framework this work
+      is measured against targets Catapult, which may be the source of the
+      recollection.
+
 evidence:
   - id: E001
     claim: >-
@@ -194,6 +227,58 @@ evidence:
       merely as output. Wall clock fell from roughly 15 minutes to 2m05s on 4 cores.
 
 
+  - id: E009
+    claim: >-
+      Teaching the write pattern the `(*p)[i][j]` and `p->field` forms, and fixing
+      the `T (*p)[N][M]` parameter parse, moved 22 designs past static refusal
+      without changing any verdict.
+    verified_by: test
+    test: tests/test_analyze.py::AnalyzeTests::test_write_through_dereferenced_array_pointer_is_seen
+    fixed_in: PLACEHOLDER
+    result: >-
+      no-observable-output fell from 26 designs to 3; the sweep stayed at 38/104.
+      The 22 now fail with `cannot convert 'double*' to 'double (*)[40]'`, which
+      names the real blocker instead of refusing to evaluate them.
+    note: >-
+      The parameter parse was a second defect underneath the first: `unsigned char
+      (*state)[4][4]` yielded the argument name `state)`, and that name flowed into
+      the config, the report and the testbench.
+
+  - id: E010
+    claim: >-
+      The deterministic repair loop changes nothing on this corpus. Enabling
+      --auto-repair gained 0 designs and lost 0.
+    verified_by: artifact
+    artifact: docs/memory/artifacts/sweep-repair-loop.json
+    measured_at: PLACEHOLDER
+    method: >-
+      `scripts/run_hls_eval_sweep.py --auto-repair`, compared per design against
+      the same sweep without it.
+    note: >-
+      Not a defect in the loop. Its four mechanical repairs address missing
+      includes, `restrict` in C++, missing original-source support and invalid
+      interface pragmas -- none of which is why these designs fail. Real repair
+      capability sits behind `_llm_repair`, which is gated on --use-llm and was
+      not exercised at corpus scale.
+
+  - id: E011
+    claim: >-
+      Only 5 of 66 remaining failures (8%) are attributable to generation quality.
+      40 are testbench-harness limits and 20 are properties of the input.
+    verified_by: artifact
+    artifact: docs/memory/artifacts/sweep-q008.json
+    measured_at: PLACEHOLDER
+    breakdown: >-
+      29 flat testbench versus an N-D parameter; 10 rejected before generation ever
+      runs; 8 stimulus cannot build the parameter type; 7 references already written
+      in ap_int/ap_fixed; 5 golden-vs-HLS disagreement; 3 testbench segfault; 3 C++
+      templates in the reference; 1 unclassified.
+    note: >-
+      This reframes the headline number. The sweep is not measuring how well the
+      agent writes HLS-C -- most designs never reach a point where generation
+      quality could matter. It is measuring how many designs the testbench
+      generator can model at all.
+
 frontier:
   - id: Q004
     question: >-
@@ -225,24 +310,6 @@ frontier:
       with and without retrieval over the same benchmark set. That ablation is
       the paper; the mechanism alone is a feature with no evidence.
 
-  - id: Q008
-    question: >-
-      Should pointer direction inference understand a write spelled
-      ``(*p)[i][j] = ...`` or ``p->field = ...``?
-    blocked_on: human
-    context: >-
-      26 designs in the sweep are blocked by the no-observable-output error, and
-      the AES kernels show why: AddRoundKey writes `(*state)[i][j] ^= ...`, which
-      the write pattern does not match, so `state` is classified an input, nothing
-      is comparable, and the run is refused. The refusal is correct -- vacuous
-      verification is worse than none -- but the underlying inference is what is
-      wrong, and each such design is currently unevaluable rather than merely
-      unverified.
-    recommendation: >-
-      Add the deref-index and arrow forms to the write pattern. Beyond those two,
-      stop: regex alias analysis has a ceiling and the honest next step is a real
-      parser, which is a much larger decision than this one.
-
   - id: Q009
     question: >-
       What should the agent do with a top function it cannot brace-match?
@@ -256,3 +323,21 @@ frontier:
       Catch it at the analyze boundary and emit an error-severity diagnostic
       naming the top and the offending offset, so the run fails with a report like
       every other rejection.
+
+  - id: Q010
+    question: >-
+      Should the testbench generator model multi-dimensional array parameters
+      rather than flattening every argument to a 1-D buffer?
+    blocked_on: human
+    context: >-
+      29 of the 66 remaining failures are one error: the testbench declares
+      `T ref_x[LEN]` and passes `T*` where the top function wants `T (*)[40]`.
+      A further 8 fail because the stimulus helpers cannot build a struct or a
+      typedef'd array. Together that is 37 designs behind one model choice, and it
+      is now much the largest lever -- larger than the 26-design inference gap that
+      D005 just closed.
+    recommendation: >-
+      Yes, and treat it as the next substantial piece of work rather than a fix.
+      It touches declaration, initialisation, the call site and comparison in
+      testgen, and it is the difference between an n of roughly 38 and an n of
+      roughly 70 on this corpus.

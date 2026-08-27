@@ -104,7 +104,7 @@ def _argument_block(source: str, top: str) -> str:
     return "arguments:\n" + "\n".join(lines) + "\n" if lines else ""
 
 
-def _run_one(family: str, name: str, design_dir: Path, work: Path, raw: bool, timeout: int) -> dict:
+def _run_one(family: str, name: str, design_dir: Path, work: Path, raw: bool, timeout: int, repair: bool = False) -> dict:
     row = {"fam": family, "d": name, "top": "", "stage": "", "verdict": "FAIL", "why": ""}
     sources = [f for f in glob.glob(str(design_dir / "*.cpp")) if not f.endswith("_tb.cpp")]
     headers = glob.glob(str(design_dir / "*.h"))
@@ -149,7 +149,7 @@ def _run_one(family: str, name: str, design_dir: Path, work: Path, raw: bool, ti
                 "--config", str(project / "config.yaml"),
                 "--out", str(project / "proj"),
                 "--no-llm", "--no-run-vitis", "--new-run",
-            ],
+            ] + (["--auto-repair"] if repair else []),
             capture_output=True, text=True, cwd=REPO_ROOT, timeout=timeout,
         )
     except subprocess.TimeoutExpired:
@@ -187,6 +187,11 @@ def main() -> int:
     parser.add_argument("--out", type=Path, help="write results JSON here")
     parser.add_argument("--work", type=Path, help="scratch directory (default: alongside --out)")
     parser.add_argument("--raw", action="store_true", help="skip gcc -E -P macro expansion")
+    parser.add_argument(
+        "--auto-repair",
+        action="store_true",
+        help="let the deterministic repair loop iterate on failures (off by default, matching the CLI)",
+    )
     parser.add_argument("--workers", type=int, default=min(4, os.cpu_count() or 1))
     parser.add_argument("--timeout", type=int, default=180, help="per-design seconds")
     parser.add_argument("--limit", type=int, help="stop after this many designs")
@@ -203,13 +208,14 @@ def main() -> int:
 
     designs = _discover(args.data_root)[: args.limit]
     mode = "raw source" if args.raw else "preprocessed"
-    print(f"{len(designs)} designs, {mode}, {args.workers} worker(s)\n", flush=True)
+    repair = "repair loop on" if args.auto_repair else "single shot"
+    print(f"{len(designs)} designs, {mode}, {repair}, {args.workers} worker(s)\n", flush=True)
 
     done = 0
 
     def run(entry):
         nonlocal done
-        row = _run_one(*entry, work, args.raw, args.timeout)
+        row = _run_one(*entry, work, args.raw, args.timeout, args.auto_repair)
         done += 1
         mark = "." if row["verdict"] == "PASS" else "x"
         print(mark, end="" if done % 60 else f" {done}/{len(designs)}\n", flush=True)
