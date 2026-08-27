@@ -458,8 +458,13 @@ def _support_include_block(top_name: str) -> str:
 #ifndef restrict
 #define restrict __restrict__
 #endif
+// The golden C may carry its own main() -- benchmark sources usually do. The
+// testbench defines main, so rename the original's out of the way rather than
+// colliding with it. CHStone's own flow does the same thing with -Dmain=...
+#define main c2hlsc_golden_main
 #define {top_name} {renamed}
 #include "../input.c"
+#undef main
 #undef {top_name}
 #endif
 """

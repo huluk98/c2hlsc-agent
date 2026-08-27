@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -90,6 +91,116 @@ def active_length_arg(array_arg: FunctionArg, scalars: list[FunctionArg]) -> Fun
     return None
 
 
+_DEFINE_RE = re.compile(r"^[ \t]*#[ \t]*define[ \t]+(\w+)[ \t]+([^\n/]+)", re.M)
+_CONST_RE = re.compile(r"\bconst\s+(?:unsigned\s+|signed\s+)?(?:int|long|short|char|size_t)\s+(\w+)\s*=\s*([^;]+);")
+_ENUM_RE = re.compile(r"\benum\s*\w*\s*\{([^}]*)\}")
+_LOCAL_INCLUDE_RE = re.compile(r'^[ \t]*#[ \t]*include[ \t]*"([^"]+)"', re.M)
+
+_CONST_EXPR_NODES = (
+    ast.Expression, ast.BinOp, ast.UnaryOp, ast.Constant, ast.Name, ast.Load,
+    ast.Add, ast.Sub, ast.Mult, ast.FloorDiv, ast.Div, ast.Mod, ast.Pow,
+    ast.USub, ast.UAdd, ast.LShift, ast.RShift, ast.BitOr, ast.BitAnd, ast.BitXor, ast.Invert,
+)
+
+
+def local_include_text(path: Path, depth: int = 0, seen: set[Path] | None = None) -> str:
+    """Concatenated text of the headers ``path`` includes with quotes, recursively.
+
+    Compile-time constants routinely live in a companion header -- the HLS-LeVeri
+    benchmark keeps every array bound in ``test.h`` -- so resolving a bound means reading
+    more than the one file the top was found in.
+    """
+
+    seen = seen if seen is not None else set()
+    resolved = path.resolve()
+    if depth > 4 or resolved in seen or not path.exists():
+        return ""
+    seen.add(resolved)
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    parts = [text]
+    for name in _LOCAL_INCLUDE_RE.findall(text):
+        parts.append(local_include_text(path.parent / name, depth + 1, seen))
+    return "\n".join(parts)
+
+
+def collect_constants(text: str) -> dict[str, int]:
+    """Integer compile-time constants: ``#define``, ``const int``, and enumerators.
+
+    Resolved iteratively so a constant defined in terms of earlier ones
+    (``#define TOTAL (ROWS * COLS)``) still lands.
+    """
+
+    raw: dict[str, str] = {}
+    for name, value in _DEFINE_RE.findall(text):
+        raw.setdefault(name, value.strip())
+    for name, value in _CONST_RE.findall(text):
+        raw.setdefault(name, value.strip())
+    for body in _ENUM_RE.findall(text):
+        counter = 0
+        for item in body.split(","):
+            item = item.strip()
+            if not item:
+                continue
+            if "=" in item:
+                key, _, value = item.partition("=")
+                raw.setdefault(key.strip(), value.strip())
+                try:
+                    counter = int(value.strip(), 0) + 1
+                except ValueError:
+                    counter += 1
+            else:
+                raw.setdefault(item.split()[0], str(counter))
+                counter += 1
+
+    constants: dict[str, int] = {}
+    for _ in range(4):  # a few passes let chained definitions resolve
+        progressed = False
+        for name, expression in raw.items():
+            if name in constants:
+                continue
+            value = eval_const_expr(expression, constants)
+            if value is not None:
+                constants[name] = value
+                progressed = True
+        if not progressed:
+            break
+    return constants
+
+
+def eval_const_expr(expression: str, constants: dict[str, int]) -> int | None:
+    """Evaluate a C integer constant expression, or ``None`` if it is not constant.
+
+    Only arithmetic over integer literals and known constants is accepted -- anything
+    with a call, subscript, attribute or unknown name is not a compile-time bound and
+    must keep being treated as one.
+    """
+
+    text = expression.strip().rstrip(";").strip()
+    if not text:
+        return None
+    text = re.sub(r"\b([0-9]+)[uUlL]+\b", r"\1", text)          # 16u / 32UL -> 16 / 32
+    text = re.sub(r"\((?:unsigned|signed|int|long|short|char|size_t)[ \t*]*\)", "", text)
+    try:
+        tree = ast.parse(text, mode="eval")
+    except SyntaxError:
+        return None
+    for node in ast.walk(tree):
+        if not isinstance(node, _CONST_EXPR_NODES):
+            return None
+        if isinstance(node, ast.Name) and node.id not in constants:
+            return None
+        if isinstance(node, ast.Constant) and not isinstance(node.value, int):
+            return None
+    try:
+        value = eval(compile(tree, "<const>", "eval"), {"__builtins__": {}}, dict(constants))
+    except Exception:
+        return None
+    return int(value) if isinstance(value, int) and not isinstance(value, bool) else None
+
+
 def strip_comments(source: str) -> str:
     source = re.sub(r"/\*.*?\*/", "", source, flags=re.S)
     source = re.sub(r"//.*", "", source)
@@ -143,7 +254,11 @@ def _split_params(params: str) -> list[str]:
     return out
 
 
-def _parse_arg(raw: str, metadata: ArgumentConfig | None = None) -> FunctionArg:
+def _parse_arg(
+    raw: str,
+    metadata: ArgumentConfig | None = None,
+    constants: dict[str, int] | None = None,
+) -> FunctionArg:
     raw = raw.strip()
     # `restrict` is a C99 keyword that is not valid C++. Drop it from the parameter text
     # so the generated header/definition signatures (built from FunctionArg.raw) compile.
@@ -165,9 +280,13 @@ def _parse_arg(raw: str, metadata: ArgumentConfig | None = None) -> FunctionArg:
     direction = metadata.direction or ("input" if is_const or (pointer_depth == 0 and not array_dims) else "inout")
     length = metadata.length
     if length is None:
+        # A bound is rarely a bare literal in real HLS code: `float a[NUM_FEATURE]` and
+        # `float b[ROWS*COLS]` are the norm. Resolving them keeps the testbench buffers
+        # the size the design actually indexes, instead of silently falling back to 16.
         for dim in array_dims:
-            if dim.strip().isdigit():
-                length = int(dim.strip())
+            value = eval_const_expr(dim, constants or {})
+            if value is not None and value > 0:
+                length = value
                 break
     return FunctionArg(
         raw=raw,
@@ -183,7 +302,13 @@ def _parse_arg(raw: str, metadata: ArgumentConfig | None = None) -> FunctionArg:
     )
 
 
-def _extract_function(source: str, top: str, source_path: Path, config: AgentConfig) -> FunctionInfo:
+def _extract_function(
+    source: str,
+    top: str,
+    source_path: Path,
+    config: AgentConfig,
+    constants: dict[str, int] | None = None,
+) -> FunctionInfo:
     pattern = re.compile(
         rf"(?P<ret>[A-Za-z_][\w\s\*\d]*?)\s+{re.escape(top)}\s*\((?P<params>[^;{{}}]*)\)\s*\{{",
         flags=re.S,
@@ -194,7 +319,10 @@ def _extract_function(source: str, top: str, source_path: Path, config: AgentCon
     open_brace = source.find("{", match.start())
     close_brace = _find_matching_brace(source, open_brace)
     params = match.group("params")
-    args = [_parse_arg(part, config.arguments.get(_guess_arg_name(part))) for part in _split_params(params)]
+    args = [
+        _parse_arg(part, config.arguments.get(_guess_arg_name(part)), constants)
+        for part in _split_params(params)
+    ]
     return_type = re.sub(r"\s+", " ", match.group("ret")).strip()
     signature = f"{return_type} {top}({', '.join(arg.raw for arg in args)})"
     definition = source[match.start() : close_brace + 1].strip()
@@ -227,7 +355,7 @@ def _infer_pointer_directions(function: FunctionInfo, config: AgentConfig) -> No
             arg.direction = "input"
 
 
-def _unsupported(function: FunctionInfo) -> list[Diagnostic]:
+def _unsupported(function: FunctionInfo, constants: dict[str, int] | None = None) -> list[Diagnostic]:
     body = strip_comments(function.body)
     checks: list[tuple[str, str, str, str | None]] = [
         ("dynamic-allocation", r"\b(malloc|calloc|realloc|free)\s*\(", "dynamic allocation is not synthesizable", "Use fixed-size caller-managed buffers."),
@@ -264,7 +392,13 @@ def _unsupported(function: FunctionInfo) -> list[Diagnostic]:
                 )
             )
     for local_array in re.finditer(r"\b(?:int|char|short|long|float|double|uint\d+_t|int\d+_t)\s+\w+\s*\[([^\]\d][^\]]*)\]", body):
-        diagnostics.append(Diagnostic("error", "variable-length-array", f"variable-length array bound {local_array.group(1)!r} detected", function.source_path.name, "Use fixed compile-time bounds or caller-managed buffers."))
+        bound = local_array.group(1)
+        # `a[N]` and `a[ROWS*COLS]` are fixed bounds whenever those names are compile-time
+        # constants, which is how almost all synthesizable C declares its arrays. Only a
+        # bound that cannot be evaluated is a genuine variable-length array.
+        if eval_const_expr(bound, constants or {}) is not None:
+            continue
+        diagnostics.append(Diagnostic("error", "variable-length-array", f"variable-length array bound {bound!r} detected", function.source_path.name, "Use fixed compile-time bounds or caller-managed buffers."))
     return diagnostics
 
 
@@ -277,8 +411,9 @@ def _type_mappings(function: FunctionInfo) -> list[dict[str, str]]:
 
 def analyze_source(input_file: Path, top: str, config: AgentConfig) -> AnalysisResult:
     source = input_file.read_text(encoding="utf-8")
+    constants = collect_constants(strip_comments(local_include_text(input_file)))
     diagnostics = DiagnosticBag()
-    function = _extract_function(source, top, input_file, config)
+    function = _extract_function(source, top, input_file, config, constants)
     _infer_pointer_directions(function, config)
     for arg in function.args:
         if arg.is_pointer_like and arg.length is None:
@@ -290,6 +425,6 @@ def analyze_source(input_file: Path, top: str, config: AgentConfig) -> AnalysisR
                 input_file.name,
                 "Set arguments.<name>.length in config.yaml.",
             )
-    unsupported = _unsupported(function)
+    unsupported = _unsupported(function, constants)
     diagnostics.extend(unsupported)
     return AnalysisResult(function, diagnostics, _type_mappings(function), unsupported)

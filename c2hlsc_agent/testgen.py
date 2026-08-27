@@ -211,8 +211,13 @@ def generate_testbench(analysis: AnalysisResult, config: AgentConfig) -> str:
 
 extern "C" {{
 #define restrict __restrict__
+// The golden C may carry its own main() -- benchmark sources usually do. The
+// testbench defines main, so rename the original's out of the way rather than
+// colliding with it. CHStone's own flow does the same thing with -Dmain=...
+#define main c2hlsc_golden_main
 #define {fn.name} {fn.name}_ref
 #include "../input.c"
+#undef main
 #undef {fn.name}
 }}
 

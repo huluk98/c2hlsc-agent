@@ -582,8 +582,13 @@ def _klee_driver(analysis: AnalysisResult) -> str:
 #include <klee/klee.h>
 
 extern "C" {{
+// The golden C may carry its own main() -- benchmark sources usually do. The
+// testbench defines main, so rename the original's out of the way rather than
+// colliding with it. CHStone's own flow does the same thing with -Dmain=...
+#define main c2hlsc_golden_main
 #define {fn.name} {fn.name}_ref
 #include "../input.c"
+#undef main
 #undef {fn.name}
 }}
 
@@ -742,7 +747,7 @@ def main() -> int:
 
     # -Wno-narrowing for the same reason as the host build: the golden C is compiled
     # as C++, and C++11 rejects narrowing in brace-init that C accepts.
-    flags = ["-std=c++17", "-Wall", "-Wextra", "-Wno-narrowing", "-I", "src", "-O0", "--coverage"]
+    flags = ["-std=c++17", "-Wall", "-Wextra", "-Wno-narrowing", "-I", "src", "-I", ".", "-O0", "--coverage"]
     extra = os.environ.get("C2HLSC_GCOV_CXXFLAGS", "").split()
     # Compile to objects under coverage/ first, then link. A one-step multi-source build
     # makes gcc name the notes files <output>-<source>.gcno, which gcov then cannot find
@@ -1264,8 +1269,13 @@ def _manifest(analysis: AnalysisResult, config: AgentConfig) -> str:
 def generate_leveri_testbenches(analysis: AnalysisResult, config: AgentConfig) -> LeVeriTestbenchBundle:
     fn = analysis.function
     golden_include = f"""extern "C" {{
+// The golden C may carry its own main() -- benchmark sources usually do. The
+// testbench defines main, so rename the original's out of the way rather than
+// colliding with it. CHStone's own flow does the same thing with -Dmain=...
+#define main c2hlsc_golden_main
 #define {fn.name} {fn.name}_ref
 #include "../input.c"
+#undef main
 #undef {fn.name}
 }}"""
     hls_include = '#include "../src/hls_top.hpp"'

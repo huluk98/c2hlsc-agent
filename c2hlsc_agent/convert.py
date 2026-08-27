@@ -92,17 +92,34 @@ def _file_scope_context(function) -> tuple[str, str]:
     return "\n".join(dict.fromkeys(includes)), "\n".join(rest).strip()
 
 
+_LOCAL_INCLUDE_RE = re.compile(r'^[ \t]*#[ \t]*include[ \t]*"[^"]+"[ \t]*$', re.M)
+
+
+def _local_includes(function) -> str:
+    """The quoted ``#include`` lines of the original C, for the generated header."""
+
+    try:
+        source = function.source_path.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    return "\n".join(dict.fromkeys(line.strip() for line in _LOCAL_INCLUDE_RE.findall(source)))
+
+
 def _generate_conservative_sources(analysis: AnalysisResult, config: AgentConfig) -> GeneratedSource:
     function = analysis.function
     pragma_lines, pragma_rows = _pragma_lines(config, function.args)
+    local_includes = _local_includes(function)
     body = function.body.rstrip()
     if pragma_lines:
         body = "\n" + "\n".join(f"  {line}" for line in pragma_lines) + "\n" + body
+    # The signature itself can name constants from a companion header --
+    # `void knn(float q[NUM_FEATURE], ...)` -- so the header has to carry those includes
+    # or it will not compile on its own. They are guarded, so repeating them is safe.
     header = f"""#ifndef C2HLSC_GENERATED_HLS_TOP_HPP
 #define C2HLSC_GENERATED_HLS_TOP_HPP
 
 {_include_for_types(function.args, function.return_type)}
-
+{local_includes}
 {function.signature};
 
 #endif

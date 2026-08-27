@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import stat
 from dataclasses import dataclass
@@ -119,7 +120,7 @@ EXTRA_FLAGS = __EXTRA_FLAGS__
 # `int t[] = {0xFFFFFFFF}`; C++11 brace-init calls that a narrowing conversion and
 # rejects it outright. Refusing to build valid C over a C++-only rule would fail the
 # run for a difference that changes no value -- the initialiser means what it meant.
-BASE_FLAGS = ["-std=c++17", "-Wall", "-Wextra", "-Wno-narrowing", "-I", "src"]
+BASE_FLAGS = ["-std=c++17", "-Wall", "-Wextra", "-Wno-narrowing", "-I", "src", "-I", "."]
 
 # name -> (sources, dependencies that should trigger a rebuild)
 PROGRAMS = {
@@ -352,6 +353,41 @@ fi
 """
 
 
+_LOCAL_INCLUDE = re.compile(r'^[ \t]*#[ \t]*include[ \t]*"([^"]+)"', re.M)
+
+
+def _copy_local_headers(source: Path, out_dir: Path, depth: int = 0, seen: set[Path] | None = None) -> None:
+    """Copy the headers the golden C includes with quotes into the project, recursively.
+
+    A design is rarely one file: the HLS-LeVeri benchmark keeps every array bound in a
+    companion ``test.h``. Copying only ``input.c`` left both the golden testbench and the
+    generated design with ``fatal error: test.h: No such file or directory``, so the
+    project has to carry the headers to be self-contained.
+    """
+
+    seen = seen if seen is not None else set()
+    if depth > 4 or not source.exists():
+        return
+    resolved = source.resolve()
+    if resolved in seen:
+        return
+    seen.add(resolved)
+    try:
+        text = source.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return
+    for name in _LOCAL_INCLUDE.findall(text):
+        candidate = source.parent / name
+        if not candidate.exists():
+            continue
+        destination = out_dir / name
+        if destination.exists() and candidate.resolve() == destination.resolve():
+            continue
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(candidate, destination)
+        _copy_local_headers(candidate, out_dir, depth + 1, seen)
+
+
 def write_project(out_dir: Path, analysis: AnalysisResult, generated: GeneratedSource, config: AgentConfig) -> ProjectFiles:
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "src").mkdir(exist_ok=True)
@@ -360,6 +396,7 @@ def write_project(out_dir: Path, analysis: AnalysisResult, generated: GeneratedS
     verilog_bundle = generate_verilog_testbenches(analysis, config)
     golden = out_dir / "input.c"
     source = Path(analysis.function.source_path)
+    _copy_local_headers(source, out_dir)
     if not (golden.exists() and source.exists() and source.samefile(golden)):
         # Re-emitting a project in place (refinement) reads the golden C from the project
         # itself; copying it onto itself is both an error and a needless rewrite of the
