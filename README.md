@@ -202,6 +202,32 @@ single generation step. The intended agents are:
 8. `audit_memory_agent`: stores reproducible artifacts and promotes only audited repair
    successes into retrieval memory.
 
+Each of those eight is bound to the code that implements it today in
+`c2hlsc_agent/components.py`: one `ComponentSpec` per agent (stage, real entry points,
+artifacts read and written, the gate that stops the flow, the run-control budgets it
+spends, its invariants, and the seam where a live model-driven agent would take over) plus
+a thin executable adapter with a uniform `run(context) -> ComponentOutcome` contract.
+Inspect it without running anything:
+
+```bash
+python -m c2hlsc_agent components              # stage graph + every component
+python -m c2hlsc_agent components --pipeline   # the default start-to-finish order
+python -m c2hlsc_agent components --component hlsc_repair_agent
+python -m c2hlsc_agent components --json
+```
+
+Two documents go with it:
+
+- [`docs/workflow_end_to_end.md`](docs/workflow_end_to_end.md) — the complete walkthrough
+  from an input C file or NL spec to a verified (and optionally PPA-optimized) project:
+  every stage, gate, artifact, budget, failure family, and exit code.
+- [`docs/agent_components.md`](docs/agent_components.md) — the per-component reference,
+  generated from the registry itself (`python -m c2hlsc_agent components --markdown`).
+
+`cli.run_convert` remains the production driver — it owns the persistent budgets, the
+bounded repair loop, and the oscillation guards. The component layer describes and exposes
+that flow; it never duplicates the control logic and never relaxes an invariant.
+
 Important correction: Vitis C/RTL CoSim checks generated RTL against the HLS-C design
 under the supplied testbench. It does not, by itself, prove that RTL is equivalent to the
 original C. For a defensible "functional equivalent RTL" claim, the loop must keep the
@@ -786,8 +812,16 @@ Supported options:
 - `--llm-model qwen2.5-coder`
 - `--verbose`
 
-Use `python -m c2hlsc_agent.cli repair --help` for the separate external-evidence
-repair command.
+Other subcommands:
+
+- `repair` — apply a repair from evidence produced by an external run
+  (`python -m c2hlsc_agent repair --help`).
+- `optimize` — the post-equivalence QoR loop (`rtl_optimizer_agent`).
+- `status` — read the persistent bounded-run ledger without changing it.
+- `components` — inspect the agent component scaffold; runs nothing.
+
+`python -m c2hlsc_agent <command>` and `python -m c2hlsc_agent.cli <command>` are
+equivalent, as is the installed `c2hlsc-agent` console script.
 
 ## Config Format
 

@@ -2,6 +2,14 @@
 
 *Generated 2026-07-06 at commit `8576b04` (merge of PR #1 "Fix review findings").*
 
+> This file is a point-in-time snapshot of the function reference. For the current
+> flow see [`docs/workflow_end_to_end.md`](docs/workflow_end_to_end.md), and for the
+> per-component contracts see [`docs/agent_components.md`](docs/agent_components.md),
+> generated from `c2hlsc_agent/components.py`. The "Adding real agents" plan at the
+> bottom of this file has since been implemented as that component scaffold: each of
+> the eight declared agents is now bound to its real entry points and has an
+> executable `run(context) -> ComponentOutcome` adapter.
+
 ## How the pipeline fits together
 
 `c2hlsc_agent` converts an ordinary C top function into a Vitis HLS C/C++ project and

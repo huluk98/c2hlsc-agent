@@ -7,6 +7,14 @@ from pathlib import Path
 
 from .analyze import analyze_source
 from .candidates import select_best_candidate
+from .components import (
+    DEFAULT_PIPELINE,
+    component_specs,
+    describe_components,
+    get_component,
+    render_components_markdown,
+    workflow_stages,
+)
 from .config import AgentConfig, load_config, merge_cli_config
 from .convert import ReferenceGenerationError, generate_hls_sources, generate_reference_c
 from .equivalence import VerificationState
@@ -202,6 +210,24 @@ def build_parser() -> argparse.ArgumentParser:
     optimize.add_argument("--verbose", action="store_true", help="print per-candidate progress")
     _add_remote_vitis_arguments(optimize)
     _add_llm_arguments(optimize)
+    components = sub.add_parser(
+        "components",
+        help="inspect the agent component scaffold: stages, gates, artifacts, budgets, and LLM seams",
+    )
+    components.add_argument("--component", help="show one component by name instead of the whole scaffold")
+    components.add_argument("--stages", action="store_true", help="show only the stage graph")
+    components.add_argument(
+        "--pipeline",
+        action="store_true",
+        help="show the default start-to-finish component order run_stages executes",
+    )
+    components_format = components.add_mutually_exclusive_group()
+    components_format.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    components_format.add_argument(
+        "--markdown",
+        action="store_true",
+        help="emit the full docs/agent_components.md reference",
+    )
     status = sub.add_parser(
         'status',
         help='show the latest persistent bounded-run state for a project',
@@ -722,6 +748,94 @@ def run_optimize(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_components(args: argparse.Namespace) -> int:
+    """Inspect the agent component scaffold without running anything."""
+
+    if args.markdown:
+        print(render_components_markdown(), end="")
+        return 0
+
+    if args.pipeline:
+        payload = {"default_pipeline": list(DEFAULT_PIPELINE)}
+        if args.json:
+            print(json.dumps(payload, indent=2))
+            return 0
+        print("Default start-to-finish component order (c2hlsc_agent.components.run_stages):")
+        for index, name in enumerate(DEFAULT_PIPELINE, start=1):
+            spec = get_component(name).spec
+            print(f"  {index}. {name:<28} [{spec.stage}] {spec.gate}")
+        print(
+            "\nRepair (hlsc_repair_agent) is a loop body driven by convert --auto-repair; "
+            "optimization (rtl_optimizer_agent) is the separate optimize command."
+        )
+        return 0
+
+    if args.stages:
+        stages = workflow_stages()
+        if args.json:
+            print(json.dumps(stages, indent=2))
+            return 0
+        for index, stage in enumerate(stages, start=1):
+            members = ", ".join(stage["components"]) or "-"
+            print(f"{index}. {stage['stage']:<9} {members}")
+            print(f"   {stage['purpose']}")
+        return 0
+
+    if args.component:
+        try:
+            spec = get_component(args.component).spec
+        except KeyError:
+            names = ", ".join(item.name for item in component_specs())
+            raise SystemExit(f"unknown component {args.component!r}; known components: {names}")
+        if args.json:
+            print(json.dumps(spec.to_dict(), indent=2))
+            return 0
+        print(f"{spec.name} ({spec.role})")
+        print(f"  stage         : {spec.stage}")
+        print(f"  status        : {spec.status}")
+        print(f"  owns          : {spec.owns}")
+        print(f"  inputs        : {', '.join(spec.procedure.inputs) or '-'}")
+        print(f"  outputs       : {', '.join(spec.procedure.outputs) or '-'}")
+        print(f"  implemented by: {', '.join(spec.implementation)}")
+        print(f"  driven by     : {', '.join(spec.cli) or 'library only'}")
+        print(f"  reads         : {', '.join(spec.reads) or '-'}")
+        print(f"  writes        : {', '.join(spec.writes) or '-'}")
+        print(f"  budgets       : {', '.join(spec.budgets) or '-'}")
+        print(f"  gate          : {spec.gate}")
+        print(f"  stop condition: {spec.stop_condition}")
+        print(f"  llm seam      : {spec.llm_seam}")
+        print("  invariants    :")
+        for item in spec.invariants:
+            print(f"    - {item}")
+        return 0
+
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "stages": workflow_stages(),
+                    "components": describe_components(),
+                    "default_pipeline": list(DEFAULT_PIPELINE),
+                },
+                indent=2,
+            )
+        )
+        return 0
+
+    for index, stage in enumerate(workflow_stages(), start=1):
+        print(f"{index}. {stage['stage']}: {stage['purpose']}")
+        for name in stage["components"]:
+            spec = get_component(name).spec
+            print(f"     {spec.name} [{spec.status}] - {spec.role}")
+            print(f"       gate  : {spec.gate}")
+            print(f"       writes: {', '.join(spec.writes) or '-'}")
+    print(
+        "\nUse --component NAME for one component, --stages for the stage graph, "
+        "--pipeline for the default run order, --json or --markdown for the full reference."
+    )
+    return 0
+
+
 def run_status(args: argparse.Namespace) -> int:
     project_dir = Path(args.project).expanduser().resolve()
     ledger = RunLedger(project_dir / RUN_LEDGER_FILENAME)
@@ -770,6 +884,8 @@ def main(argv: list[str] | None = None) -> int:
         return run_repair(args)
     if args.command == "optimize":
         return run_optimize(args)
+    if args.command == "components":
+        return run_components(args)
     if args.command == 'status':
         return run_status(args)
     parser.error(f"unknown command {args.command}")
