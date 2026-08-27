@@ -740,7 +740,9 @@ def main() -> int:
         for path in ROOT.rglob(pattern):
             path.unlink()
 
-    flags = ["-std=c++17", "-Wall", "-Wextra", "-I", "src", "-O0", "--coverage"]
+    # -Wno-narrowing for the same reason as the host build: the golden C is compiled
+    # as C++, and C++11 rejects narrowing in brace-init that C accepts.
+    flags = ["-std=c++17", "-Wall", "-Wextra", "-Wno-narrowing", "-I", "src", "-O0", "--coverage"]
     extra = os.environ.get("C2HLSC_GCOV_CXXFLAGS", "").split()
     # Compile to objects under coverage/ first, then link. A one-step multi-source build
     # makes gcc name the notes files <output>-<source>.gcno, which gcov then cannot find

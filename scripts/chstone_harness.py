@@ -50,6 +50,10 @@ BLOCKERS: tuple[tuple[str, str, str], ...] = (
     ("variable-length-array", r"\bvariable-length-array\b", "local array with a non-literal bound"),
     ("function-pointer", r"\bfunction-pointer\b", "indirect call through a function pointer"),
     ("unbounded-loop", r"\bunbounded-loop\b", "for(;;) or while(1)"),
+    ("kr-function-definition", r"redeclared as different kind of entity|declared void|expected unqualified-id before .\{.",
+     "K&R-style function definitions, which C++ does not accept in any form"),
+    ("cxx-narrowing", r"narrowing conversion of",
+     "C brace-initialiser that C++11 rejects as narrowing"),
     ("missing-file-scope-context", r"was not declared in this scope|undeclared identifier",
      "generated hls_top.cpp drops the file-scope globals/helpers the top uses"),
     ("compile-error", r"\berror:", "generated source did not compile"),
@@ -437,7 +441,7 @@ def main(argv: list[str] | None = None) -> int:
     }
     histogram: dict[str, int] = {}
     for r in results:
-        key = r.first_blocker or ("none" if r.passes else "unclassified")
+        key = r.first_blocker or ("none" if r.passes else f"unclassified:{r.samples[0].status if r.samples else '?'}")
         histogram[key] = histogram.get(key, 0) + 1
     report["blocker_histogram"] = dict(sorted(histogram.items(), key=lambda kv: -kv[1]))
 

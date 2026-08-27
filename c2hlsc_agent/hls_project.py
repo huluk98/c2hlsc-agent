@@ -115,7 +115,11 @@ EXE = ".exe" if os.name == "nt" else ""
 # Substituted at generation time from the project's AgentConfig.
 EXTRA_FLAGS = __EXTRA_FLAGS__
 
-BASE_FLAGS = ["-std=c++17", "-Wall", "-Wextra", "-I", "src"]
+# -Wno-narrowing: the golden reference is C, compiled here as C++. C allows
+# `int t[] = {0xFFFFFFFF}`; C++11 brace-init calls that a narrowing conversion and
+# rejects it outright. Refusing to build valid C over a C++-only rule would fail the
+# run for a difference that changes no value -- the initialiser means what it meant.
+BASE_FLAGS = ["-std=c++17", "-Wall", "-Wextra", "-Wno-narrowing", "-I", "src"]
 
 # name -> (sources, dependencies that should trigger a rebuild)
 PROGRAMS = {
