@@ -91,6 +91,59 @@ available. `scripts/check_readiness.py` settles it.
 
 ---
 
+## 4b. Verified by execution in this container (iverilog 12.0 + yosys 0.33 installed)
+
+Lane C and the local-PPA flow had never been run anywhere. Both now have, against
+hand-written RTL implementing the `ap_ctrl_hs` / `ap_memory` contract:
+
+| Subsystem | Result |
+|---|---|
+| Lane C, scalar design (`ap_return`) | **pass**; sabotaging `a+b` -> `a-b` makes it fail with per-test expected/actual |
+| Lane C, array design (`ap_memory`, 1-cycle read latency) | **pass** first try; corrupting one element pinpoints `out[5]` on every test |
+| `gen_rtl_tb.py --from-rtl` reconciliation | **works**: detects `ap_rst_n`, flips polarity, rewires the instantiation, and the regenerated TB simulates clean against the active-low design |
+| yosys synthesis + area parsing | **works** on yosys 0.33 (298 cells, 384.104 um^2) despite the code comment naming 0.6x |
+| liberty -> Verilog cell models | **was broken** — see L1 below; now fixed and verified |
+| gate-level waveform sim | **pass** after the L1 fix; VCD written; sabotage caught with a per-element mismatch |
+| OpenSTA slack/power | not installed, not packaged for Ubuntu — untested |
+
+**L1 (fixed, commit `4fd9817`).** Liberty uses juxtaposition as AND; Nangate45 writes every
+NAND/AND/AOI/OAI cell that way (`function : "!(A1 A2)"`). `_liberty_expr_to_verilog` did not
+handle it and emitted invalid Verilog, and the unhandled-operator guard could not catch it
+because whitespace is necessarily whitelisted there. So the cell was emitted broken rather
+than skipped, contradicting the module's stated contract. The gate-level sim could not
+compile against any real standard-cell library. Two regression tests added; suite now 224.
+
+**Reproduction assets** live in the scratchpad, not the repo: hand-written `add_scalars.v`
+and `double_all.v` (ap_ctrl_hs + ap_memory), and a minimal `mini45.lib` with INV/BUF/NAND2/
+NOR2/DFF. Worth re-creating as committed fixtures if lane C or local PPA gets more work.
+
+---
+
+## 4c. W5 — `--vitis-ssh` cannot target a Windows Vitis host
+
+The user's natural split (Mac drives, Windows synthesizes) is **not supported today**.
+`remote.py` assumes a POSIX remote in five ways: `ssh <host> bash -lc '...'`; GNU coreutils
+`timeout -k 30s`; probing `/tools|/opt/Xilinx/.../settings64.sh` (Windows uses
+`settings64.bat`); `rsync` for push and pull; POSIX paths throughout.
+
+Three viable topologies, with cost:
+
+| | Path | Needs | Gets |
+|---|---|---|---|
+| T1 | everything on the Windows box | W1 + W2 | fastest route to real RTL, no new architecture |
+| T2 | everything on the Mac with Bambu | a Bambu backend (~7 modules) | RTL on the Mac, and rungs 2-4 finally testable in CI/containers |
+| T3 | Mac drives, Windows synthesizes | W1 + W2 + W5 | the original split; most work, most fragile |
+
+Recommendation: T1 now, T2 next, T3 only if the split is specifically wanted.
+
+**Environment facts:** Vivado HLS was discontinued after 2020.2 — "Vivado HLS 2024.2" is
+almost certainly **Vitis HLS 2024.2**, binary `vitis_hls.bat`, which is the name the code
+already hardcodes. Bambu is on the user's Mac, not here: `release.bambuhls.eu` and GitHub
+releases are both blocked by this container's network policy, and Bambu is not in the Ubuntu
+archives. Ubuntu archives themselves ARE reachable, which is how iverilog and yosys got in.
+
+---
+
 ## 5. Answered
 
 - **Q1** deliverable → (b) a working tool; ASIC is the long-term goal, not the current one
@@ -102,6 +155,7 @@ available. `scripts/check_readiness.py` settles it.
 ## 6. Open — next action
 
 **Blocking:**
+- **Q24** — topology: T1 / T2 / T3 (see 4c). Recommend T1 now, T2 next
 - **Q5** — run `python scripts/check_readiness.py` from the repo root on the Windows box and
   paste the output. Ignore the ASIC-PPA failures. This settles W1.
 - **Q6** — is the binary `vitis_hls` (supported) or the legacy `vivado_hls` (supported
