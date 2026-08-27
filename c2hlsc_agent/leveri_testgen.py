@@ -873,11 +873,23 @@ if __name__ == "__main__":
 
 
 def _klee_script() -> str:
-    return """#!/usr/bin/env python3
+    return r"""#!/usr/bin/env python3
+'''Symbolic exploration of the golden C top.
+
+Runs KLEE natively when it is installed. Where it is not -- macOS has no Homebrew
+formula and Ubuntu does not package it either -- this falls back to the official
+klee/klee container automatically, so `make klee-coverage` and the refinement loop work
+on a Mac without anything being installed into the host PATH.
+
+  C2HLSC_KLEE_DOCKER=0   never use the container, skip instead
+  C2HLSC_KLEE_DOCKER=1   use the container even if a native klee exists
+  C2HLSC_KLEE_IMAGE=...  override the image (default klee/klee:latest)
+'''
 from __future__ import annotations
 
 import json
 import os
+import platform
 import shutil
 import subprocess
 from pathlib import Path
@@ -886,11 +898,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 COVERAGE_DIR = ROOT / "coverage"
 REPORT_PATH = COVERAGE_DIR / "klee_report.json"
+DEFAULT_IMAGE = "klee/klee:latest"
+DOCTOR = "c2hlsc-agent doctor --install"
 
 
-def write_report(payload: dict[str, object]) -> None:
+def write_report(payload: dict) -> None:
     COVERAGE_DIR.mkdir(exist_ok=True)
-    REPORT_PATH.write_text(json.dumps(payload, indent=2) + "\\n", encoding="utf-8")
+    REPORT_PATH.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
 def resolve_tool(env_name: str, *candidate_names: str) -> str | None:
@@ -923,22 +937,115 @@ def default_klee_include(klee_path: str | None) -> str | None:
     return None
 
 
+def docker_available() -> tuple[bool, str]:
+    '''The CLI existing is not enough -- a Mac with Docker Desktop closed has the binary
+    but no daemon, which would otherwise fail with an unhelpful socket error.'''
+    if shutil.which("docker") is None:
+        return False, "docker not installed"
+    try:
+        probe = subprocess.run(["docker", "info"], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, f"docker not usable: {exc}"
+    if probe.returncode != 0:
+        return False, "docker daemon is not running (start Docker Desktop)"
+    return True, ""
+
+
+CONTAINER_SCRIPT = r'''
+set -e
+INC=""
+for c in /home/klee/klee_src/include /usr/local/include /usr/include; do
+  if [ -f "$c/klee/klee.h" ]; then INC="$c"; break; fi
+done
+if [ -z "$INC" ]; then echo "klee headers not found inside the image" >&2; exit 3; fi
+CXX=clang++
+command -v clang++ >/dev/null 2>&1 || CXX="clang -x c++"
+mkdir -p coverage
+$CXX -std=c++17 -I . -I "$INC" -emit-llvm -c -g -O0 tb/klee_driver.cpp -o coverage/klee_driver.bc
+klee --output-dir=coverage/klee-out coverage/klee_driver.bc
+'''
+
+
+def run_in_docker(timeout_s: int) -> int:
+    image = os.environ.get("C2HLSC_KLEE_IMAGE", DEFAULT_IMAGE)
+    klee_out = COVERAGE_DIR / "klee-out"
+    if klee_out.exists():
+        shutil.rmtree(klee_out)
+    COVERAGE_DIR.mkdir(exist_ok=True)
+
+    command = ["docker", "run", "--rm", "-v", f"{ROOT}:/work", "-w", "/work"]
+    if platform.system() == "Linux":
+        # Bind mounts on Linux keep the container's uid, so without this every artifact
+        # KLEE writes would land root-owned in the user's project.
+        command += ["-u", f"{os.getuid()}:{os.getgid()}"]
+    command += [image, "bash", "-c", CONTAINER_SCRIPT]
+
+    logs: list[dict] = []
+    try:
+        result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True, timeout=timeout_s)
+    except subprocess.TimeoutExpired as exc:
+        write_report({
+            "status": "fail",
+            "mode": "docker",
+            "image": image,
+            "reason": "timeout",
+            "timeout_s": timeout_s,
+            "stdout": (exc.stdout or "")[-4000:] if isinstance(exc.stdout, str) else "",
+        })
+        return 1
+    except (OSError, subprocess.SubprocessError) as exc:
+        write_report({"status": "fail", "mode": "docker", "image": image, "reason": str(exc)})
+        return 1
+
+    logs.append({
+        "cmd": command[:-1] + ["<script>"],
+        "returncode": result.returncode,
+        "stdout": result.stdout[-8000:],
+        "stderr": result.stderr[-8000:],
+    })
+    ktests = sorted(str(path.relative_to(ROOT)) for path in klee_out.glob("*.ktest")) if klee_out.exists() else []
+    status = "pass" if result.returncode == 0 else "fail"
+    write_report({
+        "status": status,
+        "mode": "docker",
+        "image": image,
+        "policy_id": "hls_leveri_shift_left_v1",
+        "commands": logs,
+        "ktest_count": len(ktests),
+        "ktest_files": ktests,
+    })
+    print(f"KLEE ({image}) report written to {REPORT_PATH}")
+    return result.returncode
+
+
 def main() -> int:
+    forced = os.environ.get("C2HLSC_KLEE_DOCKER", "").strip()
+    timeout_s = int(os.environ.get("C2HLSC_KLEE_TIMEOUT", "60"))
+
     klee = resolve_tool("KLEE", "klee")
     clangxx = resolve_tool("KLEE_CXX", "klee-clang++", "clang++")
     klee_include = os.environ.get("KLEE_INCLUDE_DIR") or default_klee_include(klee)
-    if klee is None:
-        write_report({"status": "skipped", "reason": "klee not found", "remedy": "c2hlsc-agent doctor --install"})
-        print("KLEE coverage skipped: klee not found -- run `c2hlsc-agent doctor --install` to install it")
-        return 0
-    if clangxx is None:
-        write_report({"status": "skipped", "reason": "clang++ not found", "remedy": "c2hlsc-agent doctor --install"})
-        print("KLEE coverage skipped: clang++ not found -- run `c2hlsc-agent doctor --install` to install it")
-        return 0
-    if klee_include is None or not Path(klee_include).exists():
-        write_report({"status": "skipped", "reason": "KLEE include directory not found", "klee_include": klee_include})
-        print("KLEE coverage skipped: include directory not found")
-        return 0
+    native_ready = bool(klee and clangxx and klee_include and Path(klee_include).exists())
+
+    if forced == "1" or (not native_ready and forced != "0"):
+        ok, reason = docker_available()
+        if ok:
+            return run_in_docker(timeout_s)
+        if forced == "1":
+            write_report({"status": "skipped", "mode": "docker", "reason": reason, "remedy": DOCTOR})
+            print(f"KLEE coverage skipped: {reason}")
+            return 0
+        if not native_ready:
+            missing = "klee not found" if not klee else ("clang++ not found" if not clangxx else "KLEE include directory not found")
+            write_report({
+                "status": "skipped",
+                "mode": "none",
+                "reason": missing,
+                "docker_reason": reason,
+                "remedy": DOCTOR,
+            })
+            print(f"KLEE coverage skipped: {missing}; container fallback unavailable ({reason}) -- {DOCTOR}")
+            return 0
 
     COVERAGE_DIR.mkdir(exist_ok=True)
     bitcode = COVERAGE_DIR / "klee_driver.bc"
@@ -961,8 +1068,7 @@ def main() -> int:
         "-o",
         str(bitcode),
     ]
-    timeout_s = int(os.environ.get("C2HLSC_KLEE_TIMEOUT", "60"))
-    logs: list[dict[str, object]] = []
+    logs: list[dict] = []
     try:
         compiled = subprocess.run(compile_cmd, cwd=ROOT, text=True, capture_output=True, check=True)
         logs.append({"cmd": compile_cmd, "returncode": compiled.returncode, "stdout": compiled.stdout[-4000:], "stderr": compiled.stderr[-4000:]})
@@ -973,6 +1079,7 @@ def main() -> int:
         status = "pass" if executed.returncode == 0 else "fail"
         write_report({
             "status": status,
+            "mode": "native",
             "policy_id": "hls_leveri_shift_left_v1",
             "commands": logs,
             "ktest_count": len(ktests),
@@ -982,11 +1089,11 @@ def main() -> int:
         return executed.returncode
     except subprocess.TimeoutExpired as exc:
         logs.append({"cmd": exc.cmd, "timeout_s": timeout_s, "stdout": (exc.stdout or "")[-4000:], "stderr": (exc.stderr or "")[-4000:]})
-        write_report({"status": "fail", "reason": "timeout", "commands": logs})
+        write_report({"status": "fail", "mode": "native", "reason": "timeout", "commands": logs})
         return 1
     except subprocess.CalledProcessError as exc:
         logs.append({"cmd": exc.cmd, "returncode": exc.returncode, "stdout": (exc.stdout or "")[-4000:], "stderr": (exc.stderr or "")[-4000:]})
-        write_report({"status": "fail", "reason": "compile_failed", "commands": logs})
+        write_report({"status": "fail", "mode": "native", "reason": "compile_failed", "commands": logs})
         return exc.returncode or 1
 
 

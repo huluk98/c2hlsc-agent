@@ -36,6 +36,7 @@ from c2hlsc_agent import toolchain
 
 HAVE_BUILD = shutil.which("g++") is not None and shutil.which("make") is not None
 HAVE_GCOV = HAVE_BUILD and shutil.which("gcov") is not None
+HAVE_KLEE = HAVE_GCOV and shutil.which("klee") is not None and shutil.which("clang++") is not None
 
 VECTOR_ADD = """#include <stdint.h>
 void vector_add(const int32_t *a, const int32_t *b, int32_t *out, int n) {
@@ -48,6 +49,16 @@ int32_t picky(const int32_t *a, int32_t n) {
   int32_t acc = 0;
   if (n == 3) { acc += 7; }
   for (int i = 0; i < n; ++i) { acc += a[i]; }
+  return acc;
+}
+"""
+
+NEEDLE = """#include <stdint.h>
+int32_t needle(const int32_t *a, int32_t n) {
+  int32_t acc = 0;
+  for (int i = 0; i < n; ++i) {
+    if (a[i] == 12345) { acc += 1000; } else { acc += a[i]; }
+  }
   return acc;
 }
 """
@@ -419,6 +430,72 @@ class RefinementLoopTests(unittest.TestCase):
             regenerate(project, analysis, config)
             self.assertIn(marker, source.read_text(encoding="utf-8"))
             self.assertIn("c2hlsc_extra_count = 1", (project / "tb" / "testbench.cpp").read_text(encoding="utf-8"))
+
+
+@unittest.skipUnless(HAVE_KLEE, "a native klee and clang++ are required")
+class SymbolicRefinementTests(unittest.TestCase):
+    """The KLEE path, against real KLEE.
+
+    A guarded equality branch is the case the random schedule provably cannot reach --
+    widening a pseudo-random stream will not produce 12345 -- so this is the test that
+    distinguishes a working symbolic loop from one that only looks like it works.
+    """
+
+    def _needle(self, tmp: Path):
+        return _project(
+            tmp,
+            NEEDLE,
+            "needle",
+            {"a": ArgumentConfig(direction="input", length=4), "n": ArgumentConfig(range=(0, 4))},
+            num_tests=8,
+        )
+
+    def test_klee_reaches_a_branch_the_random_schedule_cannot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project, analysis, config = self._needle(Path(tmp))
+            outcome = refine_project(project, analysis, config, target=100.0, max_rounds=3, allow_widen=False)
+
+            self.assertEqual(outcome.status, "met", outcome.summary)
+            self.assertLess(outcome.baseline_coverage, 100.0)
+            self.assertEqual(outcome.final_coverage, 100.0)
+            self.assertTrue(all(item.strategy == "klee" for item in outcome.rounds))
+
+            # The magic constant must appear in a decoded vector, not merely somewhere.
+            needles = [v for v in outcome.vectors if 12345 in (v.values.get("a") or [])]
+            self.assertTrue(needles, "KLEE should have produced an input containing the guard constant")
+            self.assertTrue(all(v.origin.startswith("klee:") for v in needles))
+
+    def test_the_decoder_round_trips_real_klee_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project, analysis, config = self._needle(Path(tmp))
+            report = json.loads(
+                subprocess.run(
+                    ["make", "-C", str(project), "klee-coverage"], capture_output=True, text=True
+                ).stdout
+                and (project / "coverage" / "klee_report.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(report["mode"], "native")
+            self.assertEqual(report["status"], "pass")
+            self.assertGreater(report["ktest_count"], 0)
+
+            produced = sorted((project / "coverage" / "klee-out").glob("*.ktest"))
+            objects = parse_ktest(produced[0])
+            # Object names are the argument names, and sizes follow the declared widths.
+            self.assertEqual(set(objects), {"a", "n"})
+            self.assertEqual(len(objects["a"]), 4 * 4)
+            self.assertEqual(len(objects["n"]), 4)
+            vector = ktest_to_vector(objects, analysis, origin="klee:real")
+            self.assertEqual(len(vector.values["a"]), 4)
+            self.assertLessEqual(vector.values["n"], 4)
+
+    def test_refined_project_still_passes_every_host_tier(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project, analysis, config = self._needle(Path(tmp))
+            outcome = refine_project(project, analysis, config, target=100.0, max_rounds=3, allow_widen=False)
+            self.assertEqual(outcome.status, "met")
+            for target in ("test", "leveri-test"):
+                run = subprocess.run(["make", "-C", str(project), target], capture_output=True, text=True)
+                self.assertEqual(run.returncode, 0, f"{target}: {run.stdout}{run.stderr}")
 
 
 class TraceConsistencyRungTests(unittest.TestCase):

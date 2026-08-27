@@ -120,10 +120,22 @@ TOOLS: tuple[Tool, ...] = (
         apt="klee",
         env_overrides=("KLEE",),
         manual=(
-            "KLEE has no Homebrew formula. The supported route on macOS is the official image: "
-            "docker run --rm -v \"$PWD\":/work -w /work klee/klee:latest — "
-            "install Docker Desktop with: brew install --cask docker"
+            "KLEE is packaged on Debian but not on Ubuntu or macOS. On Debian/Ubuntu build it "
+            "with: sudo bash scripts/install_klee.sh. Everywhere else the generated "
+            "tb/run_klee.py falls back to the official klee/klee container automatically once "
+            "Docker is running (macOS: brew install --cask docker); force or disable that with "
+            "C2HLSC_KLEE_DOCKER=1 / =0."
         ),
+    ),
+    Tool(
+        name="docker",
+        tier="symbolic",
+        purpose="runs the official KLEE container where KLEE is not native (macOS, Ubuntu)",
+        brew="docker",
+        apt="docker.io",
+        dnf="moby-engine",
+        pacman="docker",
+        manual="On macOS install Docker Desktop: brew install --cask docker",
     ),
     Tool(
         name="clang++",
@@ -246,6 +258,43 @@ def _brew_has_formula(formula: str) -> bool:
     return bool(payload.get("formulae") or payload.get("casks"))
 
 
+def _linux_has_package(manager: str, package: str) -> bool:
+    """Confirm a Linux package exists in the configured repositories.
+
+    Package availability is distro- and release-specific: ``klee`` is a real Debian
+    package but on Ubuntu 24.04 the only match for that name is a *font*. Offering
+    `apt-get install klee` there hands the user a command that fails, or worse installs
+    something unrelated -- so every name is confirmed against the local index first, the
+    same way Homebrew formulae are.
+    """
+
+    probe = {
+        "apt": ["apt-cache", "policy", package],
+        "dnf": ["dnf", "--quiet", "list", "--available", package],
+        "pacman": ["pacman", "-Si", package],
+    }.get(manager)
+    if probe is None:
+        return False
+    try:
+        result = subprocess.run(probe, capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if result.returncode != 0:
+        return False
+    if manager == "apt":
+        # A name with no candidate prints nothing at all; an unknown name also exits 0.
+        return "Candidate:" in result.stdout and "Candidate: (none)" not in result.stdout
+    return bool(result.stdout.strip())
+
+
+def package_exists(manager: str | None, package: str) -> bool:
+    if not manager or not package:
+        return False
+    if manager == "brew":
+        return _brew_has_formula(package)
+    return _linux_has_package(manager, package)
+
+
 def _install_command(manager: str, package: str) -> list[str]:
     return {
         "brew": ["brew", "install", package],
@@ -286,8 +335,8 @@ def check(tiers: Iterable[str] | None = None, manager: str | None = None) -> lis
         status = ToolStatus(tool=tool, path=path, source=source)
         if path is None:
             package = tool.package_for(manager)
-            if package and manager == "brew" and not _brew_has_formula(package):
-                package = None  # the formula moved or never existed; don't offer a broken command
+            if package and not package_exists(manager, package):
+                package = None  # the package moved, was renamed, or never existed here
             if package:
                 status.installable = True
                 status.command = _install_command(manager or "", package)
