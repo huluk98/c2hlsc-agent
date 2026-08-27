@@ -40,7 +40,22 @@ def _storage_type(arg: FunctionArg) -> str:
 
 
 def _value_print(expr: str) -> str:
+    """Integer rendering, for contexts that genuinely need one (``clamp_count``)."""
+
     return f"static_cast<long long>({expr})"
+
+
+def _show_value(expr: str) -> str:
+    """Diagnostic rendering that preserves the value's own type.
+
+    Mismatch text used to cast every value to ``long long``, which destroys exactly the
+    evidence the diagnostic exists to carry: on a floating-point design a 1.5-vs-1.7
+    disagreement both print as ``1``, and a NaN casts to INT64_MIN, so a real NaN
+    divergence renders as ``expected=-9223372036854775808 actual=-9223372036854775808``
+    -- identical values that nonetheless failed. The repair agent reads these.
+    """
+
+    return f"c2hlsc_show({expr})"
 
 
 def _init_array(arg: FunctionArg, config: AgentConfig) -> str:
@@ -113,7 +128,7 @@ _active_length_arg = active_length_arg
 
 
 def _scalar_log_expr(scalars: list[FunctionArg]) -> str:
-    return "".join(f' << " {arg.name}=" << {_value_print(arg.name)}' for arg in scalars)
+    return "".join(f' << " {arg.name}=" << {_show_value(arg.name)}' for arg in scalars)
 
 
 def _array_trace_lines(current: FunctionArg, arrays: list[FunctionArg]) -> str:
@@ -123,7 +138,7 @@ def _array_trace_lines(current: FunctionArg, arrays: list[FunctionArg]) -> str:
             continue
         lines.append(
             f"""        if (i < {arg.length}) {{
-          std::cerr << " {arg.name}[i]=" << {_value_print(f'ref_{arg.name}[i]')};
+          std::cerr << " {arg.name}[i]=" << {_show_value(f'ref_{arg.name}[i]')};
         }}"""
         )
     return "\n".join(lines)
@@ -186,7 +201,7 @@ def generate_testbench(analysis: AnalysisResult, config: AgentConfig) -> str:
         return_compare = f"""
     if (!values_equal(ref_ret, hls_ret)) {{
       std::cerr << "Mismatch test=" << test_idx << " return expected="
-                << {_value_print('ref_ret')} << " actual=" << {_value_print('hls_ret')}
+                << {_show_value('ref_ret')} << " actual=" << {_show_value('hls_ret')}
                 << " seed={config.seed}"{scalar_context} << "\\n";
       return 1;
     }}"""
@@ -209,8 +224,8 @@ def generate_testbench(analysis: AnalysisResult, config: AgentConfig) -> str:
             comparisons.append(f"""    for (int i = 0; i < {compare_var}; ++i) {{
       if (!values_equal(ref_{arg.name}[i], hls_{arg.name}[i])) {{
         std::cerr << "Mismatch test=" << test_idx << " arg={arg.name} index=" << i
-                  << " expected=" << {_value_print(f'ref_{arg.name}[i]')}
-                  << " actual=" << {_value_print(f'hls_{arg.name}[i]')}
+                  << " expected=" << {_show_value(f'ref_{arg.name}[i]')}
+                  << " actual=" << {_show_value(f'hls_{arg.name}[i]')}
                   << " seed={config.seed}"
                   << " compare_len=" << {compare_var}{scalar_context};{trace_lines}
         std::cerr << "\\n";
@@ -232,9 +247,12 @@ def generate_testbench(analysis: AnalysisResult, config: AgentConfig) -> str:
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <iomanip>
 #include <iostream>
 #include <limits>
 #include <random>
+#include <sstream>
+#include <string>
 
 extern "C" {{
 #define restrict __restrict__
@@ -252,12 +270,37 @@ extern "C" {{
 
 {extra_tables}{stimulus_helpers}
 template <typename T>
+std::string c2hlsc_show(T value) {{
+  std::ostringstream out;
+  if (std::numeric_limits<T>::is_integer) {{
+    out << static_cast<long long>(value);
+  }} else {{
+    out << std::setprecision(17) << static_cast<long double>(value);
+  }}
+  return out.str();
+}}
+
+template <typename T>
 bool values_equal(T a, T b) {{
   if (std::numeric_limits<T>::is_integer) {{
     return a == b;
   }}
   long double da = static_cast<long double>(a);
   long double db = static_cast<long double>(b);
+  // Identical non-finite values must agree before the tolerance is applied. For two
+  // infinities the relative test computes inf - inf = NaN, and NaN <= anything is false,
+  // so values_equal(inf, inf) used to report a mismatch between identical values. This is
+  // a differential oracle: golden and HLS arriving at the same NaN agree about the
+  // computation, whatever IEEE says about NaN's own identity.
+  if (std::isnan(da) && std::isnan(db)) {{
+    return true;
+  }}
+  if (std::isnan(da) || std::isnan(db)) {{
+    return false;
+  }}
+  if (std::isinf(da) || std::isinf(db)) {{
+    return da == db;
+  }}
   long double diff = da > db ? da - db : db - da;
   long double scale = std::fabs(da) > std::fabs(db) ? std::fabs(da) : std::fabs(db);
   if (scale < 1.0L) scale = 1.0L;

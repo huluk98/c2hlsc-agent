@@ -90,7 +90,7 @@ class ConvertTests(unittest.TestCase):
         self.assertIn("for (int i = 0; i < compare_len_out; ++i)", testbench)
         self.assertIn("if (!values_equal(ref_out[i], hls_out[i]))", testbench)
         self.assertIn('<< " compare_len=" << compare_len_out', testbench)
-        self.assertIn('<< " n=" << static_cast<long long>(n)', testbench)
+        self.assertIn('<< " n=" << c2hlsc_show(n)', testbench)
         self.assertIn('"Mismatch test=" << test_idx << " arg=out index="', testbench)
 
     def test_generated_testbench_uses_vitis_friendly_stimulus(self):
