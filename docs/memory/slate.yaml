@@ -142,8 +142,10 @@ evidence:
     measured_at: 350bfff
     baseline: docs/memory/artifacts/sweep-baseline-pre-fix.json
     method: >-
-      Same harness as E005, archived at docs/memory/artifacts/sweep-harness.py,
-      run before and after the fixes on identical inputs.
+      `scripts/run_hls_eval_sweep.py`, run before and after the fixes on
+      identical inputs. The original throwaway harness is kept at
+      docs/memory/artifacts/sweep-harness.py as the provenance of E005; the
+      committed script reproduces its numbers exactly (see E008).
     breakdown: >-
       20 of the gains are chstone designs unblocked by hoisting signature
       typedefs (float64, flag, bits64, int8, int16); 4 are machsuite designs
@@ -170,6 +172,27 @@ evidence:
       The header fix cleared all ten "X was not declared in this scope" failures
       here, but the designs then fail equivalence for want of a correct bound. A
       human-written config supplies that bound; the harness cannot.
+
+  - id: E008
+    claim: >-
+      The committed sweep harness reproduces the serial numbers exactly when run
+      concurrently, and its output is byte-identical across repeated runs.
+    verified_by: artifact
+    artifact: docs/memory/artifacts/sweep-parallel-preprocessed.json
+    measured_at: PLACEHOLDER
+    method: >-
+      `python3 scripts/run_hls_eval_sweep.py --data-root <hls_eval_data> --workers 4`,
+      compared per design against the serial results in
+      sweep-after-fixes-preprocessed.json and sweep-after-fixes-raw-source.json.
+    result: >-
+      38/104 preprocessed and 24/104 raw, matching the serial runs on all 104
+      designs in both modes with zero verdict disagreements. Two consecutive
+      parallel runs produced byte-identical result files.
+    note: >-
+      Rows are sorted by design id before writing, so completion order cannot leak
+      into the artifact. That is what makes the file usable as evidence rather than
+      merely as output. Wall clock fell from roughly 15 minutes to 2m05s on 4 cores.
+
 
 frontier:
   - id: Q004

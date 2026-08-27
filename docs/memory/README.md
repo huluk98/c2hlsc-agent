@@ -24,6 +24,7 @@ checks them all on demand.
 | `slate.yaml` | Decisions, evidence, and the open frontier |
 | `artifacts/` | Committed measurement outputs that evidence entries point at |
 | `../../scripts/replay_slate.py` | Re-runs every evidence entry |
+| `../../scripts/run_hls_eval_sweep.py` | Produces the sweep numbers behind `E005`-`E008` |
 | `../../CLAUDE.md` | Wiring: makes a fresh session read the slate before acting |
 
 ## Using it
@@ -34,7 +35,20 @@ python3 scripts/replay_slate.py             # re-verify every recorded claim
 python3 scripts/replay_slate.py --id E003   # one entry
 ```
 
-Exit status is 0 while the record holds and 1 when something drifted.
+Exit status is 0 while the record holds and 1 when something drifted. Entries are
+checked concurrently; pass `--workers 1` when you want a clean failure trace.
+
+Re-measuring the sweep needs the HLS-Eval corpus, which is not vendored here:
+
+```bash
+git clone https://github.com/sharc-lab/hls-eval /tmp/hls-eval
+python3 scripts/run_hls_eval_sweep.py --data-root /tmp/hls-eval/hls_eval_data \
+  --out /tmp/sweep.json --workers 4          # add --raw for the un-preprocessed mode
+```
+
+Rows are sorted by design id before writing, so two runs of the same command
+produce byte-identical output no matter what order the workers finished in. That
+property is what lets a result file serve as evidence rather than just output.
 
 ## The three entry kinds
 
