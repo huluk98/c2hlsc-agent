@@ -123,6 +123,7 @@ def _kill_tree(proc: subprocess.Popen) -> None:
 
 
 def run_command(command: list[str], cwd: Path, phase: str, timeout: int = 120) -> PhaseResult:
+    timeout_s = timeout
     proc = subprocess.Popen(
         command,
         cwd=cwd,
@@ -132,8 +133,8 @@ def run_command(command: list[str], cwd: Path, phase: str, timeout: int = 120) -
         start_new_session=True,
     )
     try:
-        stdout, stderr = proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
+        stdout, stderr = proc.communicate(timeout=timeout_s)
+    except subprocess.TimeoutExpired as timeout:
         _terminate_tree(proc)
         try:
             stdout, stderr = proc.communicate(timeout=10)
@@ -142,7 +143,9 @@ def run_command(command: list[str], cwd: Path, phase: str, timeout: int = 120) -
             stdout, stderr = proc.communicate()
         log_path = cwd / f"{phase}.log"
         log_path.write_text((stdout or "") + "\n--- stderr ---\n" + (stderr or ""), encoding="utf-8")
-        raise subprocess.TimeoutExpired(command, timeout, output=stdout, stderr=stderr)
+        # Re-raise enriched with the partial output, chained to the original so the
+        # evidence trail shows this came from the watchdog rather than a fresh fault.
+        raise subprocess.TimeoutExpired(command, timeout_s, output=stdout, stderr=stderr) from timeout
     stdout = stdout or ""
     stderr = stderr or ""
     status = "pass" if proc.returncode == 0 else "fail"

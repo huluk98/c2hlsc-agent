@@ -23,7 +23,7 @@ Two things are configurable from :class:`~c2hlsc_agent.config.AgentConfig`:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Iterable
 
 from .analyze import FunctionArg

@@ -16,7 +16,6 @@ from c2hlsc_agent.components import (
     STAGE_PURPOSE,
     ComponentContext,
     ComponentError,
-    component_registry,
     component_specs,
     describe_components,
     get_component,

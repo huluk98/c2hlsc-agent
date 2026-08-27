@@ -110,6 +110,9 @@ class OptimizeOutcome:
     target_gaps: list[str] = field(default_factory=list)
     rounds: list[dict[str, object]] = field(default_factory=list)
     local_ppa: dict[str, object] = field(default_factory=dict)
+    #: Why the target-driven loop stopped. Computed all along but previously discarded,
+    #: which left the report unable to say whether the loop converged or simply ran out.
+    stop_reason: str = ""
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -127,6 +130,7 @@ class OptimizeOutcome:
             "target_gaps": list(self.target_gaps),
             "rounds": list(self.rounds),
             "local_ppa": dict(self.local_ppa),
+            "stop_reason": self.stop_reason,
         }
 
 
@@ -449,7 +453,6 @@ def optimize_project(
     adopted: tuple[int, str] | None = None  # (index, source) of the current working point
     rounds_budget = max(1, max_rounds) if targets is not None else 1
     index = 0
-    stop_reason = ""
 
     for round_no in range(rounds_budget):
         round_results: list[CandidateResult] = []
@@ -482,7 +485,7 @@ def optimize_project(
             elif cand.score < working_score:
                 improving.append(cand)
         if not improving:
-            stop_reason = f"round {round_no}: no candidate improved on the working point"
+            outcome.stop_reason = f"round {round_no}: no candidate improved on the working point"
             break
         round_best = min(improving, key=lambda c: (c.gap_score if c.gap_score is not None else 0.0, c.score))
         adopted = (round_best.index, sources[round_best.index])
@@ -503,10 +506,11 @@ def optimize_project(
         if verbose:
             print(f"round {round_no}: adopted candidate {round_best.index} as the new working point")
         if targets is not None and round_best.targets_met:
-            stop_reason = f"targets met in round {round_no}"
+            outcome.stop_reason = f"targets met in round {round_no}"
             break
         if targets is None:
-            break  # classic single-pass mode
+            outcome.stop_reason = "single-pass mode: one round of candidates"
+            break
 
     # 4. Promote the working point (the last adopted candidate) through the FULL ladder.
     if adopted is None:

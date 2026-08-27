@@ -654,8 +654,6 @@ class InterpreterPortabilityTests(unittest.TestCase):
 
     @unittest.skipUnless(HAVE_BUILD, "g++ and make are required")
     def test_the_rung_passes_with_no_python3_on_path(self) -> None:
-        import sys as _sys
-
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             project, _, _ = _project(

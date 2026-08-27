@@ -418,7 +418,7 @@ def run_convert(args: argparse.Namespace) -> int:
                 RunStatus.BLOCKED,
                 f'NL-only reference generation backend failed: {exc}',
             )
-            raise SystemExit(f"NL-only reference generation failed (LLM backend error): {exc}")
+            raise SystemExit(f"NL-only reference generation failed (LLM backend error): {exc}") from exc
         if not reference:
             controller.finish(
                 RunStatus.FAILED,
@@ -788,7 +788,7 @@ def run_optimize(args: argparse.Namespace) -> int:
             verbose=args.verbose,
         )
     except RuntimeError as exc:
-        raise SystemExit(f"QoR optimization could not run: {exc}")
+        raise SystemExit(f"QoR optimization could not run: {exc}") from exc
     print(outcome.summary)
     print(f"QoR report: {project_dir / 'qor_report.json'} (+ .md" + (" + qor_table.tex)" if outcome.delta else ")"))
     if outcome.rolled_back:
@@ -845,7 +845,7 @@ def run_components(args: argparse.Namespace) -> int:
             spec = get_component(args.component).spec
         except KeyError:
             names = ", ".join(item.name for item in component_specs())
-            raise SystemExit(f"unknown component {args.component!r}; known components: {names}")
+            raise SystemExit(f"unknown component {args.component!r}; known components: {names}") from None
         if args.json:
             print(json.dumps(spec.to_dict(), indent=2))
             return 0
@@ -924,7 +924,7 @@ def run_refine(args: argparse.Namespace) -> int:
             verbose=args.verbose,
         )
     except RefinementError as exc:
-        raise SystemExit(f"coverage refinement could not run: {exc}")
+        raise SystemExit(f"coverage refinement could not run: {exc}") from exc
 
     print(outcome.summary)
     print(f"Refinement report: {project_dir / 'coverage_refinement.json'}")

@@ -245,7 +245,7 @@ class NlSpecTests(unittest.TestCase):
             passing = VerificationState()
             passing.add_phase(PhaseResult("software_equivalence", "pass"))
             passing.add_phase(PhaseResult("trace_consistency", "pass"))
-            with mock.patch("c2hlsc_agent.cli.build_llm_client", return_value=None) as build, mock.patch(
+            with mock.patch("c2hlsc_agent.cli.build_llm_client", return_value=None), mock.patch(
                 "c2hlsc_agent.cli.verify_project", return_value=passing
             ):
                 rc = run_convert(args)
