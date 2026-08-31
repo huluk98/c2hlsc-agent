@@ -33,21 +33,62 @@ def _storage_type(arg: FunctionArg) -> str:
 
 
 def _value_print(expr: str) -> str:
-    return f"static_cast<long long>({expr})"
+    # `static_cast<long long>` does not compile for a struct-typed element; `printable`
+    # is overloaded on arithmetic-ness in the emitted testbench.
+    return f"printable({expr})"
+
+
+# A bound resolved from real constants can be large (Rosetta's spam-filter kernel declares
+# NUM_FEATURES * NUM_TRAINING = 4,608,000 elements). Anything above this is clamped and the
+# clamp is stated in the testbench contract, because a silently-shrunk stimulus is exactly
+# the kind of unsound pass this generator is supposed to make impossible.
+_MAX_TEST_ELEMENTS = 1 << 24
+
+
+def _element_count(arg: FunctionArg) -> int:
+    return min(int(arg.length or 0), _MAX_TEST_ELEMENTS)
+
+
+def _array_declaration(arg: FunctionArg) -> list[str]:
+    """Storage plus a view whose type matches the parameter's declared shape.
+
+    Two things the old flat ``T ref_x[N];`` could not do. It could not bind to a
+    multi-dimensional parameter -- ``bit8*`` does not convert to ``bit8 (*)[256]`` -- and
+    at a real bound it would overflow the stack, since the testbench declares two copies of
+    every argument. Allocating on the heap and casting to the declared shape fixes both.
+    """
+
+    storage_type = _storage_type(arg)
+    count = _element_count(arg)
+    lines: list[str] = []
+    dims = arg.resolved_dims
+    for prefix in ("ref", "hls"):
+        lines.append(f"  std::vector<{storage_type}> {prefix}_{arg.name}_storage({count});")
+        if len(dims) > 1:
+            suffix = "".join(f"[{d}]" for d in dims[1:])
+            lines.append(
+                f"  auto {prefix}_{arg.name} = reinterpret_cast<{storage_type}(*){suffix}>"
+                f"({prefix}_{arg.name}_storage.data());"
+            )
+        else:
+            lines.append(
+                f"  {storage_type}* {prefix}_{arg.name} = {prefix}_{arg.name}_storage.data();"
+            )
+    return lines
 
 
 def _init_array(arg: FunctionArg) -> str:
     if arg.direction == "output":
-        return f"""for (int i = 0; i < {arg.length}; ++i) {{
+        return f"""for (int i = 0; i < {_element_count(arg)}; ++i) {{
       auto v = output_sentinel<{_storage_type(arg)}>(test_idx, i);
-      ref_{arg.name}[i] = v;
-      hls_{arg.name}[i] = v;
+      ref_{arg.name}_storage[i] = v;
+      hls_{arg.name}_storage[i] = v;
     }}"""
     unsigned = "true" if _is_unsigned(arg.c_type) else "false"
-    return f"""for (int i = 0; i < {arg.length}; ++i) {{
+    return f"""for (int i = 0; i < {_element_count(arg)}; ++i) {{
       auto v = patterned_value<{_storage_type(arg)}>(test_idx, i, rng, {unsigned});
-      ref_{arg.name}[i] = v;
-      hls_{arg.name}[i] = v;
+      ref_{arg.name}_storage[i] = v;
+      hls_{arg.name}_storage[i] = v;
     }}"""
 
 
@@ -97,8 +138,8 @@ def _array_trace_lines(current: FunctionArg, arrays: list[FunctionArg]) -> str:
         if arg.name == current.name:
             continue
         lines.append(
-            f"""        if (i < {arg.length}) {{
-          std::cerr << " {arg.name}[i]=" << {_value_print(f'ref_{arg.name}[i]')};
+            f"""        if (i < {_element_count(arg)}) {{
+          std::cerr << " {arg.name}[i]=" << {_value_print(f'ref_{arg.name}_storage[i]')};
         }}"""
         )
     return "\n".join(lines)
@@ -138,10 +179,9 @@ def generate_testbench(analysis: AnalysisResult, config: AgentConfig) -> str:
     contract_comment = _contract_comment(fn.args, fn.return_type, arrays, scalars)
     declarations: list[str] = []
     initializers: list[str] = []
+    array_declarations: list[str] = []
     for arg in arrays:
-        storage_type = _storage_type(arg)
-        declarations.append(f"    {storage_type} ref_{arg.name}[{arg.length}] = {{}};")
-        declarations.append(f"    {storage_type} hls_{arg.name}[{arg.length}] = {{}};")
+        array_declarations.extend(_array_declaration(arg))
         initializers.append("    " + _init_array(arg).replace("\n", "\n    "))
     for arg in scalars:
         declarations.append(f"    {arg.c_type} {arg.name} = {_scalar_decl(arg)};")
@@ -169,18 +209,18 @@ def generate_testbench(analysis: AnalysisResult, config: AgentConfig) -> str:
             compare_var = f"compare_len_{arg.name}"
             if active_len:
                 compare_declarations.append(
-                    f"    const int {compare_var} = clamp_count({_value_print(active_len.name)}, {arg.length});"
+                    f"    const int {compare_var} = clamp_count({_value_print(active_len.name)}, {_element_count(arg)});"
                 )
             else:
-                compare_declarations.append(f"    const int {compare_var} = {arg.length};")
+                compare_declarations.append(f"    const int {compare_var} = {_element_count(arg)};")
             trace_lines = _array_trace_lines(arg, arrays)
             if trace_lines:
                 trace_lines = "\n" + trace_lines
             comparisons.append(f"""    for (int i = 0; i < {compare_var}; ++i) {{
-      if (!values_equal(ref_{arg.name}[i], hls_{arg.name}[i])) {{
+      if (!values_equal(ref_{arg.name}_storage[i], hls_{arg.name}_storage[i])) {{
         std::cerr << "Mismatch test=" << test_idx << " arg={arg.name} index=" << i
-                  << " expected=" << {_value_print(f'ref_{arg.name}[i]')}
-                  << " actual=" << {_value_print(f'hls_{arg.name}[i]')}
+                  << " expected=" << {_value_print(f'ref_{arg.name}_storage[i]')}
+                  << " actual=" << {_value_print(f'hls_{arg.name}_storage[i]')}
                   << " seed={config.seed}"
                   << " compare_len=" << {compare_var}{scalar_context};{trace_lines}
         std::cerr << "\\n";
@@ -193,9 +233,12 @@ def generate_testbench(analysis: AnalysisResult, config: AgentConfig) -> str:
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <iostream>
 #include <limits>
 #include <random>
+#include <type_traits>
+#include <vector>
 
 extern "C" {{
 #define restrict __restrict__
@@ -234,7 +277,38 @@ T bounded_scalar(int test_idx, std::mt19937_64& rng, long long lo, long long hi)
 }}
 
 template <typename T>
-T patterned_value(int test_idx, int element_idx, std::mt19937_64& rng, bool is_unsigned) {{
+typename std::enable_if<std::is_arithmetic<T>::value, long long>::type
+printable(const T& value) {{
+  return static_cast<long long>(value);
+}}
+
+template <typename T>
+typename std::enable_if<!std::is_arithmetic<T>::value, long long>::type
+printable(const T&) {{
+  return 0;  // a struct has no single integer summary; the mismatch index locates it
+}}
+
+template <typename T>
+typename std::enable_if<!std::is_arithmetic<T>::value, T>::type
+patterned_value(int test_idx, int element_idx, std::mt19937_64& rng, bool) {{
+  // Struct-typed argument. Fill the object's bytes deterministically, masking each byte
+  // to 0x3F so that any float or double member lands on a small finite value: an unmasked
+  // fill can produce NaN, and NaN != NaN would be reported as a mismatch that is not one.
+  T value{{}};
+  unsigned char* bytes = reinterpret_cast<unsigned char*>(&value);
+  unsigned long long mix = static_cast<unsigned long long>(test_idx + 1) * 0x9E3779B97F4A7C15ULL
+                         ^ static_cast<unsigned long long>(element_idx + 1) * 0xBF58476D1CE4E5B9ULL;
+  if (test_idx == 0) return value;  // all-zero struct stays a directed case
+  for (size_t i = 0; i < sizeof(T); ++i) {{
+    bytes[i] = static_cast<unsigned char>(((mix >> ((i % 8) * 8)) ^ (i * 31u)) & 0x3F);
+  }}
+  (void)rng;
+  return value;
+}}
+
+template <typename T>
+typename std::enable_if<std::is_arithmetic<T>::value, T>::type
+patterned_value(int test_idx, int element_idx, std::mt19937_64& rng, bool is_unsigned) {{
   if (test_idx == 0) return static_cast<T>(0);
   if (test_idx == 1) return static_cast<T>(~static_cast<unsigned long long>(0));
   if (test_idx == 2 && std::numeric_limits<T>::is_integer) {{
@@ -246,7 +320,19 @@ T patterned_value(int test_idx, int element_idx, std::mt19937_64& rng, bool is_u
 }}
 
 template <typename T>
-T output_sentinel(int test_idx, int element_idx) {{
+typename std::enable_if<!std::is_arithmetic<T>::value, T>::type
+output_sentinel(int test_idx, int element_idx) {{
+  T value{{}};
+  unsigned char* bytes = reinterpret_cast<unsigned char*>(&value);
+  for (size_t i = 0; i < sizeof(T); ++i) {{
+    bytes[i] = static_cast<unsigned char>(((test_idx * 7 + element_idx * 13 + i * 3) & 0x3F) | 0x10);
+  }}
+  return value;
+}}
+
+template <typename T>
+typename std::enable_if<std::is_arithmetic<T>::value, T>::type
+output_sentinel(int test_idx, int element_idx) {{
   unsigned long long value = 0x9E3779B97F4A7C15ULL;
   value ^= static_cast<unsigned long long>(test_idx + 1) * 0xBF58476D1CE4E5B9ULL;
   value ^= static_cast<unsigned long long>(element_idx + 1) * 0x94D049BB133111EBULL;
@@ -254,7 +340,14 @@ T output_sentinel(int test_idx, int element_idx) {{
 }}
 
 template <typename T>
-bool values_equal(T a, T b) {{
+typename std::enable_if<!std::is_arithmetic<T>::value, bool>::type
+values_equal(const T& a, const T& b) {{
+  return std::memcmp(&a, &b, sizeof(T)) == 0;
+}}
+
+template <typename T>
+typename std::enable_if<std::is_arithmetic<T>::value, bool>::type
+values_equal(T a, T b) {{
   if (std::numeric_limits<T>::is_integer) {{
     return a == b;
   }}
@@ -274,6 +367,9 @@ int clamp_count(long long value, int limit) {{
 
 int main() {{
   std::mt19937_64 rng({config.seed}ULL);
+// Argument storage is allocated once, not per test: at a real bound these are tens of
+// megabytes, and the testbench holds two copies of every argument.
+{chr(10).join(array_declarations)}
   for (int test_idx = 0; test_idx < {config.num_tests}; ++test_idx) {{
 {chr(10).join(declarations)}
 {chr(10).join(initializers)}

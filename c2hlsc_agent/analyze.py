@@ -15,6 +15,13 @@ class FunctionArg:
     c_type: str
     pointer_depth: int = 0
     array_dims: list[str] = field(default_factory=list)
+    resolved_dims: list[int] = field(default_factory=list)
+    """Each declared dimension as an integer, once named constants are resolved.
+
+    ``length`` is their product. Keeping the shape as well as the total is what lets the
+    testbench declare ``T x[H][W]`` instead of a flat ``T x[H*W]``, which is the only
+    form a ``T (*)[W]`` parameter will bind to."""
+
     is_const: bool = False
     direction: str = "input"
     length: int | None = None
@@ -257,27 +264,30 @@ def _parse_arg(
         metadata = ArgumentConfig()
     direction = metadata.direction or ("input" if is_const or pointer_depth == 0 and not array_dims else "inout")
     length = metadata.length
+    resolved_dims: list[int] = []
     if length is None:
         # The bound may be a literal, a named constant, or an expression over them
         # (`NUM_FEATURES * NUM_TRAINING`). Multi-dimensional arrays contribute the product
         # of their dimensions, so `length` stays the total element count.
         total = 1
-        resolved_any = False
+        dims: list[int] = []
         for dim in array_dims:
             value = evaluate_constant(dim, constants or {})
             if value is None:
-                resolved_any = False
+                dims = []
                 break
             total *= value
-            resolved_any = True
-        if resolved_any:
+            dims.append(value)
+        if dims:
             length = total
+            resolved_dims = dims
     return FunctionArg(
         raw=raw,
         name=name,
         c_type=c_type,
         pointer_depth=pointer_depth,
         array_dims=array_dims,
+        resolved_dims=resolved_dims,
         is_const=is_const,
         direction=direction,
         length=length,
