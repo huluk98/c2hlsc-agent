@@ -204,6 +204,27 @@ def load_prior_rows(path: Path) -> "list[dict[str, Any]]":
     return list(by_design.values())
 
 
+def row_has_llm_error(row: "dict[str, Any]") -> bool:
+    """Whether any requested sample in a saved design row lost its model call.
+
+    A design with one good sample and one backend error is still incomplete: retaining it
+    would bias pass@1 even if it already satisfies pass@k. On resume the whole design is
+    regenerated so every arm still contains the configured number of independent samples.
+    """
+
+    if row.get("llm_error"):
+        return True
+    for sample in row.get("samples") or ():
+        if not isinstance(sample, dict):
+            continue
+        if sample.get("llm_error"):
+            return True
+        for attempt in sample.get("rounds") or ():
+            if isinstance(attempt, dict) and attempt.get("llm_error"):
+                return True
+    return False
+
+
 #: Row fields that must agree across a resumed sweep. Every one of them changes what the
 #: numbers MEAN, and ``build_report`` stamps the report with the *final* invocation's config
 #: for all rows -- so mixing them produces a report that misdescribes its own contents.
@@ -1760,6 +1781,28 @@ def main(argv: "list[str] | None" = None) -> int:
     if args.resume:
         prior = load_prior_rows(results_path)
         check_resume_compatible(prior, mode, run_config, results_path)
+        retry_names = {
+            row["design"] for row in prior
+            if mode == "llm" and row_has_llm_error(row)
+        }
+        if retry_names:
+            # Preserve the exact outage-contaminated file before replacing it with a
+            # canonical checkpoint containing only complete rows. Appending retries while
+            # leaving the error rows in place creates duplicate designs for consumers that
+            # read JSONL directly instead of applying this runner's last-row-wins rule.
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            backup = results_path.with_name(
+                f"{results_path.name}.backend-errors.{stamp}.{os.getpid()}.bak"
+            )
+            shutil.copy2(results_path, backup)
+            prior = [row for row in prior if row.get("design") not in retry_names]
+            text = "".join(json.dumps(row, sort_keys=True) + "\n" for row in prior)
+            _atomic_write(results_path, text)
+            print(
+                f"resume: preserved {len(retry_names)} backend-error design row(s) in "
+                f"{backup.name}; they will be regenerated",
+                flush=True,
+            )
         done = {row["design"] for row in prior}
         wanted = set(selected_names)
         # Rows for designs outside this selection stay in the file but out of the report.

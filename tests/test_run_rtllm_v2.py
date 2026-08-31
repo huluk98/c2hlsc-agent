@@ -955,6 +955,40 @@ class BackendOutageTests(DriverTestCase):
         report = json.loads((self.out / "report.json").read_text(encoding="utf-8"))
         self.assertEqual(report["llm_error_designs"], ["bbb_counter"])
 
+    def test_resume_replaces_backend_error_rows_and_preserves_the_outage_file(self):
+        def first_hook(design: RtllmDesign) -> DesignResult:
+            if design.name == "bbb_counter":
+                return self._llm_error_row(design.name, design.category)
+            return make_design_result(design.name, design.category, [True])
+
+        with self.patch_discovery(), self.patch_run_design(first_hook), mock.patch.object(
+            driver, "build_llm_client", return_value=object()
+        ):
+            code, _ = run_main(
+                ["--benchmark", str(self.bench), "--out-dir", str(self.out)]
+            )
+        self.assertEqual(code, 3)
+
+        second = self.patch_run_design()
+        with self.patch_discovery(), second, mock.patch.object(
+            driver, "build_llm_client", return_value=object()
+        ):
+            code, output = run_main(
+                ["--benchmark", str(self.bench), "--out-dir", str(self.out), "--resume"]
+            )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(second.calls, ["bbb_counter"])  # type: ignore[attr-defined]
+        self.assertIn("preserved 1 backend-error design row", output)
+        rows = read_jsonl(self.out / "results.jsonl")
+        self.assertEqual(sorted(row["design"] for row in rows), sorted(self.design_names))
+        self.assertEqual(len(rows), len(self.design_names), "resume must not leave duplicates")
+        backups = list(self.out.glob("results.jsonl.backend-errors.*.bak"))
+        self.assertEqual(len(backups), 1)
+        self.assertIn("bbb_counter", backups[0].read_text(encoding="utf-8"))
+        report = json.loads((self.out / "report.json").read_text(encoding="utf-8"))
+        self.assertEqual(report["llm_error_designs"], [])
+
 
 class ResumeCompatibilityTests(DriverTestCase):
     def _argv(self, *extra: str) -> "list[str]":

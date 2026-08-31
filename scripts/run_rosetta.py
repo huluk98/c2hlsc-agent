@@ -45,6 +45,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from pathlib import Path
 
 ROSETTA_URL = "https://github.com/cornell-zhang/rosetta.git"
@@ -368,6 +369,9 @@ class AgentResult:
     project_dir: str | None = None
     xilinx_followup_cmd: str | None = None
     notes: list[str] = field(default_factory=list)
+    #: A failed model call followed by a deterministic fallback is not a model result.
+    #: ``--resume`` regenerates rows carrying this field.
+    llm_error: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         payload = dict(self.__dict__)
@@ -534,6 +538,32 @@ def classify_agent(report: dict, log_text: str, project: Path, top: str, kernel_
     return "generated", walls[0][0], walls
 
 
+_LLM_FALLBACK_RE = re.compile(
+    r"^- (LLM (?:generation attempt .*? failed .*|HLS-C generation requested .*?fell back .*?))$",
+    re.M,
+)
+
+
+def _llm_fallback_reason(project: Path) -> str | None:
+    report = project / "conversion_report.md"
+    if not report.exists():
+        return None
+    try:
+        text = report.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    match = _LLM_FALLBACK_RE.search(text)
+    return match.group(1).strip() if match else None
+
+
+def _saved_llm_error(payload: dict) -> str | None:
+    value = payload.get("llm_error")
+    if value:
+        return str(value)
+    project_dir = payload.get("project_dir")
+    return _llm_fallback_reason(Path(project_dir)) if project_dir else None
+
+
 def render_agent_config(app: RosettaApp) -> str:
     """The ``--config`` the conversion runs under.
 
@@ -635,6 +665,15 @@ def run_agent(app: RosettaApp, out_dir: Path, args: argparse.Namespace) -> Agent
         result.duration_s = round(time.time() - started, 2)
         return result
 
+    if args.use_llm:
+        result.llm_error = _llm_fallback_reason(project)
+        if result.llm_error:
+            result.rung = "generated" if project.exists() else "analyzed"
+            result.failure_family = "llm_error"
+            result.evidence = result.llm_error
+            result.duration_s = round(time.time() - started, 2)
+            return result
+
     equivalence_log = project / "software_equivalence.log"
     log_text = (equivalence_log.read_text(encoding="utf-8", errors="replace")
                 if equivalence_log.exists() else combined)
@@ -715,6 +754,7 @@ def _summarise_agent(rows: list[AgentResult], apps: int, elapsed: float, resumed
         "completed": len(rows),
         "resumed": resumed,
         "passed": sum(1 for r in rows if r.ok),
+        "llm_error_apps": [r.app for r in rows if r.llm_error],
         "rung_reached": reached,
         "failure_families": families,
         "walls": walls,
@@ -835,13 +875,35 @@ def main(argv: list[str] | None = None) -> int:
     prior: dict[str, AppResult | AgentResult] = {}
     if args.resume and results_path.exists():
         wanted = {a.name for a in apps}
+        saved: dict[str, dict] = {}
         for line in results_path.read_text(encoding="utf-8").splitlines():
             try:
                 payload = json.loads(line)
                 name = payload["app"]
             except (json.JSONDecodeError, KeyError, TypeError):
                 continue
-            done.add(name)
+            saved[name] = payload
+        retry_names = {
+            name for name, payload in saved.items()
+            if agent_mode and args.use_llm and _saved_llm_error(payload)
+        }
+        if retry_names:
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            backup = results_path.with_name(
+                f"{results_path.name}.backend-errors.{stamp}.{os.getpid()}.bak"
+            )
+            shutil.copy2(results_path, backup)
+            saved = {name: payload for name, payload in saved.items() if name not in retry_names}
+            text = "".join(json.dumps(payload, sort_keys=True) + "\n" for payload in saved.values())
+            tmp = results_path.with_name(f"{results_path.name}.{os.getpid()}.tmp")
+            tmp.write_text(text, encoding="utf-8")
+            os.replace(tmp, results_path)
+            log(
+                f"resume: preserved {len(retry_names)} backend-error app row(s) in "
+                f"{backup.name}; they will be regenerated"
+            )
+        done = set(saved)
+        for name, payload in saved.items():
             row = rebuild_row(payload)
             # Rows for apps outside this selection stay in the file but out of the report;
             # the last row for an app wins if it was recorded more than once.
@@ -900,13 +962,19 @@ def main(argv: list[str] | None = None) -> int:
             f"rungs {summary['rung_reached']}")
         if summary["walls"]:
             log("walls: " + ", ".join(f"{k}={v}" for k, v in sorted(summary["walls"].items())))
+        if summary["llm_error_apps"]:
+            log(
+                "backend errors (not model results): "
+                + ", ".join(summary["llm_error_apps"])
+                + "; rerun with --resume"
+            )
     else:
         log(f"\nsw: built {summary['built']}/{summary['completed']}, ran {summary['ran']}, "
             f"passed {summary['passed']}/{summary['judged']} judged")
         if summary["no_trustworthy_oracle"]:
             log("no trustworthy oracle (excluded): " + ", ".join(summary["no_trustworthy_oracle"]))
     log(f"report: {out_dir / 'report.md'}")
-    return 0
+    return 3 if agent_mode and summary["llm_error_apps"] else 0
 
 
 if __name__ == "__main__":

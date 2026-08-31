@@ -79,6 +79,28 @@ def read_rows(results_path: Path) -> "list[dict]":
     return rows
 
 
+def saved_llm_error(row: dict) -> str | None:
+    """Backend failure recorded directly, or recoverable from older HLS-C artifacts."""
+
+    if row.get("llm_error"):
+        return str(row["llm_error"])
+    project_dir = row.get("project_dir")
+    if not project_dir:
+        return None
+    report = Path(project_dir) / "conversion_report.md"
+    if not report.exists():
+        return None
+    try:
+        for line in report.read_text(encoding="utf-8", errors="replace").splitlines():
+            if line.startswith("- LLM generation attempt ") and " failed [" in line:
+                return line[2:].strip()
+            if line.startswith("- LLM HLS-C generation requested ") and "fell back" in line:
+                return line[2:].strip()
+    except OSError:
+        return None
+    return None
+
+
 def normalise_rtllm(row: dict, sweep: str, results_path: Path) -> dict:
     """One design's aggregate over its samples.
 
@@ -92,8 +114,15 @@ def normalise_rtllm(row: dict, sweep: str, results_path: Path) -> dict:
     passed = row.get("func_success")
     samples = row.get("samples") or []
     strict = sum(1 for s in samples if s.get("func_pass_strict"))
+    llm_errors = sum(1 for s in samples if s.get("llm_error"))
 
-    if passed is None:
+    # A mixed row (one valid sample, one backend failure) is no more complete than a row
+    # where every call failed: pass@1 is biased even if pass@k is already green. Keep the
+    # artifacts and counts, but do not let the design enter pass/fail totals until resume
+    # has regenerated all configured samples.
+    if llm_errors:
+        verdict = "unknown"
+    elif passed is None:
         verdict = "unknown"
     elif passed > 0:
         verdict = "pass"
@@ -118,7 +147,7 @@ def normalise_rtllm(row: dict, sweep: str, results_path: Path) -> dict:
         "syntax_success": row.get("syntax_success"),
         "evidence_policy": row.get("evidence_policy"),
         "oracle_derived_evidence": row.get("oracle_derived_evidence"),
-        "llm_errors": sum(1 for s in samples if s.get("llm_error")),
+        "llm_errors": llm_errors,
         "duration_s": row.get("wall_s"),
         "artifacts": {"results_jsonl": str(results_path)},
     }
@@ -132,7 +161,10 @@ def normalise(row: dict, suite: str, sweep: str, results_path: Path) -> dict:
         return {"suite": suite, "sweep": sweep, "id": None, "verdict": "unknown"}
 
     ok = row.get(schema["ok_field"])
-    if ok is True:
+    llm_error = saved_llm_error(row)
+    if llm_error:
+        verdict = "unknown"
+    elif ok is True:
         verdict = "pass"
     elif ok is False:
         verdict = "fail"
@@ -151,6 +183,7 @@ def normalise(row: dict, suite: str, sweep: str, results_path: Path) -> dict:
         "id": row.get(schema["id_field"]),
         "verdict": verdict,
         "failure_family": row.get(schema["family_field"]),
+        "llm_error": llm_error,
         "artifacts": artifacts,
     }
     if schema["rung_field"]:

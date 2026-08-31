@@ -911,6 +911,54 @@ class DriverTests(TempTreeTestCase):
         self.assertIn("no CHStone benchmarks", str(ctx.exception))
 
 
+class AgentResumeTests(TempTreeTestCase):
+    def test_resume_retries_a_saved_llm_error_and_preserves_the_outage_file(self):
+        self.out.mkdir(parents=True)
+        old_project = self.out / "old" / "project"
+        old_project.mkdir(parents=True)
+        (old_project / "conversion_report.md").write_text(
+            "- LLM generation attempt 1 failed [RuntimeError: claude CLI failed: quota].\n",
+            encoding="utf-8",
+        )
+        failed = driver.BenchmarkResult(
+            benchmark="adpcm", mode="agent", rung="generated", ok=False,
+            failure_family="generated_hlsc_does_not_compile", project_dir=str(old_project),
+        )
+        complete = driver.BenchmarkResult(
+            benchmark="jpeg", mode="agent", rung="host_equivalence", ok=True,
+        )
+        (self.out / "results.jsonl").write_text(
+            json.dumps(failed.to_dict()) + "\n" + json.dumps(complete.to_dict()) + "\n",
+            encoding="utf-8",
+        )
+        calls: "list[str]" = []
+
+        def fake_run(bench, out_dir, args):
+            calls.append(bench.name)
+            return driver.BenchmarkResult(
+                benchmark=bench.name, mode="agent", rung="generated", ok=False,
+                failure_family="generated_hlsc_does_not_compile",
+            )
+
+        argv = [
+            "--benchmark", str(self.bench), "--out-dir", str(self.out),
+            "--benchmarks", "adpcm", "jpeg", "--use-llm", "--resume",
+        ]
+        with mock.patch.object(driver, "run_agent_staged", fake_run):
+            code, output = run_main(argv)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(calls, ["adpcm"])
+        self.assertIn("preserved 1 backend-error benchmark row", output)
+        rows = read_jsonl(self.out / "results.jsonl")
+        self.assertEqual(sorted(row["benchmark"] for row in rows), ["adpcm", "jpeg"])
+        self.assertEqual(len(rows), 2)
+        backups = list(self.out.glob("results.jsonl.backend-errors.*.bak"))
+        self.assertEqual(len(backups), 1)
+        saved = read_jsonl(backups[0])
+        self.assertEqual(saved[0]["project_dir"], str(old_project))
+
+
 class ParserTests(unittest.TestCase):
     def test_every_documented_flag_parses(self):
         args = driver.build_parser().parse_args([

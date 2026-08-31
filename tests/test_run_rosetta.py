@@ -814,6 +814,53 @@ class AgentModeTests(TempTreeTestCase):
         self.assertEqual(rebuilt.to_dict(), row.to_dict())
         self.assertIsNone(driver.agent_row_from_dict({"nothing": True}))
 
+    def test_resume_retries_a_saved_llm_error_and_preserves_the_outage_file(self):
+        self.out.mkdir(parents=True)
+        old_project = self.out / "old" / "project"
+        old_project.mkdir(parents=True)
+        (old_project / "conversion_report.md").write_text(
+            "- LLM HLS-C generation requested (model=opus) but unavailable; fell back to copy.\n",
+            encoding="utf-8",
+        )
+        failed = driver.AgentResult(
+            app="3d-rendering", generator="llm", rung="generated", ok=False,
+            failure_family="generated_hlsc_does_not_compile", project_dir=str(old_project),
+        )
+        complete = driver.AgentResult(
+            app="digit-recognition", generator="llm", rung="host_equivalence", ok=True,
+        )
+        (self.out / "results.jsonl").write_text(
+            json.dumps(failed.to_dict()) + "\n" + json.dumps(complete.to_dict()) + "\n",
+            encoding="utf-8",
+        )
+        calls: "list[str]" = []
+
+        def fake_run(app, out_dir, args):
+            calls.append(app.name)
+            return driver.AgentResult(
+                app=app.name, generator="llm", rung="generated", ok=False,
+                failure_family="generated_hlsc_does_not_compile",
+            )
+
+        argv = [
+            "--benchmark", str(self.bench), "--out-dir", str(self.out),
+            "--apps", "3d-rendering", "digit-recognition", "--agent", "--use-llm",
+            "--resume",
+        ]
+        with mock.patch.object(driver, "run_agent", fake_run):
+            code, output = run_main(argv)
+
+        self.assertEqual(code, 0)
+        self.assertEqual(calls, ["3d-rendering"])
+        self.assertIn("preserved 1 backend-error app row", output)
+        rows = read_jsonl(self.out / "results.jsonl")
+        self.assertEqual(sorted(row["app"] for row in rows), ["3d-rendering", "digit-recognition"])
+        self.assertEqual(len(rows), 2)
+        backups = list(self.out.glob("results.jsonl.backend-errors.*.bak"))
+        self.assertEqual(len(backups), 1)
+        saved = read_jsonl(backups[0])
+        self.assertEqual(saved[0]["project_dir"], str(old_project))
+
 
 if __name__ == "__main__":
     unittest.main()
