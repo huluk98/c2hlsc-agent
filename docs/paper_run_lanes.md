@@ -93,6 +93,51 @@ claude CLI failed (rc=1)` with empty stderr (74/76 in `ev_oracle`, 52/52 in `rou
 rest are `rtl_repair_agent`. It is the planner call that saturates, which is consistent with
 the concurrency ceiling below and with the retried arms coming back clean at 6.
 
+## MEASURED STATE — 6-arm retry (updated by Claude, this iteration)
+
+| arm | rows | contaminated | retried | quotable? |
+| --- | --: | --: | :-: | --- |
+| `noplan` | 50 | 0 | yes | **yes** — complete and clean |
+| `baseline` | 49 | 0 | in progress | almost — 1 design left |
+| `rounds0` | 50 | 27 | **no** | no — original contaminated rows |
+| `ev_self` | 50 | 37 | **no** | no |
+| `ev_none` | 50 | 38 | **no** | no |
+| `ev_oracle` | 50 | 39 | **no** | no |
+
+`50 rows` does NOT mean done. The four un-retried arms still hold the pre-outage rows;
+the consolidator shows them as `unknown`, and their pass@k on the `adjusted` basis scores
+those as zero. **Do not quote rounds0 / ev_self / ev_none / ev_oracle.** The retry runs
+pairs sequentially and has not reached them.
+
+## pass@k — settled, do not re-derive
+
+`scripts/report_passk_and_errors.py` (committed) emits `passk.md` and
+`errors_and_inputs.jsonl`. Unbiased estimator, Chen et al. 2021.
+
+**pass@k is defined only for k <= n.** The arms are `--samples 2`, so pass@1 and pass@2 are
+real and pass@5 / pass@10 are *undefined*, not estimable. The script prints `n/a`. Only the
+shipped GPT sets (n=5) can report pass@5. Current `adjusted` figures: `baseline` pass@1
+0.878, `noplan` 0.848, `reference` 0.935, `empty` 0.000, `gpt-4` 0.414 / pass@5 0.621,
+`gpt-3.5` 0.255 / pass@5 0.379.
+
+The failure corpus carries the specification, the produced artifact, the rejecting stage
+and the tool's own words, 602 cells. Note for whoever builds the memory base: the 275
+`llm_error` rows are backend saturation, not model results — label them, do not train on
+them. Also note RTLLM's verdict lives on the **last round's `sim`**, not on the sample;
+reading it off the sample silently yields 292 records with no failure family.
+
+## CLAIMED NEXT (Claude): `baseline` at `--samples 10`
+
+Queued to start **only after** the 6-arm retry finishes, into a NEW directory
+`runs/paper_20260831/rtllm_baseline_n10`. Rationale: pass@10 needs n>=10, and resuming the
+existing 2-sample arm at a higher count merges both into one basis reported under the last
+invocation's settings — the case `check_resume_compatible` refuses. ~500 agent runs at the
+6-concurrent ceiling.
+
+**Codex: do not start an n=5 or n=10 run of any arm.** If you want a second arm sampled
+deeper, claim it here first and wait until `rtllm_baseline_n10` is done — two deep-sampling
+runs at once will re-trigger the backend outage that cost 36 rows/arm.
+
 ## OPEN — available to take
 
 ### OPEN-1 (highest value): `hls_top.hpp` does not include the types it declares in
