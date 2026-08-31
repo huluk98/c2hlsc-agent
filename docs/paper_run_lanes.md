@@ -1,14 +1,19 @@
 # Work lanes — paper_20260831
 
-Two agents are working this run root, across four checkouts (see "Worktree map" below).
+Two agents worked this run root across isolated checkouts (see "Worktree map" below).
 This file is the claim register: **take only work listed as OPEN, and edit this file to
-claim it before you start.** Last updated by the Claude session driving the sweeps.
+claim it before you start.** Final state recorded by Codex after the bounded handoff.
+
+> **Final handoff, 19:35 on 2026-08-31:** no RTLLM writer or deep-sampling queue remains.
+> Codex stopped the bounded retry after Claude CLI saturation reappeared. Baseline,
+> no-plan, and no-repair are complete and clean; the three evidence-policy arms are
+> incomplete/contaminated and must not be scored. Codex owns all further work.
 
 ## Worktree map
 
 | path | branch | state |
 | --- | --- | --- |
-| `C:\Users\luke\c2hlsc-rtllm` | `fix/self-contained-translation-unit` | Claude, **active** — owns the sweeps and this file |
+| `C:\Users\luke\c2hlsc-rtllm` | `fix/self-contained-translation-unit` | Claude, **stopped** — frozen source artifacts; no writer remains |
 | `C:\Users\luke\c2hlsc-vitis-qor` | `codex/vitis-qor-authority` | Codex, **active** — clean tree, `104056c` committed 17:04 |
 | `C:\Users\luke\c2hlsc-final` | `codex/final-integration` | Codex, **lead integration** — Vitis and Claude branches merged; owns final validation and report |
 | `C:\Users\luke\c2hlsc-agent` | `claude/combined-generation-workflow` | idle; only untracked `.claude/`, `results/`, `tests/fixtures/` |
@@ -31,7 +36,7 @@ that directory.
 
 | lane | state | artifacts |
 | --- | --- | --- |
-| RTLLM 6-arm sweep (`baseline`, `no-plan`, `rounds=0`, `evidence=self/none/oracle`) | **RUNNING NOW — DO NOT START `scripts/resume_paper_20260831.ps1` AGAINST THIS RUN ROOT** | `rtllm_*/results.jsonl`, `arm_*.retry.log` |
+| RTLLM 6-arm sweep (`baseline`, `no-plan`, `rounds=0`, `evidence=self/none/oracle`) | **STOPPED AT QUOTA/TRANSPORT CEILING — do not resume this run root** | Three complete clean arms; three evidence arms frozen unscored in `rtllm_*/results.jsonl` |
 | RTLLM baselines (`--reference`, `--empty-baseline`) | DONE — 47/50 and 4/50, reproduce published | `rtllm_reference/`, `rtllm_empty/` |
 | RTLLM external sets (gpt-4, gpt-3.5) | DONE — 0.414 / 0.255 pass@1, reproduce published | `rtllm_ext_gpt-4/`, `rtllm_ext_gpt-35/` |
 | CHStone `chstone_main` arms (det + LLM ×2) | DONE — det 6/12; LLM **7/12 clean** both samples (see below) | `chstone_det/`, `chstone_llm_s*/` |
@@ -44,22 +49,22 @@ that directory.
 | lane | state | worktree / branch | files and artifacts |
 | --- | --- | --- | --- |
 | Vitis-only QoR authority and `--target-clock-ns` | **COMMITTED 17:04** as `104056c`, branched off Claude's `5809f2c` — merges clean, unmerged to `main` | `C:\Users\luke\c2hlsc-vitis-qor` / `codex/vitis-qor-authority` | `README.md`, `c2hlsc_agent/{cli,qor,qor_optimizer}.py`, `tests/test_qor.py`, `docs/paper_20260831_continuation.md`; validation artifact only under `C:\Users\luke\runs_win\chstone_final\benchmarks\dfmul\project\qor_report.*` |
-| Lead integration, independent validation, final merged report, and OPEN-1 | **ACTIVE under Codex** — Vitis work merged at `68ca828`; Claude remains limited to the already-running sweep | `C:\Users\luke\c2hlsc-codex-main` / `codex/main-integration` | Codex owns code integration, post-sweep consolidation, report QA, and the account-accessible Markdown handoff |
+| Lead integration, independent validation, final merged report, and OPEN-1 | **FINALISING under Codex** — Vitis work merged at `68ca828`; Claude sweep is stopped | `C:\Users\luke\c2hlsc-final` / `codex/final-integration` | Codex owns code integration, consolidation, report QA, and the account-accessible Markdown handoff |
 
-Codex will not start or write any `runs\paper_20260831\rtllm_*` sweep. Claude owns those
-checkpoint writers until the live retry completes. Codex is the lead agent and owns all
-integration and validation; do not assign Claude new work after the bounded sweep. Neither
-agent should copy or overwrite the other's worktree files.
+Codex did not start or write any `runs\paper_20260831\rtllm_*` sweep. Claude owned those
+checkpoint writers until the bounded retry stopped. Codex is the lead agent and owns all
+integration, validation, and reporting; do not assign Claude new work without a new,
+explicitly bounded lane.
 
 **Do not rerun any sweep in this run root.** They append to `results.jsonl` and a
 concurrent writer corrupts the resume checkpoint. If a sweep needs redoing, say so here
 and let the holder do it.
 
-## Live collision warning
+## Historical collision log — superseded by final handoff
 
-A Claude-side retry is **in flight** (verified 17:09 on 2026-08-31: PIDs 18676/2580 are the
+A Claude-side retry was **in flight** (verified 17:09 on 2026-08-31: PIDs 18676/2580 were the
 `.venv` shims, 19088/7276 the real interpreters — one logical writer per arm, no collision).
-It runs `run_rtllm_v2.py --resume`, two arms at a time, three workers each, in the order
+It ran `run_rtllm_v2.py --resume`, two arms at a time, three workers each, in the order
 baseline+noplan, rounds0+ev_self, ev_none+ev_oracle. Backups are taken (e.g.
 `rtllm_baseline/results.jsonl.backend-errors.20260831T084534Z.19088.bak`).
 
@@ -67,7 +72,7 @@ baseline+noplan, rounds0+ev_self, ev_none+ev_oracle. Backups are taken (e.g.
 into the same `results.jsonl` and destroys the resume checkpoint.** Whoever reads this
 second: leave the RTL retry alone and take an OPEN item below.
 
-### Retry progress, measured 17:09
+### Historical retry progress, measured 17:09
 
 The lower concurrency is working: the two retried arms have produced **zero** `llm_error`
 cells so far, against 52–76 in every arm still queued.
@@ -128,21 +133,23 @@ construct no model and are excluded rather than compared.
 analyse the result — regenerate the odd arm into a fresh `--out-dir` under the settings
 above. This applies to any future deep-sampling arm as much as to anything Codex adds.
 
-## MEASURED STATE — 6-arm retry (updated by Claude, this iteration)
+## FINAL MEASURED STATE — bounded retry frozen at 19:35
 
 | arm | rows | contaminated | retried | quotable? |
 | --- | --: | --: | :-: | --- |
 | `noplan` | 50 | 0 | yes | **yes** — complete and clean |
-| `baseline` | 49 | 0 | in progress | almost — 1 design left |
-| `rounds0` | 50 | 27 | **no** | no — original contaminated rows |
-| `ev_self` | 50 | 37 | **no** | no |
-| `ev_none` | 50 | 38 | **no** | no |
+| `baseline` | 50 | 0 | yes | **yes** — complete and clean |
+| `rounds0` | 50 | 0 | yes | **yes** — complete and clean |
+| `ev_self` | 34 | 0 | partial | no — 16 designs unrun; surviving subset is selection-biased |
+| `ev_none` | 13 | 0 | partial | no — 37 designs unrun; surviving subset is selection-biased |
 | `ev_oracle` | 50 | 39 | **no** | no |
 
-`50 rows` does NOT mean done. The four un-retried arms still hold the pre-outage rows;
-the consolidator shows them as `unknown`, and their pass@k on the `adjusted` basis scores
-those as zero. **Do not quote rounds0 / ev_self / ev_none / ev_oracle.** The retry runs
-pairs sequentially and has not reached them.
+`50 rows` does not by itself mean done: `ev_oracle` still holds pre-outage rows and the
+consolidator marks 39 of them `unknown`. **Do not quote ev_self / ev_none / ev_oracle.**
+The completed baseline, no-plan, and no-repair arms each contain 50 unique designs,
+100 samples, and zero backend-error cells. A detached Claude launcher briefly resumed
+`ev_self` and `ev_none` after the first stop; Codex stopped it, froze the counts above,
+regenerated all consolidated outputs, and changed the launcher to require explicit opt-in.
 
 ## pass@k — settled, do not re-derive
 
@@ -151,8 +158,9 @@ pairs sequentially and has not reached them.
 
 **pass@k is defined only for k <= n.** The arms are `--samples 2`, so pass@1 and pass@2 are
 real and pass@5 / pass@10 are *undefined*, not estimable. The script prints `n/a`. Only the
-shipped GPT sets (n=5) can report pass@5. Current `adjusted` figures: `baseline` pass@1
-0.878, `noplan` 0.848, `reference` 0.935, `empty` 0.000, `gpt-4` 0.414 / pass@5 0.621,
+shipped GPT sets (n=5) can report pass@5. Final quotable `adjusted` figures: `baseline`
+pass@1/pass@2 0.870/0.935, `noplan` 0.848/0.913, `rounds0` 0.641/0.674,
+`reference` pass@1 0.935, `empty` 0.000, `gpt-4` 0.414 / pass@5 0.621, and
 `gpt-3.5` 0.255 / pass@5 0.379.
 
 The failure corpus carries the specification, the produced artifact, the rejecting stage
@@ -267,8 +275,9 @@ symbol-collision and C-not-valid-C++ casualties -- now pass, which is this branc
 - **`LFSR` is the only port-order trap in RTLLM.** 4 of 50 testbenches bind positionally;
   on `alu`, `pe` and `float_multi` the reference's declaration order is the spec's order.
   Shimmed to bind by name; validated against reference, spec-order, and two wrong RTLs.
-- **The backend saturates at ~12 concurrent `claude` CLI processes.** That produced 36
-  `llm_error` rows per arm. Keep total concurrency at or below 6.
+- **The backend saturated at ~12 concurrent `claude` CLI processes and later returned
+  transport failures at lower concurrency as quota pressure accumulated.** Keep future
+  Claude work bounded and separate from Codex integration.
 - **`--resume` does retry `llm_error` rows.** It backs them up to
   `results.jsonl.backend-errors.*.bak`, drops them, and regenerates. Good rows survive.
 - **Vitis HLS 2024.2 and Vivado 2024.2 work here** (`D:\Xilinx\...`). The full
