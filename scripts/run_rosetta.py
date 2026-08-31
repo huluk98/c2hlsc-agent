@@ -352,6 +352,11 @@ class AgentResult:
     ran: bool = False                 # the equivalence testbench executed
     oracle: str = "original_sw_kernel"
     xilinx_available: bool = False
+    #: Per-phase Vitis status when --run-vitis ran; None means the rung was not attempted.
+    csim: str | None = None
+    csynth: str | None = None
+    cosim: str | None = None
+    vitis_ok: bool | None = None
     rungs_not_attempted: tuple[str, ...] = XILINX_RUNGS
     failure_family: str | None = None
     walls: list[str] = field(default_factory=list)
@@ -596,7 +601,7 @@ def run_agent(app: RosettaApp, out_dir: Path, args: argparse.Namespace) -> Agent
         "--top", top,
         "--out", str(project),
         "--config", str(config_path),
-        "--no-run-vitis",
+        "--run-vitis" if getattr(args, "run_vitis", False) else "--no-run-vitis",
     ]
     if args.keep_going:
         cmd.append("--keep-going")
@@ -640,6 +645,15 @@ def run_agent(app: RosettaApp, out_dir: Path, args: argparse.Namespace) -> Agent
             report = json.loads(report_path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
             report = {}
+
+    if getattr(args, "run_vitis", False):
+        for phase in ("csim", "csynth", "cosim"):
+            status = report.get(phase)
+            setattr(result, phase, str(status) if status is not None else None)
+        result.xilinx_available = result.csim is not None
+        result.vitis_ok = all(
+            getattr(result, phase) == "pass" for phase in ("csim", "csynth", "cosim")
+        )
 
     rung, family, walls = classify_agent(report, log_text, project, top, kernel_source)
     result.rung = rung
@@ -787,6 +801,13 @@ def build_parser() -> argparse.ArgumentParser:
                              "--use-llm: the mechanical repairs need no model)")
     parser.add_argument("--max-iterations", type=int, default=2)
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
+    parser.add_argument(
+        "--run-vitis",
+        action="store_true",
+        help="continue past host equivalence into Vitis CSim/CSynth/CoSim. The convert "
+             "command repairs against the failing phase. Requires vitis_hls on PATH or "
+             "C2HLSC_VITIS_BIN.",
+    )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--verbose", action="store_true")
     return parser

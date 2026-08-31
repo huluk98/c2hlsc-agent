@@ -81,8 +81,17 @@ def _pragma_lines(config: AgentConfig, args: list[FunctionArg]) -> tuple[list[st
             reason = "scalar/control interface requested by configuration"
         elif config.interface_mode in {"ap_memory", "m_axi", "axis"}:
             mode = config.interface_mode
-            line = f"#pragma HLS INTERFACE {mode} port={arg.name}"
-            reason = f"{mode} interface requested by configuration; direction is {arg.direction}"
+            # A pointer parameter carries no size, so Vitis assumes depth=1 for CoSim and
+            # transfers exactly one element back. The C testbench then sees every element
+            # after the first still holding its sentinel and reports a mismatch at index 1
+            # -- a CoSim failure that says nothing about the design. State the depth we
+            # already know from the analyzed bound.
+            depth = f" depth={arg.length}" if arg.length else ""
+            line = f"#pragma HLS INTERFACE {mode} port={arg.name}{depth}"
+            reason = (
+                f"{mode} interface requested by configuration; direction is {arg.direction}"
+                + (f"; depth={arg.length} so CoSim transfers the whole buffer" if depth else "")
+            )
         else:
             continue
         lines.append(line)

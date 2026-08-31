@@ -361,6 +361,49 @@ def write_mutant_source(project_dir: Path, top: str) -> Path | None:
 # --------------------------------------------------------------------------- #
 
 
+_TCL_FILES = ("run_csim.tcl", "run_cosim.tcl", "run_hls.tcl")
+
+
+_NARROWING_CFLAGS = "-Wno-narrowing -Wno-c++11-narrowing"
+
+
+def stage_vitis_tcl(project_dir: Path, *, relax_narrowing: bool = True) -> list[str]:
+    """Add golden_ref.c to every generated tcl, and mirror the host's narrowing flags.
+
+    Returns the tcl files actually changed. Idempotent.
+    """
+
+    changed: list[str] = []
+    for name in _TCL_FILES:
+        path = project_dir / name
+        if not path.is_file():
+            continue
+        text = path.read_text(encoding="utf-8")
+        if relax_narrowing and _NARROWING_CFLAGS not in text:
+            text = text.replace('-cflags "', f'-cflags "{_NARROWING_CFLAGS} ')
+            path.write_text(text, encoding="utf-8")
+            if path.name not in changed:
+                changed.append(path.name)
+        if "golden_ref.c" in text:
+            continue
+        marker = "add_files -tb tb/testbench.cpp"
+        index = text.find(marker)
+        if index < 0:
+            continue
+        end = text.find("\n", index)
+        if end < 0:
+            continue
+        # reuse whatever -cflags the testbench line already carries
+        tb_line = text[index:end]
+        cflags = ""
+        if "-cflags" in tb_line:
+            cflags = tb_line[tb_line.index("-cflags"):]
+        insertion = f'\nadd_files -tb golden_ref.c {cflags}'.rstrip()
+        path.write_text(text[:end] + insertion + text[end:], encoding="utf-8")
+        changed.append(name)
+    return changed
+
+
 def stage_project(
     project_dir: Path,
     source_dir: Path,
@@ -419,6 +462,11 @@ def stage_project(
             result.steps.append("Makefile: CXXFLAGS += -Wno-narrowing (" + narrowing_relaxation_note() + ")")
 
     golden = write_golden_source(project_dir, top)
+    staged_tcl = stage_vitis_tcl(project_dir, relax_narrowing=relax_narrowing)
+    if staged_tcl:
+        result.steps.append(
+            "Vitis tcl: added golden_ref.c as a testbench file (" + ", ".join(staged_tcl) + ")"
+        )
     result.golden_source = str(golden)
     result.golden_export = ref
     result.applied = True

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -10,6 +11,34 @@ from .remote import RemoteVitis
 
 PHASE_ORDER = ("software_equivalence", "csim", "csynth", "cosim")
 PHASE_TIMEOUTS = {"csim": 600, "csynth": 1200, "cosim": 600}
+
+
+def vitis_executable() -> str | None:
+    """Absolute path to the local ``vitis_hls`` launcher, or None when there is none.
+
+    ``C2HLSC_VITIS_BIN`` wins when set, which is how a Windows install is pointed at
+    ``...\\Vitis_HLS\\2024.2\\bin\\vitis_hls.bat`` without putting it on PATH.
+    """
+
+    configured = os.environ.get("C2HLSC_VITIS_BIN")
+    if configured and Path(configured).is_file():
+        return configured
+    return shutil.which("vitis_hls")
+
+
+def vitis_command(args: list[str]) -> list[str]:
+    """Build a launch command the platform can actually execute.
+
+    On Windows the launcher is ``vitis_hls.bat``. ``CreateProcess`` only appends ``.exe``
+    when searching PATH, so a bare ``vitis_hls`` fails with WinError 2 even though
+    :func:`shutil.which` -- which honours ``PATHEXT`` -- finds it; and a batch file has to
+    go through the command interpreter rather than being executed directly.
+    """
+
+    resolved = vitis_executable() or "vitis_hls"
+    if os.name == "nt" and resolved.lower().endswith((".bat", ".cmd")):
+        return ["cmd", "/c", resolved, *args]
+    return [resolved, *args]
 
 
 def earliest_failing_phase(state: VerificationState, run_vitis_requested: bool) -> str | None:
@@ -57,7 +86,7 @@ def _run_vitis_phase(project_dir: Path, phase: str, remote: RemoteVitis | None) 
     try:
         if remote is not None:
             return remote.run_phase(project_dir, phase, timeout)
-        return run_command(["vitis_hls", "-f", f"run_{phase}.tcl"], project_dir, phase, timeout=timeout)
+        return run_command(vitis_command(["-f", f"run_{phase}.tcl"]), project_dir, phase, timeout=timeout)
     except subprocess.TimeoutExpired as exc:
         return _timeout_result(project_dir, phase, exc, f"Vitis {phase}")
 
@@ -100,8 +129,11 @@ def run_vitis(
                 "csynth": PhaseResult("csynth", "blocked", summary=message),
                 "cosim": PhaseResult("cosim", "blocked", summary=message),
             }
-    elif shutil.which("vitis_hls") is None:
-        message = "vitis_hls not found on PATH (use --vitis-ssh to run Vitis on a remote Linux host)"
+    elif vitis_executable() is None:
+        message = (
+            "vitis_hls not found on PATH and C2HLSC_VITIS_BIN is unset "
+            "(use --vitis-ssh to run Vitis on a remote Linux host)"
+        )
         return {
             "csim": PhaseResult("csim", "fail", summary=message),
             "csynth": PhaseResult("csynth", "blocked", summary=message),

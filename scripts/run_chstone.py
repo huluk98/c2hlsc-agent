@@ -121,6 +121,12 @@ class BenchmarkResult:
     ok: bool
     vitis_available: bool = False
     rungs_not_attempted: tuple[str, ...] = VITIS_RUNGS
+    #: Per-phase Vitis status when --run-vitis ran; None means the rung was not attempted.
+    csim: str | None = None
+    csynth: str | None = None
+    cosim: str | None = None
+    vitis_ok: bool | None = None
+    vitis_repair_rounds_run: int = 0
     failure_family: str | None = None
     diagnostics: list[str] = field(default_factory=list)
     evidence: str = ""
@@ -356,7 +362,7 @@ def _convert_command(top_copy: Path, project: Path, args: argparse.Namespace,
 
 
 def _repair_command(project: Path, top_copy: Path, log_path: Path, iteration: int,
-                    args: argparse.Namespace) -> list[str]:
+                    args: argparse.Namespace, stage: str = "software_equivalence") -> list[str]:
     """One repair round driven from the *staged* equivalence log.
 
     Running repair outside ``convert`` is the whole point of the staged flow: the evidence
@@ -367,7 +373,7 @@ def _repair_command(project: Path, top_copy: Path, log_path: Path, iteration: in
     cmd = [
         sys.executable, "-m", "c2hlsc_agent.cli", "repair",
         "--project", str(project),
-        "--stage", "software_equivalence",
+        "--stage", stage,
         "--evidence", str(log_path),
         "--input", str(top_copy),
         "--top", CHSTONE_TOP_FUNCTION,
@@ -430,6 +436,72 @@ def run_mutation_check(project: Path, timeout: int) -> tuple[str, str]:
         return "FALSE_GREEN", "equivalence test passed against a candidate returning ret+1"
     return "inconclusive", (
         "mutant did not build or did not report a mismatch: " + output.strip()[-400:]
+    )
+
+
+def _vitis_ladder(project: Path, staged: Path, top_copy: Path,
+                  args: argparse.Namespace, result: "BenchmarkResult") -> None:
+    """Run CSim -> CSynth -> CoSim, repairing against whichever phase fails first.
+
+    Only reached once host equivalence passes, so a Vitis failure here is about
+    synthesizability or the C/RTL interface rather than about the translation being wrong.
+    """
+
+    from c2hlsc_agent.hls_runner import run_vitis, vitis_executable
+
+    if vitis_executable() is None:
+        result.notes.append("vitis_hls not found; Vitis rungs not attempted")
+        return
+
+    result.vitis_available = True
+    rounds = result.repair_rounds_allowed
+    for attempt in range(rounds + 1):
+        phases = run_vitis(project, True)
+        result.csim = phases["csim"].status
+        result.csynth = phases["csynth"].status
+        result.cosim = phases["cosim"].status
+        failing = next(
+            (name for name in ("csim", "csynth", "cosim") if phases[name].status != "pass"),
+            None,
+        )
+        if failing is None:
+            result.vitis_ok = True
+            result.rungs_not_attempted = ()
+            return
+        if attempt >= rounds:
+            break
+        evidence = project / f"{failing}.log"
+        if not evidence.exists():
+            break
+        try:
+            repair = subprocess.run(
+                _repair_command(project, top_copy, evidence, attempt + 1, args, stage=failing),
+                capture_output=True, text=True, timeout=args.timeout, cwd=str(REPO_ROOT))
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            result.notes.append(f"vitis repair round {attempt + 1} did not complete: {exc}")
+            break
+        result.vitis_repair_rounds_run = attempt + 1
+        summary = ((repair.stdout or "").strip().splitlines() or [""])[0][:160]
+        result.notes.append(f"vitis repair round {attempt + 1} ({failing}): {summary}")
+        again = chstone_staging.stage_project(
+            project, staged, top_copy.name, CHSTONE_TOP_FUNCTION,
+            relax_narrowing=args.relax_narrowing,
+        )
+        if not again.applied:
+            result.notes.append("staging lost during the vitis ladder")
+            break
+        # A Vitis repair must not silently break the rung below it.
+        code, log_text = _make(project, "test", args.timeout)
+        if code != 0 or not _EQUIV_PASS_RE.search(log_text):
+            result.notes.append("vitis repair regressed host equivalence; stopped")
+            break
+        if repair.returncode != 0:
+            break
+
+    result.vitis_ok = False
+    result.rungs_not_attempted = tuple(
+        name for name in ("csim", "csynth", "cosim")
+        if getattr(result, name) in (None, "skipped", "blocked")
     )
 
 
@@ -551,6 +623,8 @@ def run_agent_staged(bench: ChstoneBenchmark, out_dir: Path, args: argparse.Name
         result.rung, result.failure_family = _classify_conversion(
             {"diagnostics": report.get("diagnostics"), "software_equivalence": "fail"}, log_text
         )
+    if result.ok and getattr(args, "run_vitis", False):
+        _vitis_ladder(project, staged, top_copy, args, result)
     result.stimulus_count = _stimulus_count(log_text) if result.ok else None
     result.diagnostics = [
         f"[{d.get('severity')}] {d.get('code')}: {d.get('message')}"
@@ -904,6 +978,12 @@ def build_parser() -> argparse.ArgumentParser:
                         help="name for this ablation arm, recorded in report.json/report.md")
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
     parser.add_argument("--native-timeout", type=int, default=DEFAULT_NATIVE_TIMEOUT)
+    parser.add_argument(
+        "--run-vitis",
+        action="store_true",
+        help="continue past host equivalence into Vitis CSim/CSynth/CoSim, repairing "
+             "against the failing phase's log. Requires vitis_hls on PATH or C2HLSC_VITIS_BIN.",
+    )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--verbose", action="store_true")
     return parser

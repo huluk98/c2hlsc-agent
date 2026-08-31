@@ -235,11 +235,24 @@ def _kind_name(cursor) -> str:
 
 
 def _read(path: str, cache: dict[str, bytes]) -> bytes:
+    """Read a source file with its line endings normalized to LF.
+
+    A CRLF checkout breaks every multi-line macro we hoist: a backslash continuation
+    followed by CR-LF is no longer a continuation, so the macro body spills into the
+    generated header as code ("stray '##' in program"). Normalizing here also keeps the
+    generated output byte-identical across platforms.
+
+    libclang reports extents as byte offsets into the file as *it* read it, so the cache
+    must preserve length. CRLF therefore becomes LF plus a padding space rather than being
+    collapsed, which keeps every later offset where libclang expects it.
+    """
+
     if path not in cache:
         try:
-            cache[path] = Path(path).read_bytes()
+            raw = Path(path).read_bytes()
         except OSError:
-            cache[path] = b""
+            raw = b""
+        cache[path] = raw.replace(b"\r\n", b"\n ")
     return cache[path]
 
 
@@ -327,6 +340,55 @@ def _ansi_signature(cursor) -> str:
     return f"{cursor.result_type.spelling} {cursor.spelling}({', '.join(params)})"
 
 
+# Ranges used to decide whether an initializer element needs an explicit cast. Widths are
+# the LP64/LLP64 common denominator; a value inside the range is left exactly as written.
+_SIGNED_MAX = {
+    "char": 2**7 - 1,
+    "signed char": 2**7 - 1,
+    "short": 2**15 - 1,
+    "short int": 2**15 - 1,
+    "int": 2**31 - 1,
+    "long": 2**31 - 1,
+    "long int": 2**31 - 1,
+    "long long": 2**63 - 1,
+    "long long int": 2**63 - 1,
+}
+
+
+def _cast_narrowing_initializers(declaration: str, element_type: str) -> tuple[str, bool]:
+    """Wrap out-of-range integer literals in an explicit cast to ``element_type``.
+
+    Returns (text, changed). Only literals that genuinely do not fit are touched, so a
+    normal table is emitted byte-for-byte as it was written.
+    """
+
+    bare = " ".join(t for t in element_type.split() if t not in {"const", "volatile"})
+    limit = _SIGNED_MAX.get(bare)
+    if limit is None or "=" not in declaration:
+        return declaration, False
+
+    head, _, initializer = declaration.partition("=")
+    changed = False
+
+    def cast(match: "re.Match[str]") -> str:
+        nonlocal changed
+        token = match.group(0)
+        try:
+            value = int(token, 0)
+        except ValueError:
+            return token
+        if value <= limit:
+            return token
+        changed = True
+        return f"({bare}){token}"
+
+    # integer literals only: hex or decimal, not attached to an identifier
+    rewritten = re.sub(r"(?<![\w.])(?:0[xX][0-9a-fA-F]+|\d+)[uUlL]*(?![\w.])", cast, initializer)
+    if not changed:
+        return declaration, False
+    return f"{head}={rewritten}", True
+
+
 def _var_decl_text(cursor, cache: dict[str, bytes]) -> tuple[str, str | None]:
     """Rebuild a file-scope variable declaration. Returns (text, normalization_note).
 
@@ -385,6 +447,14 @@ def _var_decl_text(cursor, cache: dict[str, bytes]) -> tuple[str, str | None]:
     if "extern" not in type_text:
         decl = "static " + decl
         note = f"gave file-scope global {name!r} internal linkage"
+
+    element = cursor.type.get_array_element_type().spelling if array else type_text
+    decl, casted = _cast_narrowing_initializers(decl, element)
+    if casted:
+        note = (
+            f"cast out-of-range initializer elements of {name!r} to {element!r} "
+            "(narrowing is legal C, rejected by C++ and by Vitis synthesis)"
+        )
     return decl + ";", note
 
 
