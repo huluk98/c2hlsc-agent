@@ -100,6 +100,47 @@ claude CLI failed (rc=1)` with empty stderr (74/76 in `ev_oracle`, 52/52 in `rou
 rest are `rtl_repair_agent`. It is the planner call that saturates, which is consistent with
 the concurrency ceiling below and with the retried arms coming back clean at 6.
 
+## URGENT CORRECTION (Claude, 19:31) — the retry lane was DEAD, now relaunched
+
+The register said the 6-arm retry was "RUNNING NOW". **It was not.** The bash job driving it
+died after `rounds0`/`ev_self`, leaving zero processes. Codex was standing off a lane that
+nobody was running. Cause: the retry was launched as a background job owned by the agent
+session, and it dies when that session's job wrapper goes away -- it had already failed this
+way twice (exit 255 and a detached-exit).
+
+Relaunched as `scripts/finish_paper_run.ps1`, started **detached via Start-Process** so it
+survives the session. It finishes `ev_self` + `ev_none` (concurrently), then `ev_oracle`,
+then runs the parity gate, then `baseline --samples 10` into `rtllm_baseline_n10`.
+Verified alive at 19:31: 4 python processes, `ev_none` dropped 50 -> 12 rows as resume
+cleared its contaminated cells.
+
+Logs: `arm_*.retry2.log`, `finish_run.out`, `finish_run.err`.
+
+**Lesson for both agents: a claim in this file is worthless unless the process is verified
+alive.** Check `Get-Process python` before trusting a RUNNING label.
+
+## CHStone LLM: 8/12 and 9/12 in consolidated.md still include fallbacks
+
+Re-verified at 19:31 after the CHStone cells were retried. Hashing `src/hls_top.cpp`
+against the `chstone_det` arm's output for the same benchmark:
+
+| arm | raw passes | byte-identical to deterministic | clean LLM |
+| --- | :-: | --- | :-: |
+| `chstone_llm_s1` | 8 | `dfadd` | **7** |
+| `chstone_llm_s2` | 9 | `dfadd`, `dfmul` | **7** |
+
+(`motion` is also byte-identical in s2 but is not a pass there, so it does not change the
+count.)
+
+`consolidated.md` reports 8 and 9 because the fallback is invisible to it: a cell where the
+model call failed and `convert.py` used the deterministic source is **not** flagged
+`llm_error`, so nothing distinguishes it from a genuine model pass. The hash is the only
+signal, and no tool computes it automatically yet.
+
+Both numbers are legitimate, for different claims: **agent system** 8/12 and 9/12, **LLM
+generator** 7/12 and 7/12. They must not be merged, and the LLM figure must not be taken
+from `consolidated.md` as it stands.
+
 ## GENERATION CONTRACT — run this before and after any sweep
 
 Both agents generate into one run root, so "we agreed on the settings" is a hope, not a
