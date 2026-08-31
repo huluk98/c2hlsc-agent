@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from .analyze import AnalysisResult, FunctionArg
 from .closure import ClosureResult, extract_closure
@@ -26,7 +28,109 @@ class GeneratedSource:
     """What was hoisted to make the emitted TU self-contained; None when unavailable."""
 
 
-def _include_for_types(args: list[FunctionArg], return_type: str) -> str:
+_HEADER_SUFFIXES = {".h", ".hh", ".hpp", ".hxx", ".inc"}
+_C_TYPE_WORDS = {
+    "char",
+    "const",
+    "double",
+    "enum",
+    "float",
+    "int",
+    "long",
+    "restrict",
+    "short",
+    "signed",
+    "struct",
+    "union",
+    "unsigned",
+    "void",
+    "volatile",
+}
+_QUOTED_INCLUDE = re.compile(r'^[ \t]*#[ \t]*include[ \t]*"([^"]+)"', re.M)
+
+
+def _header_declares_any_type(path: Path, names: set[str], include_dirs: list[Path], seen: set[Path]) -> bool:
+    """Return whether a local header or one of its headers names a signature type."""
+
+    try:
+        resolved = path.resolve()
+    except OSError:
+        return False
+    if resolved in seen:
+        return False
+    seen.add(resolved)
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    if any(re.search(rf"\b{re.escape(name)}\b", text) for name in names):
+        return True
+    search_dirs = [path.parent, *include_dirs]
+    for include_name in _QUOTED_INCLUDE.findall(text):
+        for directory in search_dirs:
+            candidate = Path(directory) / include_name
+            if candidate.is_file() and _header_declares_any_type(candidate, names, include_dirs, seen):
+                return True
+    return False
+
+
+def _local_type_includes(
+    args: list[FunctionArg], return_type: str, source_path: Path, include_dirs: list[Path]
+) -> list[str]:
+    """Find quoted headers needed to make a fallback signature self-declaring."""
+
+    type_text = " ".join([return_type] + [arg.c_type for arg in args])
+    names = {
+        name
+        for name in re.findall(r"[A-Za-z_]\w*", type_text)
+        if name not in _C_TYPE_WORDS and not name.startswith("int") and not name.startswith("uint")
+    }
+    if not names:
+        return []
+    try:
+        source = source_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    includes: list[str] = []
+    seen: set[Path] = set()
+
+    def scan(text: str, parent: Path) -> None:
+        for include_name in _QUOTED_INCLUDE.findall(text):
+            candidate = next(
+                (
+                    Path(directory) / include_name
+                    for directory in [parent, *include_dirs]
+                    if (Path(directory) / include_name).is_file()
+                ),
+                None,
+            )
+            if candidate is None:
+                continue
+            resolved = candidate.resolve()
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            if candidate.suffix.lower() in _HEADER_SUFFIXES:
+                if _header_declares_any_type(candidate, names, include_dirs, set()):
+                    try:
+                        emitted_name = candidate.relative_to(source_path.parent).as_posix()
+                    except ValueError:
+                        emitted_name = include_name
+                    includes.append(f'#include "{emitted_name}"')
+                continue
+            try:
+                nested = candidate.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            scan(nested, candidate.parent)
+
+    scan(source, source_path.parent)
+    return list(dict.fromkeys(includes))
+
+
+def _include_for_types(
+    args: list[FunctionArg], return_type: str, source_path: Path, include_dirs: list[Path]
+) -> str:
     """The baseline include set, used when closure extraction is unavailable.
 
     This alone is not enough for any kernel that names a type of its own -- see
@@ -38,6 +142,7 @@ def _include_for_types(args: list[FunctionArg], return_type: str) -> str:
     includes = ["#include <stdint.h>"]
     if "ap_int" in text or "ap_uint" in text:
         includes.append("#include <ap_int.h>")
+    includes.extend(_local_type_includes(args, return_type, source_path, include_dirs))
     return "\n".join(includes)
 
 
@@ -113,7 +218,12 @@ def _generate_conservative_sources(analysis: AnalysisResult, config: AgentConfig
     # be able to name everything the body closes over. Both come from the closure; the
     # bare include list is only the fallback for when libclang is unavailable.
     header_context = closure.type_preamble if closure.available and closure.type_preamble else (
-        _include_for_types(function.args, function.return_type)
+        _include_for_types(
+            function.args,
+            function.return_type,
+            function.source_path,
+            list(getattr(config, "include_dirs", [])),
+        )
     )
     source_context = closure.definition_preamble if closure.available else ""
 

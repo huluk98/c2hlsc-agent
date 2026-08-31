@@ -4,10 +4,12 @@ import shutil
 import subprocess
 from pathlib import Path
 import sys
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from c2hlsc_agent.analyze import analyze_source
+from c2hlsc_agent.closure import ClosureResult
 from c2hlsc_agent.config import AgentConfig, ArgumentConfig
 from c2hlsc_agent.convert import generate_hls_sources
 from c2hlsc_agent.hls_project import render_run_csim, render_run_cosim, render_run_csynth, render_run_hls, write_project
@@ -45,6 +47,36 @@ class ConvertTests(unittest.TestCase):
         self.assertIn("void vector_add", generated.header)
         self.assertIn('#include "hls_top.hpp"', generated.source)
         self.assertIn("out[i] = a[i] + b[i]", generated.source)
+
+    def test_fallback_header_carries_and_stages_local_signature_type(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "types.h").write_text(
+                "#ifndef TYPES_H\n#define TYPES_H\ntypedef unsigned long long float64;\n#endif\n",
+                encoding="utf-8",
+            )
+            (root / "support.c").write_text('#include "types.h"\n', encoding="utf-8")
+            source = root / "input.c"
+            source.write_text(
+                '#include "support.c"\nfloat64 multiply(float64 a, float64 b) { return a * b; }\n',
+                encoding="utf-8",
+            )
+            cfg = AgentConfig(top="multiply")
+            analysis = analyze_source(source, "multiply", cfg)
+            with patch(
+                "c2hlsc_agent.convert.extract_closure",
+                return_value=ClosureResult(available=False, diagnostics=["closure disabled"]),
+            ):
+                generated = generate_hls_sources(analysis, cfg)
+
+            self.assertIn('#include "types.h"', generated.header)
+            project = write_project(root / "project", analysis, generated, cfg)
+            self.assertIn(root / "project" / "types.h", project.generated_files)
+            self.assertTrue((root / "project" / "types.h").is_file())
+            testbench = generate_testbench(analysis, cfg)
+            self.assertLess(
+                testbench.index('#include "../src/hls_top.hpp"'), testbench.index('extern "C"')
+            )
 
     def test_ap_memory_interface_pragmas_for_pointer_args(self):
         analysis, cfg = self._analysis()

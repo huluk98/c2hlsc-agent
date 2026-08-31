@@ -86,6 +86,8 @@ class HlscRepairAgentTests(unittest.TestCase):
         source = (project.root / "src" / "hls_top.cpp").read_text(encoding="utf-8")
         self.assertIn("C2HLSC_REPAIR_INCLUDE_ORIGINAL_SUPPORT", source)
         self.assertIn("#define use_helper use_helper_c2hlsc_repair_reference", source)
+        self.assertIn("#define main main_c2hlsc_repair_main", source)
+        self.assertIn("#undef main", source)
         self.assertEqual(outcome.target_files, ("src/hls_top.cpp",))
 
     def test_removes_generated_interface_pragmas_after_interface_failure(self):

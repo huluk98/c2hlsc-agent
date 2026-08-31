@@ -262,14 +262,14 @@ def generate_testbench(analysis: AnalysisResult, config: AgentConfig) -> str:
 #include <type_traits>
 #include <vector>
 
+#include "../src/hls_top.hpp"
+
 extern "C" {{
 #define restrict __restrict__
 #define {fn.name} {fn.name}_ref
 #include "../input.c"
 #undef {fn.name}
 }}
-
-#include "../src/hls_top.hpp"
 
 template <typename T>
 T random_value(std::mt19937_64& rng) {{

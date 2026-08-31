@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import stat
 from dataclasses import dataclass
@@ -18,6 +19,43 @@ from .verilog_testgen import generate_verilog_testbenches
 class ProjectFiles:
     root: Path
     generated_files: list[Path]
+
+
+_QUOTED_INCLUDE = re.compile(r'^[ \t]*#[ \t]*include[ \t]*"([^"]+)"', re.M)
+
+
+def _stage_generated_header_dependencies(
+    out_dir: Path, source_path: Path, header: str, include_dirs: list[Path]
+) -> list[Path]:
+    """Copy the local headers named by the generated API into the project tree."""
+
+    copied: list[Path] = []
+    seen: set[Path] = set()
+
+    def stage(include_name: str, search_dirs: list[Path], relative_name: Path) -> None:
+        if relative_name.is_absolute() or ".." in relative_name.parts:
+            return
+        source = next(
+            (Path(directory) / include_name for directory in search_dirs if (Path(directory) / include_name).is_file()),
+            None,
+        )
+        if source is None:
+            return
+        resolved = source.resolve()
+        if resolved in seen:
+            return
+        seen.add(resolved)
+        destination = out_dir / relative_name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, destination)
+        copied.append(destination)
+        text = source.read_text(encoding="utf-8", errors="replace")
+        for nested in _QUOTED_INCLUDE.findall(text):
+            stage(nested, [source.parent, *include_dirs], relative_name.parent / nested)
+
+    for include_name in _QUOTED_INCLUDE.findall(header):
+        stage(include_name, [source_path.parent, *include_dirs], Path(include_name))
+    return copied
 
 
 def _tcl_path(value: object) -> str:
@@ -237,6 +275,14 @@ def write_project(out_dir: Path, analysis: AnalysisResult, generated: GeneratedS
     ]
     (out_dir / "src" / "hls_top.hpp").write_text(generated.header, encoding="utf-8")
     (out_dir / "src" / "hls_top.cpp").write_text(generated.source, encoding="utf-8")
+    files.extend(
+        _stage_generated_header_dependencies(
+            out_dir,
+            analysis.function.source_path,
+            generated.header,
+            list(getattr(config, "include_dirs", [])),
+        )
+    )
     (out_dir / "tb" / "testbench.cpp").write_text(generate_testbench(analysis, config), encoding="utf-8")
     (out_dir / "tb" / "leveri_golden_tb.cpp").write_text(leveri_bundle.golden_tb, encoding="utf-8")
     (out_dir / "tb" / "leveri_hls_tb.cpp").write_text(leveri_bundle.hls_tb, encoding="utf-8")

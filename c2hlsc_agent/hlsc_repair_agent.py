@@ -450,6 +450,8 @@ def _has_function_definition(source: str, symbol: str) -> bool:
 
 def _support_include_block(top_name: str) -> str:
     renamed = f"{top_name}_c2hlsc_repair_reference"
+    main_define = "" if top_name == "main" else "#define main main_c2hlsc_repair_main\n"
+    main_undef = "" if top_name == "main" else "#undef main\n"
     return f"""
 // c2hlsc_repair_agent: include copied input source with the top renamed so
 // preserved top bodies can call original helper functions and globals.
@@ -459,8 +461,8 @@ def _support_include_block(top_name: str) -> str:
 #define restrict __restrict__
 #endif
 #define {top_name} {renamed}
-#include "../input.c"
-#undef {top_name}
+{main_define}#include "../input.c"
+{main_undef}#undef {top_name}
 #endif
 """
 
