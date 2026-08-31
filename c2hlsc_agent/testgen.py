@@ -313,16 +313,20 @@ printable(const T&) {{
 template <typename T>
 typename std::enable_if<!std::is_arithmetic<T>::value, T>::type
 patterned_value(int test_idx, int element_idx, std::mt19937_64& rng, bool) {{
-  // Struct-typed argument. Fill the object's bytes deterministically, masking each byte
-  // to 0x3F so that any float or double member lands on a small finite value: an unmasked
-  // fill can produce NaN, and NaN != NaN would be reported as a mismatch that is not one.
+  // Struct-typed argument. Fill the object's bytes deterministically, writing only the low
+  // byte of each 4-byte group. An unmasked fill can produce NaN (and NaN != NaN would be
+  // reported as a mismatch that is not one); masking every byte instead leaves integer
+  // members around 1.06 billion, which a kernel that indexes memory with them will follow
+  // straight off the end of a buffer.
   T value{{}};
   unsigned char* bytes = reinterpret_cast<unsigned char*>(&value);
   unsigned long long mix = static_cast<unsigned long long>(test_idx + 1) * 0x9E3779B97F4A7C15ULL
                          ^ static_cast<unsigned long long>(element_idx + 1) * 0xBF58476D1CE4E5B9ULL;
   if (test_idx == 0) return value;  // all-zero struct stays a directed case
   for (size_t i = 0; i < sizeof(T); ++i) {{
-    bytes[i] = static_cast<unsigned char>(((mix >> ((i % 8) * 8)) ^ (i * 31u)) & 0x3F);
+    bytes[i] = (i % 4 == 0)
+        ? static_cast<unsigned char>(((mix >> ((i % 8) * 8)) ^ (i * 31u)) & 0x1F)
+        : static_cast<unsigned char>(0);
   }}
   (void)rng;
   return value;
@@ -347,7 +351,9 @@ output_sentinel(int test_idx, int element_idx) {{
   T value{{}};
   unsigned char* bytes = reinterpret_cast<unsigned char*>(&value);
   for (size_t i = 0; i < sizeof(T); ++i) {{
-    bytes[i] = static_cast<unsigned char>(((test_idx * 7 + element_idx * 13 + i * 3) & 0x3F) | 0x10);
+    bytes[i] = (i % 4 == 0)
+        ? static_cast<unsigned char>(((test_idx * 7 + element_idx * 13) & 0x1F) | 0x40)
+        : static_cast<unsigned char>(0);
   }}
   return value;
 }}
