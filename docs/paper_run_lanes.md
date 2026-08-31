@@ -1,8 +1,30 @@
 # Work lanes — paper_20260831
 
-Two agents are working this run root. This file is the claim register: **take only work
-listed as OPEN, and edit this file to claim it before you start.** Last updated by the
-Claude session driving the sweeps.
+Two agents are working this run root, across four checkouts (see "Worktree map" below).
+This file is the claim register: **take only work listed as OPEN, and edit this file to
+claim it before you start.** Last updated by the Claude session driving the sweeps.
+
+## Worktree map
+
+| path | branch | state |
+| --- | --- | --- |
+| `C:\Users\luke\c2hlsc-rtllm` | `fix/self-contained-translation-unit` | Claude, **active** — owns the sweeps and this file |
+| `C:\Users\luke\c2hlsc-vitis-qor` | `codex/vitis-qor-authority` | Codex, **active** — clean tree, `104056c` committed 17:04 |
+| `C:\Users\luke\c2hlsc-agent` | `claude/combined-generation-workflow` | idle; only untracked `.claude/`, `results/`, `tests/fixtures/` |
+| `C:\Users\luke\c2hlsc-qor-bottleneck-explorer` | `feature/qor-bottleneck-explorer-20260807` | **ORPHANED — see below** |
+
+### Orphaned worktree, needs an owner's decision
+
+`c2hlsc-qor-bottleneck-explorer` holds **2562 uncommitted insertions across 19 tracked
+files** (`qor.py`, `qor_optimizer.py`, `local_ppa.py`, `equivalence.py`, `hls_runner.py`,
+`leveri_testgen.py`, `llm.py`, `remote.py`, several `scripts/` and `tests/`). Nothing has
+touched it since **2026-08-07**, 24 days ago, and no process is running there.
+
+It overlaps Codex's `qor.py` / `qor_optimizer.py` lane, so it is a live merge hazard as
+well as unbacked work. Neither agent should commit it blind — it predates the whole
+`paper_20260831` line and may encode superseded assumptions. **Ask the human whether to
+commit it to its branch, harvest parts of it, or discard it.** Until then, do not touch
+that directory.
 
 ## Held by Claude (do not duplicate)
 
@@ -16,26 +38,60 @@ Claude session driving the sweeps.
 | Rosetta arms (det + LLM ×2) | DONE — no quotable score (see OPEN-2) | `rosetta_*/` |
 | `consolidate_paper_results.py`, `report_pass_fail_paths.py` | DONE, committed | `scripts/` |
 
+## Held by Codex (separate worktree; do not duplicate)
+
+| lane | state | worktree / branch | files and artifacts |
+| --- | --- | --- | --- |
+| Vitis-only QoR authority and `--target-clock-ns` | **COMMITTED 17:04** as `104056c`, branched off Claude's `5809f2c` — merges clean, unmerged to `main` | `C:\Users\luke\c2hlsc-vitis-qor` / `codex/vitis-qor-authority` | `README.md`, `c2hlsc_agent/{cli,qor,qor_optimizer}.py`, `tests/test_qor.py`, `docs/paper_20260831_continuation.md`; validation artifact only under `C:\Users\luke\runs_win\chstone_final\benchmarks\dfmul\project\qor_report.*` |
+
+Codex will not start or write any `runs\paper_20260831\rtllm_*` sweep. Claude owns those
+checkpoint writers until the live retry completes. Integration of the Vitis QoR branch
+must happen after the sweep owner reaches a checkpoint; neither agent should copy or
+overwrite the other's worktree files.
+
 **Do not rerun any sweep in this run root.** They append to `results.jsonl` and a
 concurrent writer corrupts the resume checkpoint. If a sweep needs redoing, say so here
 and let the holder do it.
 
 ## Live collision warning
 
-A Claude-side retry is **in flight** as of this edit: `run_rtllm_v2.py --resume`, two arms
-at a time, three workers each, in the order baseline+noplan, rounds0+ev_self,
-ev_none+ev_oracle. It has already taken the backups (e.g.
-`rtllm_baseline/results.jsonl.backend-errors.20260831T084534Z.19088.bak`) and is
-regenerating the dropped `llm_error` cells.
+A Claude-side retry is **in flight** (verified 17:09 on 2026-08-31: PIDs 18676/2580 are the
+`.venv` shims, 19088/7276 the real interpreters — one logical writer per arm, no collision).
+It runs `run_rtllm_v2.py --resume`, two arms at a time, three workers each, in the order
+baseline+noplan, rounds0+ev_self, ev_none+ev_oracle. Backups are taken (e.g.
+`rtllm_baseline/results.jsonl.backend-errors.20260831T084534Z.19088.bak`).
 
 `scripts/resume_paper_20260831.ps1` does the same job. **Running both writes two streams
 into the same `results.jsonl` and destroys the resume checkpoint.** Whoever reads this
 second: leave the RTL retry alone and take an OPEN item below.
 
-Concurrency ceiling learned the hard way: the Claude CLI backend saturates at roughly 12
-concurrent processes, which is what produced the 36 `llm_error` rows per arm in the first
-place. The retry runs 6. Do not raise it, and do not run another model-backed sweep
-alongside it.
+### Retry progress, measured 17:09
+
+The lower concurrency is working: the two retried arms have produced **zero** `llm_error`
+cells so far, against 52–76 in every arm still queued.
+
+| arm | stage | designs | samples | func_pass | `llm_error` cells left |
+| --- | --- | :-: | :-: | :-: | :-: |
+| `rtllm_baseline` | retrying now | 25/50 | 50 | 46 | 0 |
+| `rtllm_noplan` | retrying now | 34/50 | 68 | 60 | 0 |
+| `rtllm_rounds0` | queued (stage 2) | 50 | 100 | 33 | 52 |
+| `rtllm_ev_self` | queued (stage 2) | 50 | 100 | 25 | 73 |
+| `rtllm_ev_none` | queued (stage 3) | 50 | 100 | 20 | 74 |
+| `rtllm_ev_oracle` | queued (stage 3) | 50 | 100 | 23 | 76 |
+
+**Correction to an earlier note in this file:** the damage was recorded as "36 `llm_error`
+rows per arm". The measured count is 52–76 *cells* per queued arm, so the remaining retry
+is roughly twice the size previously assumed. On the observed rate (~2 samples/min/arm,
+two arms in parallel) stage 1 finishes ~17:35 and all three stages ~18:50.
+
+**Do not quote any number from the four queued arms.** Their surviving-cell pass rates
+(0.688–0.958) are computed over only 24–48 clean samples out of 100 and are selection-biased
+by whatever the planner happened to survive. They become quotable only after the retry.
+
+Every failure in the queued arms is one signature — `rtl_planner failed after 3 attempt(s):
+claude CLI failed (rc=1)` with empty stderr (74/76 in `ev_oracle`, 52/52 in `rounds0`); the
+rest are `rtl_repair_agent`. It is the planner call that saturates, which is consistent with
+the concurrency ceiling below and with the retried arms coming back clean at 6.
 
 ## OPEN — available to take
 
