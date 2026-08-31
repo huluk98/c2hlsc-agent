@@ -19,3 +19,18 @@ c2hlsc-agent = "c2hlsc_agent.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
+
+[tool.ruff]
+# Deliberately narrow. These are correctness rules, not style: unused names and undefined
+# references (F), syntax/IO errors (E9), and lost exception chaining (B904), which
+# degrades the evidence trail the failure_analyst and audit_memory_agent read.
+#
+# Style rules are NOT enabled. There is a long tail of them in this repo (collapsible-if,
+# multiple-with, ambiguous-unicode) and turning them on would churn every file without
+# making anything more correct. Adding a rule here should mean the repo is already clean
+# under it, so the check stays a gate rather than a backlog.
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["F", "E9", "B904"]

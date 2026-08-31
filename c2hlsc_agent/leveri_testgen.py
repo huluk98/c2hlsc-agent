@@ -3,8 +3,19 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 
-from .analyze import AnalysisResult, FunctionArg
+from .analyze import AnalysisResult, FunctionArg, active_length_arg
 from .config import AgentConfig
+from .testgen import multi_dim_cast
+from .stimulus import (
+    directed_index_decl,
+    directed_schedule,
+    directed_var,
+    extra_guard,
+    extra_vectors,
+    render_extra_tables,
+    render_helpers,
+    total_iterations,
+)
 
 
 LEVERI_TESTBENCH_POLICY_ID = "hls_leveri_shift_left_v1"
@@ -75,50 +86,110 @@ def _storage_type(arg: FunctionArg) -> str:
     return " ".join(token for token in arg.c_type.split() if token not in {"const", "volatile"})
 
 
-def _scalar_decl(arg: FunctionArg) -> str:
+def _scalar_decl(arg: FunctionArg, config: AgentConfig) -> str:
+    slot = directed_var(config, "cycle")
     if arg.scalar_range:
         lo, hi = arg.scalar_range
-        return f"bounded_scalar<{arg.c_type}>(cycle, rng, {lo}LL, {hi}LL)"
-    return f"random_value<{arg.c_type}>(rng)"
+        base = f"bounded_scalar<{arg.c_type}>({slot}, rng, {lo}LL, {hi}LL)"
+    else:
+        base = f"random_value<{arg.c_type}>(rng)"
+    guard = extra_guard(config, "cycle")
+    if not guard:
+        return base
+    return f"({guard}) ? static_cast<{arg.c_type}>(c2hlsc_extra_{arg.name}[cycle]) : {base}"
 
 
-def _init_array(arg: FunctionArg) -> str:
+def _init_array(arg: FunctionArg, config: AgentConfig) -> str:
+    storage = _storage_type(arg)
     if arg.direction == "output":
         return f"""for (int i = 0; i < {arg.length}; ++i) {{
-    {arg.name}[i] = output_sentinel<{_storage_type(arg)}>(cycle, i);
+    {arg.name}[i] = output_sentinel<{storage}>(cycle, i);
   }}"""
     unsigned = "true" if _is_unsigned(arg.c_type) else "false"
-    return f"""for (int i = 0; i < {arg.length}; ++i) {{
-    {arg.name}[i] = patterned_value<{_storage_type(arg)}>(cycle, i, rng, {unsigned});
+    slot = directed_var(config, "cycle")
+    patterned = f"""for (int i = 0; i < {arg.length}; ++i) {{
+    {arg.name}[i] = patterned_value<{storage}>({slot}, i, rng, {unsigned});
+  }}"""
+    guard = extra_guard(config, "cycle")
+    if not guard:
+        return patterned
+    return f"""if ({guard}) {{
+    for (int i = 0; i < {arg.length}; ++i) {{
+      {arg.name}[i] = static_cast<{storage}>(c2hlsc_extra_{arg.name}[cycle][i]);
+    }}
+  }} else {{
+    {patterned}
   }}"""
 
 
 def _call_args(args: list[FunctionArg]) -> str:
-    return ", ".join(arg.name for arg in args)
+    values = []
+    for arg in args:
+        cast = multi_dim_cast(arg)
+        values.append(f"reinterpret_cast<{cast}>({arg.name})" if cast else arg.name)
+    return ", ".join(values)
 
 
-def _header_and_roles(function_args: list[FunctionArg], return_type: str) -> tuple[list[str], list[str]]:
-    headers = ["cycle"]
-    roles = ["meta"]
+def _columns(function_args: list[FunctionArg], return_type: str) -> list[dict[str, object]]:
+    """The trace schema: one entry per CSV column, in order.
+
+    Output columns of an array that has an *active length* scalar carry the column index
+    of that scalar, so the comparator can clamp exactly the way the oracle testbench's
+    ``clamp_count`` does. Without it a design that leaves the tail of a buffer untouched
+    would be reported as a behavioural mismatch even though the tail is outside the
+    declared contract.
+    """
+
+    scalars = [arg for arg in function_args if not arg.is_pointer_like]
+    columns: list[dict[str, object]] = [{"name": "cycle", "role": "meta"}]
+    scalar_column: dict[str, int] = {}
+
+    # Scalars are emitted in argument order, interleaved with the arrays; resolve their
+    # column indices in a first pass so an array column can point at one.
+    index = 1
     for arg in function_args:
         if arg.is_pointer_like:
             if arg.direction in {"input", "inout"}:
-                for idx in range(arg.length or 0):
-                    suffix = "_in" if arg.direction == "inout" else ""
-                    headers.append(f"{arg.name}{suffix}[{idx}]")
-                    roles.append("in")
+                index += arg.length or 0
             if arg.direction in {"output", "inout"}:
-                for idx in range(arg.length or 0):
-                    suffix = "_out" if arg.direction == "inout" else ""
-                    headers.append(f"{arg.name}{suffix}[{idx}]")
-                    roles.append("out")
+                index += arg.length or 0
         else:
-            headers.append(arg.name)
-            roles.append("in")
+            scalar_column[arg.name] = index
+            index += 1
+
+    for arg in function_args:
+        if arg.is_pointer_like:
+            active = active_length_arg(arg, scalars)
+            if arg.direction in {"input", "inout"}:
+                suffix = "_in" if arg.direction == "inout" else ""
+                for idx in range(arg.length or 0):
+                    columns.append(
+                        {"name": f"{arg.name}{suffix}[{idx}]", "role": "in", "arg": arg.name, "element": idx}
+                    )
+            if arg.direction in {"output", "inout"}:
+                suffix = "_out" if arg.direction == "inout" else ""
+                for idx in range(arg.length or 0):
+                    column: dict[str, object] = {
+                        "name": f"{arg.name}{suffix}[{idx}]",
+                        "role": "out",
+                        "arg": arg.name,
+                        "element": idx,
+                        "declared_length": arg.length,
+                    }
+                    if active is not None:
+                        column["active_length_column"] = scalar_column[active.name]
+                        column["active_length_arg"] = active.name
+                    columns.append(column)
+        else:
+            columns.append({"name": arg.name, "role": "in", "arg": arg.name})
     if return_type != "void":
-        headers.append("return")
-        roles.append("out")
-    return headers, roles
+        columns.append({"name": "return", "role": "out", "arg": "return"})
+    return columns
+
+
+def _header_and_roles(function_args: list[FunctionArg], return_type: str) -> tuple[list[str], list[str]]:
+    columns = _columns(function_args, return_type)
+    return [str(c["name"]) for c in columns], [str(c["role"]) for c in columns]
 
 
 def _write_header_line(items: list[str]) -> str:
@@ -128,16 +199,16 @@ def _write_header_line(items: list[str]) -> str:
 def _array_declarations(arrays: list[FunctionArg]) -> list[str]:
     declarations: list[str] = []
     for arg in arrays:
-        declarations.append(f"  {_storage_type(arg)} {arg.name}[{arg.length}] = {{}};")
+        declarations.append(f"  static {_storage_type(arg)} {arg.name}[{arg.length}] = {{}};")
     return declarations
 
 
-def _scalar_declarations(scalars: list[FunctionArg]) -> list[str]:
-    return [f"  {arg.c_type} {arg.name} = {_scalar_decl(arg)};" for arg in scalars]
+def _scalar_declarations(scalars: list[FunctionArg], config: AgentConfig) -> list[str]:
+    return [f"  {arg.c_type} {arg.name} = {_scalar_decl(arg, config)};" for arg in scalars]
 
 
-def _array_initializers(arrays: list[FunctionArg]) -> list[str]:
-    return [_init_array(arg) for arg in arrays]
+def _array_initializers(arrays: list[FunctionArg], config: AgentConfig) -> list[str]:
+    return [_init_array(arg, config) for arg in arrays]
 
 
 def _write_value_line(expr: str) -> str:
@@ -164,57 +235,29 @@ def _write_row_lines(fn_args: list[FunctionArg], return_type: str) -> list[str]:
     return lines
 
 
-def _common_helpers(seed: int) -> str:
+def _trace_helpers(seed: int) -> str:
+    """Trace-specific helpers. The stimulus templates come from :mod:`stimulus` so the
+    oracle testbench and both trace testbenches share one schedule and one random stream."""
+
     return f"""template <typename T>
-T random_value(std::mt19937_64& rng) {{
-  if (std::numeric_limits<T>::is_integer) {{
-    return static_cast<T>(rng());
-  }}
-  return static_cast<T>((rng() % 20001) - 10000) / static_cast<T>(100);
-}}
-
-template <typename T>
-T bounded_scalar(int cycle, std::mt19937_64& rng, long long lo, long long hi) {{
-  if (hi < lo) return static_cast<T>(lo);
-  long long value = lo;
-  if (cycle == 0) {{
-    value = lo;
-  }} else if (cycle == 1) {{
-    value = hi;
-  }} else if (cycle == 2) {{
-    value = lo + ((hi - lo) / 2);
-  }} else if (cycle == 3 && lo <= 1 && hi >= 1) {{
-    value = 1;
-  }} else {{
-    const unsigned long long span = static_cast<unsigned long long>(hi - lo) + 1ULL;
-    value = lo + static_cast<long long>(rng() % span);
-  }}
-  return static_cast<T>(value);
-}}
-
-template <typename T>
-T patterned_value(int cycle, int element_idx, std::mt19937_64& rng, bool is_unsigned) {{
-  if (cycle == 0) return static_cast<T>(0);
-  if (cycle == 1) return static_cast<T>(~static_cast<unsigned long long>(0));
-  if (cycle == 2 && std::numeric_limits<T>::is_integer) {{
-    return is_unsigned ? std::numeric_limits<T>::max()
-                       : (element_idx % 2 ? std::numeric_limits<T>::max() : std::numeric_limits<T>::min());
-  }}
-  if (cycle == 3) return static_cast<T>(element_idx % 2 ? 0xAAAAAAAAULL : 0x55555555ULL);
-  return random_value<T>(rng);
-}}
-
-template <typename T>
-T output_sentinel(int cycle, int element_idx) {{
-  unsigned long long value = 0x9E3779B97F4A7C15ULL;
-  value ^= static_cast<unsigned long long>(cycle + 1) * 0xBF58476D1CE4E5B9ULL;
-  value ^= static_cast<unsigned long long>(element_idx + 1) * 0x94D049BB133111EBULL;
-  return static_cast<T>(value);
-}}
-
-template <typename T>
 void write_csv_value(std::ofstream& trace, const T& value) {{
   trace << "," << std::setprecision(17) << value;
+}}
+
+// Character-typed values must go out as numbers. Streaming a char writes the *byte*,
+// so a value of 44 emits a comma and 10 emits a newline: that does not merely produce
+// invalid UTF-8, it shifts every column after it and can line a divergent pair up as
+// equal. These non-template overloads win over the template on an exact match.
+void write_csv_value(std::ofstream& trace, const char& value) {{
+  trace << "," << static_cast<int>(value);
+}}
+
+void write_csv_value(std::ofstream& trace, const signed char& value) {{
+  trace << "," << static_cast<int>(value);
+}}
+
+void write_csv_value(std::ofstream& trace, const unsigned char& value) {{
+  trace << "," << static_cast<unsigned int>(value);
 }}
 
 std::mt19937_64 make_trace_rng() {{
@@ -235,10 +278,16 @@ def _render_trace_tb(
     arrays = [arg for arg in fn.args if arg.is_pointer_like]
     scalars = [arg for arg in fn.args if not arg.is_pointer_like]
     headers, roles = _header_and_roles(fn.args, fn.return_type)
-    declarations = _array_declarations(arrays) + _scalar_declarations(scalars)
-    initializers = _array_initializers(arrays)
+    declarations = _array_declarations(arrays) + _scalar_declarations(scalars, config)
+    initializers = _array_initializers(arrays, config)
     row_lines = _write_row_lines(fn.args, fn.return_type)
     return_prefix = f"{fn.return_type} dut_return = " if fn.return_type != "void" else ""
+
+    vectors = extra_vectors(config)
+    stimulus_helpers = render_helpers(config, "cycle") + "\n" + _trace_helpers(config.seed)
+    extra_tables = render_extra_tables(fn.args, vectors)
+    directed_decl = directed_index_decl(config, "cycle")
+    iterations = total_iterations(config)
 
     return f"""// Generated by c2hlsc_agent using {LEVERI_TESTBENCH_POLICY_ID}.
 // LeVeri-style paired trace testbench: emits one CSV trace for dual-tier checking.
@@ -251,7 +300,7 @@ def _render_trace_tb(
 
 {include_block}
 
-{_common_helpers(config.seed)}
+{extra_tables}{stimulus_helpers}
 
 int main() {{
   std::ofstream trace({json.dumps(output_csv)}, std::ofstream::out);
@@ -263,7 +312,8 @@ int main() {{
 {_write_header_line(roles)}
 
   std::mt19937_64 rng = make_trace_rng();
-  for (int cycle = 0; cycle < {config.num_tests}; ++cycle) {{
+  for (int cycle = 0; cycle < {iterations}; ++cycle) {{
+{directed_decl}
 {chr(10).join(declarations)}
 {chr(10).join(initializers)}
 
@@ -278,12 +328,43 @@ int main() {{
 
 
 def _compare_script() -> str:
-    return """#!/usr/bin/env python3
+    return r"""#!/usr/bin/env python3
+'''HLS-LeVeri dual-tier consistency check.
+
+Tier 1 -- STATIC structural alignment between the two generated testbenches:
+  * trace schema: header row, role row, cycle count
+  * input stimulus: every 'in' column must be identical on both sides
+  * control flow: the harnesses must have the same CFG shape
+  * data dependency: the harnesses must have the same def-use structure
+
+Tier 2 -- DYNAMIC behavioural consistency: every 'out' column must agree, clamped to the
+declared active length when the contract has one.
+
+The static tier is what separates a TESTBENCH bug from a DESIGN bug. Both harnesses come
+from one template, so it passes by construction today; it exists so that the day someone
+(or a model) augments one side's stimulus and not the other, the divergence is reported
+as a harness defect instead of being silently blamed on the design.
+'''
 from __future__ import annotations
 
 import csv
+import json
+import re
 import sys
 from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+MANIFEST = ROOT / "tb" / "leveri_manifest.json"
+
+CONTROL_KEYWORDS = (
+    "if", "else", "for", "while", "do", "switch", "case",
+    "default", "return", "break", "continue", "goto",
+)
+
+ASSIGNMENT = re.compile(
+    r"([A-Za-z_]\w*)\s*(?:\[[^\]]*\])?\s*(?:=(?!=)|\+=|-=|\*=|/=|%=|\|=|&=|\^=)\s*([^;]*);"
+)
 
 
 def read_trace(path: Path) -> tuple[list[str], list[str], list[list[str]]]:
@@ -294,9 +375,112 @@ def read_trace(path: Path) -> tuple[list[str], list[str], list[list[str]]]:
     return rows[0], rows[1], rows[2:]
 
 
-def fail(message: str) -> None:
-    print(f"HLS-LeVeri consistency check failed: {message}", file=sys.stderr)
+def fail(tier: str, message: str) -> None:
+    print(f"HLS-LeVeri {tier} check failed: {message}", file=sys.stderr)
     raise SystemExit(1)
+
+
+def load_manifest() -> dict:
+    if not MANIFEST.exists():
+        return {}
+    try:
+        return json.loads(MANIFEST.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+# --------------------------------------------------------------------------- #
+# Tier 1: static structural alignment
+# --------------------------------------------------------------------------- #
+
+
+def normalize_source(text: str, top: str) -> str:
+    '''Strip everything the two harnesses are SUPPOSED to differ in.
+
+    By design the golden side includes the original C with the top macro-renamed and the
+    HLS side includes the generated header, and each writes its own CSV. Those are
+    contract differences, not structural ones, so preprocessor lines, string literals and
+    the extern "C" include block are removed and the _ref suffix is folded away before
+    anything is compared.
+    '''
+    text = re.sub(r"/\*.*?\*/", " ", text, flags=re.S)
+    text = re.sub(r"//[^\n]*", " ", text)
+    text = re.sub(r'"(?:[^"\\]|\\.)*"', '""', text)
+    text = re.sub(r"'(?:[^'\\]|\\.)*'", "''", text)
+    text = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+    text = re.sub(r'extern\s+""\s*\{[^{}]*\}', " ", text)
+    if top:
+        text = re.sub(r"\b" + re.escape(top) + r"_ref\b", top, text)
+    return text
+
+
+def cfg_signature(text: str) -> list[str]:
+    '''Control-flow shape: every control keyword tagged with its brace depth.'''
+    signature: list[str] = []
+    depth = 0
+    for token in re.finditer(r"[{}]|[A-Za-z_]\w*", text):
+        value = token.group(0)
+        if value == "{":
+            depth += 1
+        elif value == "}":
+            depth -= 1
+        elif value in CONTROL_KEYWORDS:
+            signature.append(f"{value}@{depth}")
+    return signature
+
+
+def ddg_signature(text: str) -> list[str]:
+    '''Def-use structure: each assignment as target <- the sorted set of names read.'''
+    pairs = set()
+    for match in ASSIGNMENT.finditer(text):
+        target = match.group(1)
+        reads = sorted(set(re.findall(r"[A-Za-z_]\w*", match.group(2))))
+        pairs.add(target + "<-" + ",".join(reads))
+    return sorted(pairs)
+
+
+def first_divergence(left: list[str], right: list[str]) -> str:
+    for index, (a, b) in enumerate(zip(left, right)):
+        if a != b:
+            return f"position {index}: golden={a!r} hls={b!r}"
+    if len(left) != len(right):
+        shared = min(len(left), len(right))
+        longer, name = (left, "golden") if len(left) > len(right) else (right, "hls")
+        return f"{name} has {abs(len(left) - len(right))} extra entr(ies), first extra {longer[shared]!r}"
+    return "unknown"
+
+
+def static_structural_check(manifest: dict) -> dict:
+    top = str(manifest.get("top", ""))
+    golden_path = ROOT / "tb" / "leveri_golden_tb.cpp"
+    hls_path = ROOT / "tb" / "leveri_hls_tb.cpp"
+    if not golden_path.exists() or not hls_path.exists():
+        print("static structural check skipped: testbench sources not found", file=sys.stderr)
+        return {"cfg": None, "ddg": None}
+
+    golden = normalize_source(golden_path.read_text(encoding="utf-8"), top)
+    hls = normalize_source(hls_path.read_text(encoding="utf-8"), top)
+
+    golden_cfg, hls_cfg = cfg_signature(golden), cfg_signature(hls)
+    if golden_cfg != hls_cfg:
+        fail(
+            "static control-flow",
+            "paired testbenches have different CFG shapes; " + first_divergence(golden_cfg, hls_cfg),
+        )
+
+    golden_ddg, hls_ddg = ddg_signature(golden), ddg_signature(hls)
+    if golden_ddg != hls_ddg:
+        fail(
+            "static data-dependency",
+            "paired testbenches have different def-use structures; " + first_divergence(golden_ddg, hls_ddg),
+        )
+
+    return {"cfg": len(golden_cfg), "ddg": len(golden_ddg)}
+
+
+# --------------------------------------------------------------------------- #
+# Tier 2: dynamic behavioural consistency
+# --------------------------------------------------------------------------- #
 
 
 def values_match(golden: str, hls: str) -> bool:
@@ -312,43 +496,104 @@ def values_match(golden: str, hls: str) -> bool:
     return diff <= 1e-6 * scale
 
 
+def clamp(value: str, limit: int) -> int:
+    try:
+        number = int(float(value))
+    except ValueError:
+        return limit
+    if number < 0:
+        return 0
+    return min(number, limit)
+
+
 def main(argv: list[str]) -> int:
     if len(argv) != 3:
         print("usage: leveri_compare.py GOLDEN_TRACE.csv HLS_TRACE.csv", file=sys.stderr)
         return 2
 
+    manifest = load_manifest()
+    columns = manifest.get("columns") or []
+    static_stats = static_structural_check(manifest)
+
     golden_header, golden_roles, golden_rows = read_trace(Path(argv[1]))
     hls_header, hls_roles, hls_rows = read_trace(Path(argv[2]))
 
     if golden_header != hls_header:
-        fail("static header mismatch")
+        fail("static schema", "header mismatch")
     if golden_roles != hls_roles:
-        fail("static role-row mismatch")
+        fail("static schema", "role-row mismatch")
     if len(golden_rows) != len(hls_rows):
-        fail(f"cycle-count mismatch golden={len(golden_rows)} hls={len(hls_rows)}")
+        fail("static schema", f"cycle-count mismatch golden={len(golden_rows)} hls={len(hls_rows)}")
 
     input_columns = [idx for idx, role in enumerate(golden_roles) if role == "in"]
     output_columns = [idx for idx, role in enumerate(golden_roles) if role == "out"]
+    clamped = 0
+    # Dynamic evidence. A non-empty output schema is not proof that anything was compared:
+    # if every element sits beyond its active length, each one is clamped away and the loop
+    # below compares nothing while still reporting consistency.
+    compared = 0
 
     for row_idx, (golden, hls) in enumerate(zip(golden_rows, hls_rows)):
         if len(golden) != len(golden_header) or len(hls) != len(hls_header):
-            fail(f"row width mismatch at trace row {row_idx}")
+            fail("static schema", f"row width mismatch at trace row {row_idx}")
         for col_idx in input_columns:
             if golden[col_idx] != hls[col_idx]:
                 fail(
+                    "static stimulus",
                     f"stimulus mismatch cycle={golden[0]} column={golden_header[col_idx]} "
-                    f"golden={golden[col_idx]} hls={hls[col_idx]}"
+                    f"golden={golden[col_idx]} hls={hls[col_idx]}",
                 )
         for col_idx in output_columns:
+            meta = columns[col_idx] if col_idx < len(columns) else {}
+            active_col = meta.get("active_length_column")
+            element = meta.get("element")
+            if isinstance(active_col, int) and isinstance(element, int) and active_col < len(golden):
+                limit = clamp(golden[active_col], int(meta.get("declared_length") or 0))
+                if element >= limit:
+                    clamped += 1
+                    continue  # outside the declared active length: not part of the contract
+            compared += 1
             if not values_match(golden[col_idx], hls[col_idx]):
                 fail(
-                    f"behavior mismatch cycle={golden[0]} column={golden_header[col_idx]} "
-                    f"expected={golden[col_idx]} actual={hls[col_idx]}"
+                    "dynamic behaviour",
+                    f"behaviour mismatch cycle={golden[0]} column={golden_header[col_idx]} "
+                    f"expected={golden[col_idx]} actual={hls[col_idx]}",
                 )
 
+    # A tier that examined nothing has not agreed with anything. Reaching this point with
+    # no output column means every declared output was traced as an input (or none was
+    # declared), so the dynamic half compared zero values and would report "consistent"
+    # for any implementation. Absence of a mismatch is only evidence when a mismatch was
+    # possible, so this is a failure of the check rather than a pass.
+    if not output_columns:
+        fail(
+            "insufficient evidence",
+            "no output column in the trace schema: the dynamic tier compared nothing, so "
+            "consistency here would hold for any implementation",
+        )
+    if not golden_rows:
+        fail(
+            "insufficient evidence",
+            "the paired traces hold no cycles: nothing was executed to compare",
+        )
+    if compared == 0:
+        fail(
+            "insufficient evidence",
+            f"every one of the {len(output_columns)} output column(s) was clamped away by an "
+            "active length, so the dynamic tier compared nothing across "
+            f"{len(golden_rows)} cycle(s)",
+        )
+
+    notes = []
+    if static_stats.get("cfg") is not None:
+        notes.append(f"CFG {static_stats['cfg']} node(s), def-use {static_stats['ddg']} edge(s)")
+    if clamped:
+        notes.append(f"{clamped} element comparison(s) clamped to the active length")
+    suffix = (", " + ", ".join(notes)) if notes else ""
     print(
-        "HLS-LeVeri consistency check passed: "
-        f"{len(golden_rows)} cycles, {len(input_columns)} input columns, {len(output_columns)} output columns"
+        "HLS-LeVeri dual-tier consistency check passed: "
+        f"{len(golden_rows)} cycles, {len(input_columns)} input columns, "
+        f"{len(output_columns)} output columns, {compared} value(s) compared" + suffix
     )
     return 0
 
@@ -364,7 +609,7 @@ def _klee_driver(analysis: AnalysisResult) -> str:
     setup: list[str] = []
     for arg in fn.args:
         if arg.is_pointer_like:
-            declarations.append(f"  {_storage_type(arg)} {arg.name}[{arg.length}] = {{}};")
+            declarations.append(f"  static {_storage_type(arg)} {arg.name}[{arg.length}] = {{}};")
             if arg.direction in {"input", "inout"}:
                 setup.append(f'  klee_make_symbolic({arg.name}, sizeof({arg.name}), "{arg.name}");')
             else:
@@ -387,8 +632,13 @@ def _klee_driver(analysis: AnalysisResult) -> str:
 #include <klee/klee.h>
 
 extern "C" {{
+// The golden C may carry its own main() -- benchmark sources usually do. The
+// testbench defines main, so rename the original's out of the way rather than
+// colliding with it. CHStone's own flow does the same thing with -Dmain=...
+#define main c2hlsc_golden_main
 #define {fn.name} {fn.name}_ref
 #include "../input.c"
+#undef main
 #undef {fn.name}
 }}
 
@@ -404,18 +654,33 @@ int main() {{
 
 def _gcov_script() -> str:
     return """#!/usr/bin/env python3
+\"\"\"Concrete structural coverage for the shift-left tier.
+
+Builds both trace testbenches with --coverage, runs them, runs the dual-tier comparison,
+then invokes gcov and PARSES the result: line and branch coverage over the measured
+targets (the golden C and the generated HLS-C, never the testbenches themselves), plus
+the exact uncovered lines and branches. Those uncovered sites are what the refinement
+loop in c2hlsc_agent/coverage_refine.py steers KLEE toward, so producing a number is the
+whole point of this target -- an unparsed .gcov file cannot close a loop.
+\"\"\"
 from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
 COVERAGE_DIR = ROOT / "coverage"
 REPORT_PATH = COVERAGE_DIR / "gcov_report.json"
+
+# Coverage is measured over the specification and the design, not the harness that
+# drives them: a testbench is 100% covered by construction and would mask the real number.
+MEASURED_SUFFIXES = ("input.c", "src/hls_top.cpp", "hls_top.cpp")
 
 
 def run(cmd: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -431,6 +696,86 @@ def tool(name: str) -> str | None:
     return shutil.which(name)
 
 
+def is_measured(source: str) -> bool:
+    normalized = source.replace("\\\\", "/")
+    return any(normalized.endswith(suffix) for suffix in MEASURED_SUFFIXES)
+
+
+def parse_gcov(path: Path) -> dict[str, object] | None:
+    \"\"\"Parse one .gcov file into per-file line/branch counts and uncovered sites.
+
+    gcov line format is 'count:lineno:source'. A count of '-' marks a non-executable
+    line, '#####' and '=====' mark executable-but-never-executed. With -b, branch rows
+    follow the line they belong to, so the current line number attributes them.
+    \"\"\"
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+
+    source = None
+    lines_total = lines_hit = 0
+    branches_total = branches_hit = 0
+    uncovered_lines: list[int] = []
+    uncovered_branches: list[dict[str, int]] = []
+    current_line = 0
+
+    for raw in text.splitlines():
+        if raw.startswith("branch "):
+            branches_total += 1
+            match = re.match(r"branch\\s+(\\d+)", raw)
+            index = int(match.group(1)) if match else 0
+            # gcov -c prints branch COUNTS ("taken 0"), plain gcov prints PERCENTAGES
+            # ("taken 0%"). Both mean the same thing at zero; match either, or the
+            # never-taken branch silently counts as covered and the number is a lie.
+            taken = re.search(r"taken\\s+(\\d+)", raw)
+            never = "never executed" in raw
+            if never or (taken is not None and int(taken.group(1)) == 0):
+                uncovered_branches.append({"line": current_line, "branch": index})
+            else:
+                branches_hit += 1
+            continue
+        parts = raw.split(":", 2)
+        if len(parts) < 3:
+            continue
+        count = parts[0].strip()
+        number = parts[1].strip()
+        if number == "0":
+            if parts[2].startswith("Source:"):
+                source = parts[2][len("Source:"):].strip()
+            continue
+        try:
+            current_line = int(number)
+        except ValueError:
+            continue
+        if count == "-":
+            continue  # not executable
+        lines_total += 1
+        if count in {"#####", "====="}:
+            uncovered_lines.append(current_line)
+        else:
+            lines_hit += 1
+
+    if source is None:
+        return None
+    return {
+        "source": source,
+        "gcov_file": str(path.relative_to(ROOT)),
+        "lines_total": lines_total,
+        "lines_hit": lines_hit,
+        "branches_total": branches_total,
+        "branches_hit": branches_hit,
+        "uncovered_lines": uncovered_lines,
+        "uncovered_branches": uncovered_branches,
+    }
+
+
+def percent(hit: int, total: int) -> float | None:
+    if total <= 0:
+        return None
+    return round(100.0 * hit / total, 2)
+
+
 def main() -> int:
     cxx = os.environ.get("CXX", "g++")
     gcov = os.environ.get("GCOV", "gcov")
@@ -440,8 +785,9 @@ def main() -> int:
             "reason": "CXX or gcov not found",
             "cxx": cxx,
             "gcov": gcov,
+            "remedy": "c2hlsc-agent doctor --install",
         })
-        print("gcov coverage skipped: CXX or gcov not found")
+        print("gcov coverage skipped: CXX or gcov not found -- run `c2hlsc-agent doctor --install` to install it")
         return 0
 
     COVERAGE_DIR.mkdir(exist_ok=True)
@@ -449,14 +795,22 @@ def main() -> int:
         for path in ROOT.rglob(pattern):
             path.unlink()
 
-    flags = ["-std=c++17", "-Wall", "-Wextra", "-I", "src", "-O0", "--coverage"]
+    # -Wno-narrowing for the same reason as the host build: the golden C is compiled
+    # as C++, and C++11 rejects narrowing in brace-init that C accepts.
+    flags = ["-std=c++17", "-Wall", "-Wextra", "-Wno-narrowing", "-I", "src", "-I", ".", "-O0", "--coverage"]
     extra = os.environ.get("C2HLSC_GCOV_CXXFLAGS", "").split()
+    # Compile to objects under coverage/ first, then link. A one-step multi-source build
+    # makes gcc name the notes files <output>-<source>.gcno, which gcov then cannot find
+    # for src/hls_top.cpp -- the design would silently drop out of the coverage number.
     commands = [
-        [cxx, *flags, *extra, "tb/leveri_golden_tb.cpp", "-o", "coverage/leveri_golden_tb"],
-        [cxx, *flags, *extra, "tb/leveri_hls_tb.cpp", "src/hls_top.cpp", "-o", "coverage/leveri_hls_tb"],
+        [cxx, *flags, *extra, "-c", "tb/leveri_golden_tb.cpp", "-o", "coverage/leveri_golden_tb.o"],
+        [cxx, *flags, *extra, "coverage/leveri_golden_tb.o", "-o", "coverage/leveri_golden_tb"],
+        [cxx, *flags, *extra, "-c", "tb/leveri_hls_tb.cpp", "-o", "coverage/leveri_hls_tb.o"],
+        [cxx, *flags, *extra, "-c", "src/hls_top.cpp", "-o", "coverage/hls_top.o"],
+        [cxx, *flags, *extra, "coverage/leveri_hls_tb.o", "coverage/hls_top.o", "-o", "coverage/leveri_hls_tb"],
         ["coverage/leveri_golden_tb"],
         ["coverage/leveri_hls_tb"],
-        ["python3", "tb/leveri_compare.py", "leveri_golden_trace.csv", "leveri_hls_trace.csv"],
+        [sys.executable, "tb/leveri_compare.py", "leveri_golden_trace.csv", "leveri_hls_trace.csv"],
     ]
     command_logs: list[dict[str, object]] = []
     try:
@@ -480,27 +834,95 @@ def main() -> int:
 
     gcov_cmd = [gcov, "-b", "-c", "-o", str(COVERAGE_DIR), "tb/leveri_golden_tb.cpp", "tb/leveri_hls_tb.cpp", "src/hls_top.cpp"]
     gcov_result = run(gcov_cmd, check=False)
-    gcov_files = sorted(str(path.relative_to(ROOT)) for path in ROOT.rglob("*.gcov"))
+    gcov_files = sorted(ROOT.rglob("*.gcov"))
     coverage_data = sorted(str(path.relative_to(ROOT)) for path in ROOT.rglob("*.gcda"))
-    # The build, execution, and dual-trace comparison all succeeded above, so coverage
+
+    # Keep the report to project sources; standard-library headers pulled in by the
+    # harness are noise and are never part of the coverage claim.
+    parsed = [
+        entry
+        for entry in (parse_gcov(path) for path in gcov_files)
+        if entry and not str(entry["source"]).startswith("/")
+    ]
+    measured = [entry for entry in parsed if is_measured(str(entry["source"]))]
+    lines_total = sum(int(entry["lines_total"]) for entry in measured)
+    lines_hit = sum(int(entry["lines_hit"]) for entry in measured)
+    branches_total = sum(int(entry["branches_total"]) for entry in measured)
+    branches_hit = sum(int(entry["branches_hit"]) for entry in measured)
+    uncovered_lines = [
+        {"file": entry["source"], "line": line}
+        for entry in measured
+        for line in entry["uncovered_lines"]
+    ]
+    uncovered_branches = [
+        {"file": entry["source"], "line": item["line"], "branch": item["branch"]}
+        for entry in measured
+        for item in entry["uncovered_branches"]
+    ]
+    line_coverage = percent(lines_hit, lines_total)
+    branch_coverage = percent(branches_hit, branches_total)
+
+    # The build, execution, and dual-tier comparison all succeeded above, so coverage
     # correctness is already established. This target's job is to PRODUCE a coverage
     # report; pass when instrumentation actually emitted data. gcov's own exit code is
     # advisory only -- it varies across gcov/compiler versions and platforms for
     # source-path resolution -- so it does not gate the result.
     produced_coverage = bool(coverage_data or gcov_files)
+    status = "pass" if produced_coverage else "fail"
+
+    # An explicit target turns coverage into a gate; without one, coverage is evidence.
+    raw_min = os.environ.get("C2HLSC_MIN_COVERAGE", "").strip()
+    min_coverage = None
+    if raw_min:
+        try:
+            min_coverage = float(raw_min)
+        except ValueError:
+            min_coverage = None
+    # Gate on the WEAKER of line and branch coverage. Line coverage alone is easy to
+    # saturate while a whole branch stays unreached, which is exactly the case the
+    # refinement loop exists to find.
+    observed = [value for value in (line_coverage, branch_coverage) if value is not None]
+    gate_value = min(observed) if observed else None
+    below_target = (
+        status == "pass"
+        and min_coverage is not None
+        and gate_value is not None
+        and gate_value < min_coverage
+    )
+    if below_target:
+        status = "fail"
+
     write_report({
-        "status": "pass" if produced_coverage else "fail",
+        "status": status,
         "policy_id": "hls_leveri_shift_left_v1",
+        "line_coverage": line_coverage,
+        "branch_coverage": branch_coverage,
+        "lines_total": lines_total,
+        "lines_hit": lines_hit,
+        "branches_total": branches_total,
+        "branches_hit": branches_hit,
+        "min_coverage": min_coverage,
+        "gate_coverage": gate_value,
+        "below_target": below_target,
+        "measured_files": [str(entry["source"]) for entry in measured],
+        "uncovered_lines": uncovered_lines,
+        "uncovered_branches": uncovered_branches,
+        "files": parsed,
         "commands": command_logs,
         "gcov_cmd": gcov_cmd,
         "gcov_returncode": gcov_result.returncode,
         "gcov_stdout": gcov_result.stdout[-8000:],
         "gcov_stderr": gcov_result.stderr[-8000:],
-        "gcov_files": gcov_files,
+        "gcov_files": [str(path.relative_to(ROOT)) for path in gcov_files],
         "coverage_data": coverage_data,
     })
-    print(f"gcov coverage report written to {REPORT_PATH}")
-    return 0 if produced_coverage else 1
+    summary = "lines n/a" if line_coverage is None else f"lines {line_coverage:.2f}%"
+    if branch_coverage is not None:
+        summary += f", branches {branch_coverage:.2f}%"
+    if below_target:
+        summary += f" (below C2HLSC_MIN_COVERAGE={min_coverage})"
+    print(f"gcov coverage: {summary}; report written to {REPORT_PATH}")
+    return 0 if status == "pass" else 1
 
 
 if __name__ == "__main__":
@@ -509,24 +931,55 @@ if __name__ == "__main__":
 
 
 def _klee_script() -> str:
-    return """#!/usr/bin/env python3
+    return r"""#!/usr/bin/env python3
+'''Symbolic exploration of the golden C top.
+
+Runs KLEE natively when it is installed. Where it is not -- macOS has no Homebrew
+formula and Ubuntu does not package it either -- this falls back to the official
+klee/klee container automatically, so `make klee-coverage` and the refinement loop work
+on a Mac without anything being installed into the host PATH.
+
+The container is used automatically ONLY when its image is already on the machine.
+Pulling it is a multi-gigabyte download, and nothing that calls itself "coverage" should
+start one nobody asked for -- so an absent image reports skipped and says how to opt in.
+
+  C2HLSC_KLEE_DOCKER=0   never use the container, skip instead
+  C2HLSC_KLEE_DOCKER=1   use the container even if a native klee exists, pulling if needed
+  C2HLSC_KLEE_IMAGE=...  override the image (default klee/klee:latest)
+'''
 from __future__ import annotations
 
 import json
 import os
+import platform
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
 COVERAGE_DIR = ROOT / "coverage"
 REPORT_PATH = COVERAGE_DIR / "klee_report.json"
+DEFAULT_IMAGE = "klee/klee:latest"
+DOCTOR = "c2hlsc-agent doctor --install"
 
 
-def write_report(payload: dict[str, object]) -> None:
+def as_text(value: object) -> str:
+    # Captured output as text. TimeoutExpired carries whatever the pipes held when the
+    # deadline passed, and that is *undecoded bytes* even for a text-mode subprocess.run:
+    # the decode only happens on the normal return path. Writing it straight to JSON
+    # raises, which would lose the very report that explains the timeout.
+    if isinstance(value, bytes):
+        return value.decode("utf-8", "replace")
+    return value if isinstance(value, str) else ""
+
+
+def write_report(payload: dict) -> None:
     COVERAGE_DIR.mkdir(exist_ok=True)
-    REPORT_PATH.write_text(json.dumps(payload, indent=2) + "\\n", encoding="utf-8")
+    # default=str so that no unexpected value can stop the report from being written: a
+    # missing report reads as "the tool never ran", which is a different claim entirely.
+    REPORT_PATH.write_text(json.dumps(payload, indent=2, default=str) + "\n", encoding="utf-8")
 
 
 def resolve_tool(env_name: str, *candidate_names: str) -> str | None:
@@ -559,22 +1012,188 @@ def default_klee_include(klee_path: str | None) -> str | None:
     return None
 
 
+def docker_available() -> tuple[bool, str]:
+    '''Whether the official KLEE image can actually run here.
+
+    Three things have to hold, and checking fewer than all three produces a confusing
+    failure instead of a clean skip:
+      * the CLI exists -- a Mac with Docker Desktop closed still has the binary;
+      * a daemon answers;
+      * that daemon runs LINUX containers. klee/klee is a Linux image, and a Windows
+        daemon in Windows-container mode answers `docker info` happily and then fails
+        `docker run` with exit 125.
+    '''
+    if shutil.which("docker") is None:
+        return False, "docker not installed"
+    try:
+        probe = subprocess.run(
+            ["docker", "info", "--format", "{{.OSType}}"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return False, f"docker not usable: {exc}"
+    if probe.returncode != 0:
+        return False, "docker daemon is not running (start Docker Desktop)"
+    os_type = probe.stdout.strip().lower()
+    if os_type and os_type != "linux":
+        return False, f"docker daemon runs {os_type} containers; klee/klee is a Linux image"
+    return True, ""
+
+
+def image_present(image: str) -> bool:
+    '''Whether the image is already local, so using it costs nothing.
+
+    Deliberately does not pull. An automatic route that downloads gigabytes turns a
+    coverage target into a surprise, and on CI it turned a 35-second suite into a
+    206-second one.
+    '''
+    try:
+        probe = subprocess.run(
+            ["docker", "image", "inspect", image],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return probe.returncode == 0
+
+
+def _container_failed(image: str, forced: bool, reason: str, extra: dict) -> int:
+    # A container failure is only a FAILURE when the container was asked for.
+    #
+    # Reached automatically it means the same thing as KLEE not being installed: this
+    # machine cannot do symbolic exploration. That is a skip and exit 0 -- an absent
+    # optional tool must never fail a build. Forced with C2HLSC_KLEE_DOCKER=1 the user
+    # asked for the container specifically, so its failure is real and reported as such.
+
+    payload = {"mode": "docker", "image": image, "reason": reason, **extra}
+    if forced:
+        write_report({"status": "fail", **payload})
+        print(f"KLEE container run failed: {reason}", file=sys.stderr)
+        return 1
+    write_report({"status": "skipped", "remedy": DOCTOR, **payload})
+    print(f"KLEE coverage skipped: container unavailable ({reason}) -- {DOCTOR}")
+    return 0
+
+
+CONTAINER_SCRIPT = r'''
+set -e
+INC=""
+for c in /home/klee/klee_src/include /usr/local/include /usr/include; do
+  if [ -f "$c/klee/klee.h" ]; then INC="$c"; break; fi
+done
+if [ -z "$INC" ]; then echo "klee headers not found inside the image" >&2; exit 3; fi
+CXX=clang++
+command -v clang++ >/dev/null 2>&1 || CXX="clang -x c++"
+mkdir -p coverage
+$CXX -std=c++17 -I . -I "$INC" -emit-llvm -c -g -O0 tb/klee_driver.cpp -o coverage/klee_driver.bc
+klee --output-dir=coverage/klee-out coverage/klee_driver.bc
+'''
+
+
+def run_in_docker(timeout_s: int, forced: bool) -> int:
+    image = os.environ.get("C2HLSC_KLEE_IMAGE", DEFAULT_IMAGE)
+    klee_out = COVERAGE_DIR / "klee-out"
+    if klee_out.exists():
+        shutil.rmtree(klee_out)
+    COVERAGE_DIR.mkdir(exist_ok=True)
+
+    command = ["docker", "run", "--rm", "-v", f"{ROOT}:/work", "-w", "/work"]
+    if platform.system() == "Linux":
+        # Bind mounts on Linux keep the container's uid, so without this every artifact
+        # KLEE writes would land root-owned in the user's project.
+        command += ["-u", f"{os.getuid()}:{os.getgid()}"]
+    command += [image, "bash", "-c", CONTAINER_SCRIPT]
+
+    logs: list[dict] = []
+    try:
+        result = subprocess.run(command, cwd=ROOT, capture_output=True, text=True, timeout=timeout_s)
+    except subprocess.TimeoutExpired as exc:
+        return _container_failed(
+            image, forced, "timeout",
+            {"timeout_s": timeout_s, "stdout": as_text(exc.stdout)[-4000:], "stderr": as_text(exc.stderr)[-4000:]},
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return _container_failed(image, forced, str(exc), {})
+
+    logs.append({
+        "cmd": command[:-1] + ["<script>"],
+        "returncode": result.returncode,
+        "stdout": result.stdout[-8000:],
+        "stderr": result.stderr[-8000:],
+    })
+    if result.returncode != 0:
+        return _container_failed(
+            image, forced, f"container exited {result.returncode}",
+            {"commands": logs},
+        )
+    ktests = sorted(str(path.relative_to(ROOT)) for path in klee_out.glob("*.ktest")) if klee_out.exists() else []
+    write_report({
+        "status": "pass",
+        "mode": "docker",
+        "image": image,
+        "policy_id": "hls_leveri_shift_left_v1",
+        "commands": logs,
+        "ktest_count": len(ktests),
+        "ktest_files": ktests,
+    })
+    print(f"KLEE ({image}) report written to {REPORT_PATH}")
+    return 0
+
+
+def container_route(timeout_s: int, forced: bool) -> tuple[bool, str]:
+    # Whether the container can be used here, and if not, why. Kept separate from main()
+    # so every combination of (native klee, docker, forced) has one obvious answer.
+    image = os.environ.get("C2HLSC_KLEE_IMAGE", DEFAULT_IMAGE)
+    ok, reason = docker_available()
+    if not ok:
+        return False, reason
+    if not forced and not image_present(image):
+        return False, (
+            f"{image} is not pulled locally; run C2HLSC_KLEE_DOCKER=1 once "
+            f"(or `docker pull {image}`) to enable the container route"
+        )
+    return True, ""
+
+
+def skip(reason: str, **extra) -> int:
+    write_report({"status": "skipped", "reason": reason, "remedy": DOCTOR, **extra})
+    print(f"KLEE coverage skipped: {reason} -- {DOCTOR}")
+    return 0
+
+
 def main() -> int:
+    forced = os.environ.get("C2HLSC_KLEE_DOCKER", "").strip()
+    timeout_s = int(os.environ.get("C2HLSC_KLEE_TIMEOUT", "60"))
+
     klee = resolve_tool("KLEE", "klee")
     clangxx = resolve_tool("KLEE_CXX", "klee-clang++", "clang++")
     klee_include = os.environ.get("KLEE_INCLUDE_DIR") or default_klee_include(klee)
-    if klee is None:
-        write_report({"status": "skipped", "reason": "klee not found"})
-        print("KLEE coverage skipped: klee not found")
-        return 0
-    if clangxx is None:
-        write_report({"status": "skipped", "reason": "clang++ not found"})
-        print("KLEE coverage skipped: clang++ not found")
-        return 0
-    if klee_include is None or not Path(klee_include).exists():
-        write_report({"status": "skipped", "reason": "KLEE include directory not found", "klee_include": klee_include})
-        print("KLEE coverage skipped: include directory not found")
-        return 0
+    native_ready = bool(klee and clangxx and klee_include and Path(klee_include).exists())
+
+    # The user asked for the container specifically.
+    if forced == "1":
+        ok, reason = container_route(timeout_s, forced=True)
+        if ok:
+            return run_in_docker(timeout_s, True)
+        return skip(reason, mode="docker")
+
+    if not native_ready:
+        missing = (
+            "klee not found" if not klee
+            else "clang++ not found" if not clangxx
+            else "KLEE include directory not found"
+        )
+        if forced == "0":
+            # Explicitly disabled; do not even look at docker.
+            return skip(missing, mode="none", docker_reason="disabled by C2HLSC_KLEE_DOCKER=0")
+        ok, reason = container_route(timeout_s, forced=False)
+        if ok:
+            return run_in_docker(timeout_s, False)
+        return skip(missing, mode="none", docker_reason=reason)
 
     COVERAGE_DIR.mkdir(exist_ok=True)
     bitcode = COVERAGE_DIR / "klee_driver.bc"
@@ -597,8 +1216,7 @@ def main() -> int:
         "-o",
         str(bitcode),
     ]
-    timeout_s = int(os.environ.get("C2HLSC_KLEE_TIMEOUT", "60"))
-    logs: list[dict[str, object]] = []
+    logs: list[dict] = []
     try:
         compiled = subprocess.run(compile_cmd, cwd=ROOT, text=True, capture_output=True, check=True)
         logs.append({"cmd": compile_cmd, "returncode": compiled.returncode, "stdout": compiled.stdout[-4000:], "stderr": compiled.stderr[-4000:]})
@@ -609,6 +1227,7 @@ def main() -> int:
         status = "pass" if executed.returncode == 0 else "fail"
         write_report({
             "status": status,
+            "mode": "native",
             "policy_id": "hls_leveri_shift_left_v1",
             "commands": logs,
             "ktest_count": len(ktests),
@@ -617,12 +1236,12 @@ def main() -> int:
         print(f"KLEE report written to {REPORT_PATH}")
         return executed.returncode
     except subprocess.TimeoutExpired as exc:
-        logs.append({"cmd": exc.cmd, "timeout_s": timeout_s, "stdout": (exc.stdout or "")[-4000:], "stderr": (exc.stderr or "")[-4000:]})
-        write_report({"status": "fail", "reason": "timeout", "commands": logs})
+        logs.append({"cmd": exc.cmd, "timeout_s": timeout_s, "stdout": as_text(exc.stdout)[-4000:], "stderr": as_text(exc.stderr)[-4000:]})
+        write_report({"status": "fail", "mode": "native", "reason": "timeout", "commands": logs})
         return 1
     except subprocess.CalledProcessError as exc:
-        logs.append({"cmd": exc.cmd, "returncode": exc.returncode, "stdout": (exc.stdout or "")[-4000:], "stderr": (exc.stderr or "")[-4000:]})
-        write_report({"status": "fail", "reason": "compile_failed", "commands": logs})
+        logs.append({"cmd": exc.cmd, "returncode": exc.returncode, "stdout": as_text(exc.stdout)[-4000:], "stderr": as_text(exc.stderr)[-4000:]})
+        write_report({"status": "fail", "mode": "native", "reason": "compile_failed", "commands": logs})
         return exc.returncode or 1
 
 
@@ -642,11 +1261,20 @@ def _manifest(analysis: AnalysisResult, config: AgentConfig) -> str:
         "checks": [
             "static_header_alignment",
             "static_role_alignment",
+            "static_cycle_count_alignment",
             "stimulus_column_alignment",
+            "static_control_flow_alignment",
+            "static_data_dependency_alignment",
             "dynamic_output_consistency",
             "gcov_concrete_coverage",
             "klee_symbolic_path_exploration",
+            "coverage_driven_refinement",
         ],
+        "directed_tests": directed_schedule(config),
+        "extra_vectors": [vector.to_dict() for vector in extra_vectors(config)],
+        "columns": _columns(fn.args, fn.return_type),
+        "testbench_sources": ["tb/leveri_golden_tb.cpp", "tb/leveri_hls_tb.cpp"],
+        "traces": ["leveri_golden_trace.csv", "leveri_hls_trace.csv"],
         "coverage_hooks": {
             "gcov": {
                 "script": "tb/run_gcov.py",
@@ -659,6 +1287,11 @@ def _manifest(analysis: AnalysisResult, config: AgentConfig) -> str:
                 "report": "coverage/klee_report.json",
                 "make_target": "klee-coverage",
             },
+        },
+        "refinement": {
+            "script": "c2hlsc_agent/coverage_refine.py",
+            "command": "c2hlsc-agent refine --project .",
+            "make_target": "refine-coverage",
         },
         "generated_files": [
             "tb/leveri_golden_tb.cpp",
@@ -683,11 +1316,54 @@ def _manifest(analysis: AnalysisResult, config: AgentConfig) -> str:
     return json.dumps(payload, indent=2) + "\n"
 
 
+#: Columns x rows above which the paired traces stop being a diagnostic artifact and
+#: start being a disk-exhaustion hazard. The tier writes one CSV column per array
+#: *element*, so a design with megabyte arrays produces gigabyte traces: knn declares
+#: 3,145,730 elements across its arguments, which at num_tests=100 is ~3.8 GB per side.
+TRACE_CELL_WARN_THRESHOLD = 5_000_000
+
+
+def projected_trace_cells(columns: list[dict[str, object]], num_tests: int) -> int:
+    """Total CSV cells each paired trace will contain."""
+
+    return max(len(columns) - 1, 0) * max(num_tests, 0)
+
+
+def _warn_if_trace_is_huge(analysis: AnalysisResult, config: AgentConfig) -> int:
+    """Record, and warn about, a paired trace large enough to be a hazard.
+
+    The tier's value is that both sides emit every stimulus and output column, which is
+    what makes the static alignment check meaningful. That does not scale: the columns
+    are per *element*, so real array bounds turn the traces into multi-gigabyte files
+    long before they turn into a useful diagnostic. Warning is deliberate -- silently
+    capping the columns would weaken the check without saying so, and this tier is the
+    reason the shift-left comparison exists.
+    """
+
+    cells = projected_trace_cells(_columns(analysis.function.args, analysis.function.return_type), config.num_tests)
+    if cells > TRACE_CELL_WARN_THRESHOLD:
+        analysis.diagnostics.add(
+            "warning",
+            "large-paired-trace",
+            f"each paired trace will hold about {cells:,} cells "
+            f"({config.num_tests} rows); expect multi-gigabyte CSVs and slow comparison",
+            analysis.function.source_path.name,
+            "Lower num_tests, or shrink the declared argument lengths, for a trace this wide.",
+        )
+    return cells
+
+
 def generate_leveri_testbenches(analysis: AnalysisResult, config: AgentConfig) -> LeVeriTestbenchBundle:
     fn = analysis.function
+    _warn_if_trace_is_huge(analysis, config)
     golden_include = f"""extern "C" {{
+// The golden C may carry its own main() -- benchmark sources usually do. The
+// testbench defines main, so rename the original's out of the way rather than
+// colliding with it. CHStone's own flow does the same thing with -Dmain=...
+#define main c2hlsc_golden_main
 #define {fn.name} {fn.name}_ref
 #include "../input.c"
+#undef main
 #undef {fn.name}
 }}"""
     hls_include = '#include "../src/hls_top.hpp"'

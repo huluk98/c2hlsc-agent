@@ -1,11 +1,12 @@
+import os
 import shutil
-import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # tests/ importable however this is invoked
 
 from c2hlsc_agent.agent_loop import leveri_testbench_policy, multi_agent_procedures
 from c2hlsc_agent.analyze import analyze_source
@@ -18,6 +19,14 @@ from c2hlsc_agent.leveri_testgen import (
     LEVERI_TESTBENCH_SYSTEM_PROMPT,
     generate_leveri_testbenches,
     get_leveri_testbench_contract,
+)
+
+from support import (  # noqa: E402 - tests/ is on sys.path via unittest discover
+    BUILD_REASON,
+    GCOV_REASON,
+    HAVE_BUILD,
+    HAVE_GCOV,
+    run_target,
 )
 
 
@@ -87,9 +96,13 @@ class LeVeriTestgenTests(unittest.TestCase):
         self.assertIn("klee_report.json", bundle.klee_script)
         self.assertIn("static_header_alignment", bundle.manifest_json)
         self.assertIn("dynamic_output_consistency", bundle.manifest_json)
-        self.assertIn("HLS-LeVeri consistency check passed", bundle.compare_script)
+        self.assertIn("HLS-LeVeri dual-tier consistency check passed", bundle.compare_script)
+        self.assertIn("static_control_flow_alignment", bundle.manifest_json)
+        self.assertIn("static_data_dependency_alignment", bundle.manifest_json)
+        self.assertIn("cfg_signature", bundle.compare_script)
+        self.assertIn("ddg_signature", bundle.compare_script)
 
-    @unittest.skipUnless(shutil.which("g++") and shutil.which("make") and shutil.which("python3"), "g++, make, and python3 are required")
+    @unittest.skipUnless(HAVE_BUILD, BUILD_REASON)
     def test_project_leveri_trace_check_passes(self):
         analysis, cfg = self._analysis()
         generated = generate_hls_sources(analysis, cfg)
@@ -98,11 +111,11 @@ class LeVeriTestgenTests(unittest.TestCase):
         project = Path(tmp.name) / "project"
         write_project(project, analysis, generated, cfg)
 
-        run = subprocess.run(["make", "-C", str(project), "leveri-test"], text=True, capture_output=True)
+        run = run_target(project, "leveri-test")
         self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
-        self.assertIn("HLS-LeVeri consistency check passed", run.stdout)
+        self.assertIn("HLS-LeVeri dual-tier consistency check passed", run.stdout)
 
-    @unittest.skipUnless(shutil.which("g++") and shutil.which("gcov") and shutil.which("make") and shutil.which("python3"), "g++, gcov, make, and python3 are required")
+    @unittest.skipUnless(HAVE_GCOV, GCOV_REASON)
     def test_project_gcov_coverage_target_writes_report(self):
         analysis, cfg = self._analysis()
         generated = generate_hls_sources(analysis, cfg)
@@ -111,13 +124,13 @@ class LeVeriTestgenTests(unittest.TestCase):
         project = Path(tmp.name) / "project"
         write_project(project, analysis, generated, cfg)
 
-        run = subprocess.run(["make", "-C", str(project), "gcov-coverage"], text=True, capture_output=True)
+        run = run_target(project, "gcov-coverage")
         self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
         report = project / "coverage" / "gcov_report.json"
         self.assertTrue(report.exists())
         self.assertIn('"status": "pass"', report.read_text(encoding="utf-8"))
 
-    @unittest.skipUnless(shutil.which("make") and shutil.which("python3"), "make and python3 are required")
+    @unittest.skipUnless(HAVE_BUILD, BUILD_REASON)
     def test_project_klee_target_skips_cleanly_when_klee_missing(self):
         if shutil.which("klee"):
             self.skipTest("this test only checks the portable no-KLEE fallback")
@@ -128,7 +141,10 @@ class LeVeriTestgenTests(unittest.TestCase):
         project = Path(tmp.name) / "project"
         write_project(project, analysis, generated, cfg)
 
-        run = subprocess.run(["make", "-C", str(project), "klee-coverage"], text=True, capture_output=True)
+        # This test is about the no-KLEE skip path, so the container fallback is turned
+        # off explicitly. Otherwise the result depends on whether the machine happens to
+        # have the klee/klee image cached, which is not what is being tested.
+        run = run_target(project, "klee-coverage", env={**os.environ, "C2HLSC_KLEE_DOCKER": "0"})
         self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
         report = project / "coverage" / "klee_report.json"
         self.assertTrue(report.exists())

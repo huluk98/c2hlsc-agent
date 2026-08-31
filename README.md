@@ -202,6 +202,36 @@ single generation step. The intended agents are:
 8. `audit_memory_agent`: stores reproducible artifacts and promotes only audited repair
    successes into retrieval memory.
 
+Each of those eight is bound to the code that implements it today in
+`c2hlsc_agent/components.py`: one `ComponentSpec` per agent (stage, real entry points,
+artifacts read and written, the gate that stops the flow, the run-control budgets it
+spends, its invariants, and the seam where a live model-driven agent would take over) plus
+a thin executable adapter with a uniform `run(context) -> ComponentOutcome` contract.
+Inspect it without running anything:
+
+```bash
+python -m c2hlsc_agent components              # stage graph + every component
+python -m c2hlsc_agent components --pipeline   # the default start-to-finish order
+python -m c2hlsc_agent components --component hlsc_repair_agent
+python -m c2hlsc_agent components --json
+```
+
+Three documents go with it:
+
+- [`docs/input_contract.md`](docs/input_contract.md) — **start here to run your own
+  design**: what the C analyzer accepts and rejects, every `config.yaml` key with its
+  default and effect, and a map of every artifact a run emits and what each one is
+  evidence for.
+- [`docs/workflow_end_to_end.md`](docs/workflow_end_to_end.md) — the complete walkthrough
+  from an input C file or NL spec to a verified (and optionally PPA-optimized) project:
+  every stage, gate, artifact, budget, failure family, and exit code.
+- [`docs/agent_components.md`](docs/agent_components.md) — the per-component reference,
+  generated from the registry itself (`python -m c2hlsc_agent components --markdown`).
+
+`cli.run_convert` remains the production driver — it owns the persistent budgets, the
+bounded repair loop, and the oscillation guards. The component layer describes and exposes
+that flow; it never duplicates the control logic and never relaxes an invariant.
+
 Important correction: Vitis C/RTL CoSim checks generated RTL against the HLS-C design
 under the supplied testbench. It does not, by itself, prove that RTL is equivalent to the
 original C. For a defensible "functional equivalent RTL" claim, the loop must keep the
@@ -402,6 +432,20 @@ The local policy lives in `c2hlsc_agent/leveri_testgen.py` as
 `hls_leveri_shift_left_v1`. It is owned by `shift_left_testbench_agent`, not by
 `hlsc_generator_agent`.
 
+The paper this follows is *Shift-Left High-Level Synthesis Verification via
+Knowledge-Augmented LLM Agent* (arXiv:2606.17128). What is implemented here:
+
+| Paper component | Status |
+| --- | --- |
+| Paired golden/HLS testbenches from one contract, one synchronized stimulus schedule | implemented |
+| Dual-tier check — static structural alignment | implemented: trace schema, stimulus columns, **control flow**, **def-use** |
+| Dual-tier check — dynamic behavioural consistency | implemented, clamped to the declared active length |
+| Concrete coverage with gcov | implemented and **parsed**: line/branch percentages plus the uncovered line and branch list |
+| Symbolic exploration with KLEE | implemented: driver, run, and `.ktest` decoding |
+| Coverage-driven refinement loop | implemented as `c2hlsc-agent refine` — KLEE counterexamples become permanent directed cases; widening is the documented fallback where KLEE is unavailable |
+| Heterogeneous HLS Verification Knowledge Graph | **not implemented**; the manifest records the metadata a future graph would need |
+| Benchmark reproduction over the paper's 107 pairs | **not implemented** |
+
 For every generated project, AUTO RTL now writes:
 
 - `tb/leveri_golden_tb.cpp`: runs the macro-renamed original C and writes
@@ -413,6 +457,8 @@ For every generated project, AUTO RTL now writes:
 - `tb/klee_driver.cpp`: symbolic KLEE driver for the golden C top function
 - `tb/run_klee.py`: optional KLEE runner that writes a skip report if KLEE is absent
 - `tb/leveri_manifest.json`: records KG-ready metadata for the testbench bundle
+- `tb/stimulus_contract.json`: the argument metadata, test count and seed the project was
+  built with, so `refine` can regenerate the same stimulus without `--config`
 
 Run the paired trace check with:
 
@@ -573,6 +619,42 @@ sessions inherit the repository-specific engineering and evidence rules in
 `$coordinate-team-work` skill and its bounded project agents. Native Windows
 and Ubuntu preflight commands live in `scripts/team_preflight.ps1` and
 `scripts/team_preflight.sh`.
+
+## Windows quickstart (native, no WSL)
+
+Clone and run one command:
+
+```powershell
+git clone https://github.com/huluk98/c2hlsc-agent.git
+cd c2hlsc-agent
+powershell -ExecutionPolicy Bypass -File scripts\setup_windows.ps1
+```
+
+It installs the package, reports which tools each verification tier needs, and runs the
+offline test suite. Add `-InstallTools` to have it install the missing ones through winget.
+
+What you actually need:
+
+| Need | Answer |
+| --- | --- |
+| Python 3.10+ | Any name — the agent passes its own interpreter through, so `python` vs `python3` never matters |
+| A C++ compiler | `winget install LLVM.LLVM` (clang++), or MSYS2 `mingw-w64-gcc`. **MSVC (`cl.exe`) will not work** — GCC-style flags |
+| `make` | **Not needed.** Every recipe lives in the generated `tb/host_build.py`; the Makefile is just an alias |
+| A POSIX shell | **Not needed.** `run_all.py` is the shell-free sibling of `run_all.sh` |
+| Vitis HLS | Linux-only. Run it remotely with `--vitis-ssh user@linux-host`; everything else stays local |
+
+Then convert something:
+
+```powershell
+python -m c2hlsc_agent convert --input examples\vector_add\input.c --top vector_add `
+  --config examples\vector_add\config.yaml --out build\vector_add
+python -m c2hlsc_agent doctor
+```
+
+Line endings are pinned by `.gitattributes`, so a Windows clone does not silently rewrite
+shell scripts or TCL to CRLF and break them on the Linux synthesis host. CI runs the full
+suite on `windows-latest` and converts an example there with `make` unused, so the native
+path stays working.
 
 ## Install
 
@@ -786,8 +868,25 @@ Supported options:
 - `--llm-model qwen2.5-coder`
 - `--verbose`
 
-Use `python -m c2hlsc_agent.cli repair --help` for the separate external-evidence
-repair command.
+Other subcommands:
+
+- `repair` — apply a repair from evidence produced by an external run
+  (`python -m c2hlsc_agent repair --help`).
+- `optimize` — the post-equivalence QoR loop (`rtl_optimizer_agent`).
+- `refine` — coverage-driven stimulus refinement: measure structural coverage, turn what
+  the schedule never reaches into permanent directed cases, and repeat.
+- `doctor` — check every external tool each tier needs and, with `--install`, install the
+  missing ones through Homebrew (macOS) or apt/dnf/pacman (Linux). Package names are
+  verified against the platform's index before being offered, so it never hands you a
+  command that does not exist. For KLEE specifically: `apt-get install klee` on Debian,
+  `sudo bash scripts/install_klee.sh` on Ubuntu (not packaged there), and on macOS
+  nothing at all — the generated `tb/run_klee.py` uses the official `klee/klee`
+  container as soon as Docker is running.
+- `status` — read the persistent bounded-run ledger without changing it.
+- `components` — inspect the agent component scaffold; runs nothing.
+
+`python -m c2hlsc_agent <command>` and `python -m c2hlsc_agent.cli <command>` are
+equivalent, as is the installed `c2hlsc-agent` console script.
 
 ## Config Format
 
@@ -829,7 +928,7 @@ For each conversion, the output directory contains:
 - `src/hls_top.cpp`
 - `tb/testbench.cpp`
 - `tb/leveri_golden_tb.cpp`, `tb/leveri_hls_tb.cpp`, `tb/leveri_compare.py`,
-  `tb/run_gcov.py`, `tb/klee_driver.cpp`, `tb/run_klee.py`, `tb/leveri_manifest.json`
+  `tb/run_gcov.py`, `tb/klee_driver.cpp`, `tb/run_klee.py`, `tb/leveri_manifest.json`, `tb/stimulus_contract.json`
   (the HLS-LeVeri shift-left verification bundle)
 - `tb/rtl_vectors_tb.cpp`, `tb/gen_rtl_tb.py`, `tb/run_rtl_sim.py`,
   `tb/rtl_tb_manifest.json` (the standalone RTL/Verilog testbench bundle)
@@ -843,13 +942,28 @@ For each conversion, the output directory contains:
 ## Verification Order
 
 1. Static analysis
-2. Host software equivalence with `g++`
-3. Vitis HLS `csim_design`
-4. Vitis HLS `csynth_design`
-5. Vitis HLS `cosim_design`
+2. Host software equivalence with `g++` (`tb/host_build.py test`)
+3. Trace consistency — the HLS-LeVeri dual tier (`tb/host_build.py leveri-test`)
+4. Vitis HLS `csim_design`
+5. Vitis HLS `csynth_design`
+6. Vitis HLS `cosim_design`
 
-When `--no-run-vitis` is used, Vitis phases are marked `skipped`; host equivalence is
-still run when `g++` is available.
+Steps 2 and 3 are the host tier and always run. When `--no-run-vitis` is used, the Vitis
+phases are marked `skipped`; host equivalence and trace consistency still run given a
+GCC/Clang-style compiler and Python.
+
+**`make` is not required.** Every recipe lives in the generated `tb/host_build.py`, which
+the agent runs with its own interpreter; the Makefile is a thin alias over the same file.
+That is what makes native Windows work — no MSYS, no Cygwin, no WSL. See
+[`docs/workflow_end_to_end.md`](docs/workflow_end_to_end.md) for the Windows specifics.
+
+Step 3 is what makes the shift-left tier a gate rather than an advisory report. Its static
+half compares the two paired *harnesses* (trace schema, stimulus columns, control-flow
+shape, def-use structure) and its dynamic half compares their output traces, clamped to the
+declared active length. A static-tier failure is routed to `shift_left_testbench_agent` as
+a testbench defect; a dynamic-tier failure is routed to `failure_analyst` as a design
+defect. See [`docs/workflow_end_to_end.md`](docs/workflow_end_to_end.md) for the full
+walkthrough.
 
 By default, `convert` does not mutate a failing project after verification. This keeps
 the current split-machine workflow explicit: run Vitis/CoSim wherever the toolchain is

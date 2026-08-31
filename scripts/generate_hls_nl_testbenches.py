@@ -327,7 +327,6 @@ def semantic_checks(sig: FunctionSig, oracle_mode: str = "driver") -> tuple[str,
     ins = input_args(sig)
     outs = output_args(sig)
     out_names = {arg.name.lower(): arg for arg in outs}
-    in_names = {arg.name.lower(): arg for arg in ins}
     checks: list[str] = []
 
     a = find_arg(ins, {"a", "A", "in1", "x"})

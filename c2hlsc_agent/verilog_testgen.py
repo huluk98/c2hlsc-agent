@@ -4,7 +4,8 @@ import json
 import re
 from dataclasses import dataclass
 
-from .analyze import AnalysisResult, FunctionArg
+from .testgen import multi_dim_cast
+from .analyze import AnalysisResult, FunctionArg, active_length_arg, looks_like_length_name
 from .config import AgentConfig
 
 
@@ -68,17 +69,6 @@ def get_rtl_testbench_contract() -> RtlTestbenchContract:
 # Type helpers
 # ---------------------------------------------------------------------------
 
-_LENGTH_NAMES = {
-    "n",
-    "len",
-    "length",
-    "size",
-    "count",
-    "num",
-    "limit",
-    "samples",
-    "elements",
-}
 
 
 def _clean_type(c_type: str) -> str:
@@ -125,30 +115,10 @@ def _addr_bits(depth: int) -> int:
     return max(1, (depth - 1).bit_length())
 
 
-def _looks_like_length_name(scalar_name: str, array_name: str) -> bool:
-    name = scalar_name.lower()
-    array = array_name.lower()
-    return (
-        name in _LENGTH_NAMES
-        or name in {f"{array}_n", f"n_{array}", f"{array}_len", f"{array}_length", f"{array}_size", f"{array}_count"}
-        or name.startswith("num_")
-        or name.endswith("_len")
-        or name.endswith("_length")
-        or name.endswith("_size")
-        or name.endswith("_count")
-    )
+_looks_like_length_name = looks_like_length_name
 
 
-def _active_length_arg(array_arg: FunctionArg, scalars: list[FunctionArg]) -> FunctionArg | None:
-    for scalar in scalars:
-        if not scalar.scalar_range:
-            continue
-        lo, hi = scalar.scalar_range
-        if lo < 0 or array_arg.length is None or hi > array_arg.length:
-            continue
-        if _looks_like_length_name(scalar.name, array_arg.name):
-            return scalar
-    return None
+_active_length_arg = active_length_arg
 
 
 def _array_ports(direction: str) -> list[str]:
@@ -402,7 +372,7 @@ def _vectors_tb(analysis: AnalysisResult, config: AgentConfig, spec: dict[str, o
         info = array_spec[arg.name]
         storage = _storage_type(arg)
         depth = info["depth"]
-        declarations.append(f"    {storage} ref_{arg.name}[{depth}] = {{}};")
+        declarations.append(f"    static {storage} ref_{arg.name}[{depth}] = {{}};")
         unsigned = "true" if info["signed"] is False else "false"
         if arg.direction in {"input", "inout"}:
             initializers.append(
@@ -426,7 +396,12 @@ def _vectors_tb(analysis: AnalysisResult, config: AgentConfig, spec: dict[str, o
 
     call_args = []
     for arg in fn.args:
-        call_args.append(f"ref_{arg.name}" if arg.is_pointer_like else arg.name)
+        if arg.is_pointer_like:
+            cast = multi_dim_cast(arg)
+            name = f"ref_{arg.name}"
+            call_args.append(f"reinterpret_cast<{cast}>({name})" if cast else name)
+        else:
+            call_args.append(arg.name)
     return_prefix = f"{fn.return_type} ref_ret = " if fn.return_type != "void" else ""
 
     for arg in arrays:
@@ -463,8 +438,13 @@ def _vectors_tb(analysis: AnalysisResult, config: AgentConfig, spec: dict[str, o
 
 extern "C" {{
 #define restrict __restrict__
+// The golden C may carry its own main() -- benchmark sources usually do. The
+// testbench defines main, so rename the original's out of the way rather than
+// colliding with it. CHStone's own flow does the same thing with -Dmain=...
+#define main c2hlsc_golden_main
 #define {fn.name} {fn.name}_ref
 #include "../input.c"
+#undef main
 #undef {fn.name}
 }}
 
@@ -629,6 +609,11 @@ def render(spec: dict) -> str:
     add("  wire ap_done, ap_idle, ap_ready;")
     add("  integer errors = 0;")
     add("  integer warns = 0;")
+    # Positive evidence. A compare length that loaded as X makes `i < len` false on the
+    # first iteration, so the loop body never runs and the run reports PASS having
+    # compared nothing. Counting what was actually examined is what makes the verdict mean
+    # something; see the COMPARED line and the pass predicate below.
+    add("  integer compares = 0;")
     add("  integer t, i;")
 
     for scalar in scalars:
@@ -764,16 +749,25 @@ def render(spec: dict) -> str:
         advisory = bool(array.get("advisory"))
         kind = "WARN" if advisory else "MISMATCH"
         counter = "warns" if advisory else "errors"
-        add(f"      for (i = 0; i < {name}_cmp[t]; i = i + 1) begin")
-        add(f"        if ({name}_ram[i] !== {name}_exp[t*{depth} + i]) begin")
-        add(f'          $display("RTL_TB: {kind} test=%0d {name}[%0d] expected=%h actual=%h", t, i, {name}_exp[t*{depth} + i], {name}_ram[i]);')
-        add(f"          {counter} = {counter} + 1;")
+        # An unreadable or short vector file leaves the compare length at X. Detect it
+        # rather than letting `i < X` silently skip the whole comparison.
+        add(f"      if (^{name}_cmp[t] === 1'bx) begin")
+        add(f'        $display("RTL_TB: FAIL test=%0d {name} compare length did not load (vector file missing or short)", t);')
+        add("        errors = errors + 1;")
+        add("      end else begin")
+        add(f"        for (i = 0; i < {name}_cmp[t]; i = i + 1) begin")
+        add("          compares = compares + 1;")
+        add(f"          if ({name}_ram[i] !== {name}_exp[t*{depth} + i]) begin")
+        add(f'            $display("RTL_TB: {kind} test=%0d {name}[%0d] expected=%h actual=%h", t, i, {name}_exp[t*{depth} + i], {name}_ram[i]);')
+        add(f"            {counter} = {counter} + 1;")
+        add("          end")
         add("        end")
         add("      end")
     if ret is not None:
         advisory = bool(ret.get("advisory"))
         kind = "WARN" if advisory else "MISMATCH"
         counter = "warns" if advisory else "errors"
+        add("      compares = compares + 1;")
         add("      if (ret_actual !== ret_exp[t]) begin")
         add(f'        $display("RTL_TB: {kind} test=%0d return expected=%h actual=%h", t, ret_exp[t], ret_actual);')
         add(f"        {counter} = {counter} + 1;")
@@ -784,8 +778,17 @@ def render(spec: dict) -> str:
         # A void top with no output/inout array has nothing observable to check, so a bare
         # "PASS" would be vacuous. Say so explicitly instead of implying equivalence.
         add('    $display("RTL_TB: NOTE no observable outputs to compare; PASS means the design only reached ap_done");')
-    add('    if (errors == 0) $display("RTL_TB: PASS %0d tests (%0d advisory warnings)", NUM_TESTS, warns);')
-    add('    else $display("RTL_TB: FAIL %0d mismatches (%0d advisory warnings)", errors, warns);')
+    add('    $display("RTL_TB: COMPARED %0d", compares);')
+    if has_observable:
+        # This top HAS observable outputs, so comparing nothing means the vectors never
+        # loaded -- not that the design agreed. Absence of a mismatch is evidence only
+        # when a mismatch was possible.
+        add('    if (errors == 0 && compares > 0) $display("RTL_TB: PASS %0d tests (%0d advisory warnings)", NUM_TESTS, warns);')
+        add('    else if (compares == 0) $display("RTL_TB: FAIL compared nothing; expected vectors did not load");')
+        add('    else $display("RTL_TB: FAIL %0d mismatches (%0d advisory warnings)", errors, warns);')
+    else:
+        add('    if (errors == 0) $display("RTL_TB: PASS %0d tests (%0d advisory warnings)", NUM_TESTS, warns);')
+        add('    else $display("RTL_TB: FAIL %0d mismatches (%0d advisory warnings)", errors, warns);')
     add("    $finish;")
     add("  end")
 
@@ -843,6 +846,7 @@ import re
 import signal
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -975,7 +979,7 @@ def ensure_vectors(spec: dict, logs: list) -> bool:
 
 def generate_sv(spec: dict, rtl_dir: Path | None, logs: list) -> Path:
     top = spec["top"]
-    gen = ["python3", "tb/gen_rtl_tb.py"]
+    gen = [sys.executable, "tb/gen_rtl_tb.py"]
     if rtl_dir is not None:
         top_v = None
         module_re = re.compile(r"\bmodule\s+" + re.escape(top) + r"\b")
@@ -1043,11 +1047,18 @@ def main() -> int:
     if rtl_dir is None:
         write_report({
             "status": "skipped",
-            "reason": "synthesized RTL not found; run csynth (make vitis) first",
+            "reason": (
+                "synthesized RTL not found; run csynth (make vitis), or point "
+                "C2HLSC_RTL_DIR at any directory of .v/.sv files -- this tier simulates "
+                "whatever RTL it is given and does not care which HLS tool produced it"
+            ),
             "testbench": str(tb.relative_to(ROOT)) if tb.exists() else None,
             "commands": logs,
         })
-        print("RTL cosim skipped: synthesized RTL not found (run synthesis first)")
+        print(
+            "RTL cosim skipped: synthesized RTL not found "
+            "(run synthesis, or set C2HLSC_RTL_DIR to a directory of .v/.sv files)"
+        )
         return 0
 
     stdout = simulate(spec, tb, rtl_dir, logs)
@@ -1058,16 +1069,36 @@ def main() -> int:
 
     passed = "RTL_TB: PASS" in stdout
     failed = "RTL_TB: FAIL" in stdout or "RTL_TB: MISMATCH" in stdout
-    status = "pass" if (passed and not failed) else "fail"
-    write_report({
+    # How much was actually examined, as a number in the report rather than a line of text
+    # nobody parses. A run that compared nothing is not a run that agreed.
+    compared_match = re.search(r"RTL_TB: COMPARED (\d+)", stdout)
+    comparisons = int(compared_match.group(1)) if compared_match else None
+    # A vector file that failed to load is reported by the simulator on stdout and is
+    # otherwise easy to miss: the compare length reads as X, every loop is skipped, and the
+    # bench would once have printed PASS. Treat it as fatal here too, independently of the
+    # bench's own guard, so neither layer alone has to be right.
+    load_failed = "$readmemh" in stdout and (
+        "Unable to open" in stdout or "Not enough words" in stdout
+    )
+    vacuous = (
+        comparisons == 0 and "RTL_TB: NOTE no observable outputs" not in stdout
+    )
+    status = "pass" if (passed and not failed and not load_failed and not vacuous) else "fail"
+    report: dict = {
         "status": status,
         "policy_id": spec.get("policy_id"),
         "top": spec["top"],
         "rtl_dir": str(rtl_dir),
         "testbench": str(tb.relative_to(ROOT)),
+        "comparisons_performed": comparisons,
         "stdout_tail": stdout[-8000:],
         "commands": logs,
-    })
+    }
+    if load_failed:
+        report["reason"] = "expected-value vectors failed to load; nothing was compared"
+    elif vacuous:
+        report["reason"] = "the testbench compared nothing"
+    write_report(report)
     print(f"RTL cosim {status}: report written to {REPORT_PATH}")
     return 0 if status == "pass" else 1
 

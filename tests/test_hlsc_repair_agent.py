@@ -103,6 +103,7 @@ class HlscRepairAgentTests(unittest.TestCase):
         self.assertIn("#pragma HLS INTERFACE", (project.root / "src" / "hls_top.cpp").read_text(encoding="utf-8"))
         state = VerificationState()
         state.add_phase(PhaseResult("software_equivalence", "pass"))
+        state.add_phase(PhaseResult("trace_consistency", "pass"))
         state.add_phase(PhaseResult("csim", "pass"))
         state.add_phase(PhaseResult("csynth", "fail", stderr="ERROR: invalid interface port bundle"))
 

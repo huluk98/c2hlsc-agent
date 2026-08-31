@@ -52,7 +52,10 @@ class CliRepairLoopTests(unittest.TestCase):
                 ]
             )
             first = _state(PhaseResult("software_equivalence", "fail", stderr="error: 'size_t' has not been declared"))
-            second = _state(PhaseResult("software_equivalence", "pass"))
+            second = _state(
+                PhaseResult("software_equivalence", "pass"),
+                PhaseResult("trace_consistency", "pass"),
+            )
 
             with patch("c2hlsc_agent.cli.verify_project", side_effect=[first, second]) as verify:
                 rc = run_convert(args)

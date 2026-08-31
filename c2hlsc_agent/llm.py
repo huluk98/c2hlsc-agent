@@ -32,7 +32,7 @@ import urllib.request
 from typing import Protocol
 
 from .analyze import AnalysisResult
-from .hlsc_generator import HLSC_GENERATOR_SYSTEM_PROMPT, render_hlsc_generator_task
+from .hlsc_generator import render_hlsc_generator_task
 
 DEFAULT_ANTHROPIC_MODEL = "claude-opus-4-8"
 DEFAULT_LLM_MODEL = DEFAULT_ANTHROPIC_MODEL  # backward-compatible alias

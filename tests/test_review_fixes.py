@@ -4,6 +4,7 @@ import argparse
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -75,6 +76,92 @@ class ConfigMergeTests(unittest.TestCase):
         self.assertEqual(config.max_iterations, 5)
         self.assertTrue(config.auto_repair)
         self.assertTrue(config.keep_going)
+
+
+class MinimalYamlFlowTests(unittest.TestCase):
+    """The no-PyYAML fallback must read the config syntax the docs actually recommend.
+
+    PyYAML is an optional extra, so `pip install -e .` alone leaves the built-in parser in
+    charge. It handled block style but not flow collections: `[input.c]` raised a bare
+    ValueError out of ast.literal_eval (Python reads `input.c` as attribute access), and
+    `{direction: input}` came back as a *string*, which surfaced later as the misleading
+    "argument metadata must be a mapping".
+    """
+
+    def test_flow_list_of_unquoted_strings(self) -> None:
+        from c2hlsc_agent.config import _parse_scalar
+
+        self.assertEqual(_parse_scalar("[input.c]"), ["input.c"])
+        self.assertEqual(_parse_scalar("[input.c, helpers.c]"), ["input.c", "helpers.c"])
+
+    def test_flow_mapping_becomes_a_dict(self) -> None:
+        from c2hlsc_agent.config import _parse_scalar
+
+        self.assertEqual(
+            _parse_scalar("{direction: input, length: 16}"),
+            {"direction": "input", "length": 16},
+        )
+        self.assertEqual(_parse_scalar("{range: [0, 16]}"), {"range": [0, 16]})
+
+    def test_flow_splitting_respects_quotes_and_nesting(self) -> None:
+        from c2hlsc_agent.config import _parse_scalar
+
+        self.assertEqual(_parse_scalar('["a,b", c]'), ["a,b", "c"])
+        self.assertEqual(_parse_scalar("[[1, 2], [3, 4]]"), [[1, 2], [3, 4]])
+        self.assertEqual(_parse_scalar("[]"), [])
+        self.assertEqual(_parse_scalar("{}"), {})
+
+    def test_a_flow_style_config_loads_without_pyyaml(self) -> None:
+        """The documented example in docs/input_contract.md, parsed by the fallback."""
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = Path(tmp.name) / "config.yaml"
+        path.write_text(
+            "input_files: [input.c]\n"
+            "top: guarded_scale\n"
+            "num_tests: 64\n"
+            "arguments:\n"
+            "  a:   {direction: input,  length: 16}\n"
+            "  out: {direction: output, length: 16}\n"
+            "  n:   {range: [0, 16]}\n",
+            encoding="utf-8",
+        )
+        # Force the fallback even where PyYAML happens to be installed.
+        with mock.patch.dict(sys.modules, {"yaml": None}):
+            config = load_config(path)
+
+        self.assertEqual(config.top, "guarded_scale")
+        self.assertEqual(config.num_tests, 64)
+        self.assertEqual([p.name for p in config.input_files], ["input.c"])
+        self.assertEqual(config.arguments["a"].direction, "input")
+        self.assertEqual(config.arguments["a"].length, 16)
+        self.assertEqual(config.arguments["out"].direction, "output")
+        self.assertEqual(config.arguments["n"].range, (0, 16))
+
+    def test_block_and_flow_styles_agree(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        flow = Path(tmp.name) / "flow.yaml"
+        block = Path(tmp.name) / "block.yaml"
+        flow.write_text(
+            "top: k\narguments:\n  a: {direction: input, length: 8}\n", encoding="utf-8"
+        )
+        block.write_text(
+            "top: k\narguments:\n  a:\n    direction: input\n    length: 8\n", encoding="utf-8"
+        )
+        with mock.patch.dict(sys.modules, {"yaml": None}):
+            a = load_config(flow)
+            b = load_config(block)
+        self.assertEqual(a.arguments["a"].direction, b.arguments["a"].direction)
+        self.assertEqual(a.arguments["a"].length, b.arguments["a"].length)
+
+    def test_a_malformed_inline_mapping_names_the_offender(self) -> None:
+        from c2hlsc_agent.config import _parse_scalar
+
+        with self.assertRaises(ValueError) as caught:
+            _parse_scalar("{direction input}")
+        self.assertIn("direction input", str(caught.exception))
 
 
 if __name__ == "__main__":

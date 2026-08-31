@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 from .cosim_verdict import evaluate_cosim_verdict
@@ -9,14 +10,26 @@ from .equivalence import PhaseResult, VerificationState, parse_mismatches, run_c
 from .remote import RemoteVitis
 
 
-PHASE_ORDER = ("software_equivalence", "csim", "csynth", "cosim")
+PHASE_ORDER = ("software_equivalence", "trace_consistency", "csim", "csynth", "cosim")
 PHASE_TIMEOUTS = {"csim": 600, "csynth": 1200, "cosim": 600}
+
+#: Host phases, in order. Both run on the local toolchain (g++/make/python3) and both are
+#: required whenever a project is verified at all; the Vitis phases below them are opt-in.
+HOST_PHASES = ("software_equivalence", "trace_consistency")
+VITIS_PHASES = ("csim", "csynth", "cosim")
+
+
+def required_phases(run_vitis_requested: bool) -> list[str]:
+    """Phases whose result decides the run: the host tier always, Vitis when requested."""
+
+    required = list(HOST_PHASES)
+    if run_vitis_requested:
+        required.extend(VITIS_PHASES)
+    return required
 
 
 def earliest_failing_phase(state: VerificationState, run_vitis_requested: bool) -> str | None:
-    required = ["software_equivalence"]
-    if run_vitis_requested:
-        required.extend(["csim", "csynth", "cosim"])
+    required = required_phases(run_vitis_requested)
     for phase in required:
         if state.status_for(phase) != "pass":
             return phase
@@ -41,13 +54,44 @@ def _timeout_result(project_dir: Path, phase: str, exc: subprocess.TimeoutExpire
     )
 
 
+def host_target(target: str) -> list[str]:
+    """Command for one host-tier target.
+
+    The generated project's recipes live in tb/host_build.py, and the agent runs it with
+    its own interpreter. make is a convenience alias over the same file, not a dependency:
+    it is not a native Windows tool, and both host rungs are required on every run.
+    """
+
+    return [sys.executable, str(Path("tb") / "host_build.py"), target]
+
+
 def run_software_equivalence(project_dir: Path, verbose: bool = False) -> PhaseResult:
     try:
-        result = run_command(["make", "test"], project_dir, "software_equivalence", timeout=120)
+        result = run_command(host_target("test"), project_dir, "software_equivalence", timeout=120)
     except FileNotFoundError:
-        return PhaseResult("software_equivalence", "fail", summary="make not found")
+        return PhaseResult("software_equivalence", "fail", summary="tb/host_build.py not found")
     except subprocess.TimeoutExpired as exc:
         return _timeout_result(project_dir, "software_equivalence", exc, "host equivalence")
+    if verbose and result.stdout:
+        print(result.stdout)
+    return result
+
+
+def run_trace_consistency(project_dir: Path, verbose: bool = False) -> PhaseResult:
+    """The HLS-LeVeri shift-left tier: paired traces plus the dual-tier consistency check.
+
+    Runs ``make leveri-test``, which builds the golden and HLS trace testbenches, executes
+    both against one synchronized stimulus schedule, and runs ``tb/leveri_compare.py`` --
+    static structural alignment (schema, stimulus columns, control flow, data dependency)
+    followed by dynamic behavioural consistency on the output columns.
+    """
+
+    try:
+        result = run_command(host_target("leveri-test"), project_dir, "trace_consistency", timeout=180)
+    except FileNotFoundError:
+        return PhaseResult("trace_consistency", "fail", summary="tb/host_build.py not found")
+    except subprocess.TimeoutExpired as exc:
+        return _timeout_result(project_dir, "trace_consistency", exc, "trace consistency")
     if verbose and result.stdout:
         print(result.stdout)
     return result
@@ -92,19 +136,22 @@ def run_vitis(
         except (subprocess.TimeoutExpired, OSError) as exc:
             push = PhaseResult("vitis_push", "fail", summary=f"project sync to {remote.host} failed: {exc}")
         if push.status != "pass":
-            # Infrastructure failure, not a code defect: mark it "remote vitis unavailable"
-            # so classify_failure treats it as toolchain_unavailable (blocked) and the
-            # auto-repair loop does NOT mutate correct source over a transient network fault.
+            # Infrastructure failure, not a code defect. All three rungs report blocked, so
+            # the reported evidence matches the decision classify_failure already reaches:
+            # a tool that never ran has not judged this design. csim used to report "fail"
+            # here while csynth and cosim reported "blocked" for the identical cause, which
+            # put `csim-fail` in the benchmark's blocker column -- reading as "the agent
+            # produced a design that fails C simulation" when Vitis was simply absent.
             message = f"remote vitis unavailable: project sync to {remote.host} failed: {push.summary or push.stderr.strip()[-400:]}"
             return {
-                "csim": PhaseResult("csim", "fail", summary=message),
+                "csim": PhaseResult("csim", "blocked", summary=message),
                 "csynth": PhaseResult("csynth", "blocked", summary=message),
                 "cosim": PhaseResult("cosim", "blocked", summary=message),
             }
     elif shutil.which("vitis_hls") is None:
         message = "vitis_hls not found on PATH (use --vitis-ssh to run Vitis on a remote Linux host)"
         return {
-            "csim": PhaseResult("csim", "fail", summary=message),
+            "csim": PhaseResult("csim", "blocked", summary=message),
             "csynth": PhaseResult("csynth", "blocked", summary=message),
             "cosim": PhaseResult("cosim", "blocked", summary=message),
         }
@@ -151,10 +198,12 @@ def _gate_cosim_on_log(result: PhaseResult) -> PhaseResult:
         except OSError:
             pass
     verdict = evaluate_cosim_verdict(result.status, haystack)
-    if verdict.status == "fail":
+    # 'blocked' travels the same route as 'fail': neither is a pass, but blocked says the
+    # tool never judged the design rather than that the design was wrong.
+    if verdict.status in {"fail", "blocked"}:
         return PhaseResult(
             result.name,
-            "fail",
+            verdict.status,
             result.returncode,
             result.stdout,
             result.stderr,
@@ -175,10 +224,23 @@ def verify_project(
     state.add_phase(software)
     state.mismatches.extend(parse_mismatches(software.stdout + "\n" + software.stderr))
     if software.status != "pass":
-        state.add_phase(PhaseResult("csim", "blocked", summary="software equivalence failed"))
-        state.add_phase(PhaseResult("csynth", "blocked", summary="software equivalence failed"))
-        state.add_phase(PhaseResult("cosim", "blocked", summary="software equivalence failed"))
+        _block_after(state, "trace_consistency", "software equivalence failed")
         return state
+
+    trace = run_trace_consistency(project_dir, verbose=verbose)
+    state.add_phase(trace)
+    if trace.status != "pass":
+        _block_after(state, "csim", "trace consistency failed")
+        return state
+
     for result in run_vitis(project_dir, run_vitis_requested, remote=remote).values():
         state.add_phase(result)
     return state
+
+
+def _block_after(state: VerificationState, first_blocked: str, reason: str) -> None:
+    """Mark ``first_blocked`` and every later phase blocked, never skipped."""
+
+    start = PHASE_ORDER.index(first_blocked)
+    for phase in PHASE_ORDER[start:]:
+        state.add_phase(PhaseResult(phase, "blocked", summary=reason))

@@ -149,6 +149,7 @@ void vector_add(const int32_t *a, const int32_t *b, int32_t *out, int n) {
 def _csynth_failure_state() -> VerificationState:
     state = VerificationState()
     state.add_phase(PhaseResult("software_equivalence", "pass"))
+    state.add_phase(PhaseResult("trace_consistency", "pass"))
     state.add_phase(PhaseResult("csim", "pass"))
     state.add_phase(PhaseResult("csynth", "fail", summary="synthesis error: cannot schedule loop"))
     state.add_phase(PhaseResult("cosim", "blocked", summary="csynth failed"))

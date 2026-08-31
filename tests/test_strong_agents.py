@@ -10,9 +10,6 @@
 
 from __future__ import annotations
 
-import contextlib
-import io
-import json
 import os
 import subprocess
 import tempfile
@@ -194,6 +191,7 @@ class NlSpecTests(unittest.TestCase):
             )
             passing = VerificationState()
             passing.add_phase(PhaseResult("software_equivalence", "pass"))
+            passing.add_phase(PhaseResult("trace_consistency", "pass"))
             with mock.patch("c2hlsc_agent.cli.build_llm_client", return_value=SeqLLM([reference])), mock.patch(
                 "c2hlsc_agent.cli.verify_project", return_value=passing
             ):
@@ -224,6 +222,7 @@ class NlSpecTests(unittest.TestCase):
             )
             passing = VerificationState()
             passing.add_phase(PhaseResult("software_equivalence", "pass"))
+            passing.add_phase(PhaseResult("trace_consistency", "pass"))
             llm = SeqLLM([_cpp_response(CANDIDATE_B)])
             with mock.patch("c2hlsc_agent.cli.build_llm_client", return_value=llm), mock.patch(
                 "c2hlsc_agent.cli.verify_project", return_value=passing
@@ -245,7 +244,8 @@ class NlSpecTests(unittest.TestCase):
             )
             passing = VerificationState()
             passing.add_phase(PhaseResult("software_equivalence", "pass"))
-            with mock.patch("c2hlsc_agent.cli.build_llm_client", return_value=None) as build, mock.patch(
+            passing.add_phase(PhaseResult("trace_consistency", "pass"))
+            with mock.patch("c2hlsc_agent.cli.build_llm_client", return_value=None), mock.patch(
                 "c2hlsc_agent.cli.verify_project", return_value=passing
             ):
                 rc = run_convert(args)
@@ -272,6 +272,7 @@ class CandidateSelectionTests(unittest.TestCase):
             results = [
                 PhaseResult("software_equivalence", "fail", stdout="Mismatch test=0 arg=out index=1 expected=3 actual=4 seed=1"),
                 PhaseResult("software_equivalence", "pass"),
+                PhaseResult("trace_consistency", "pass"),
             ]
             with mock.patch("c2hlsc_agent.candidates.run_software_equivalence", side_effect=results):
                 winner, scores = select_best_candidate(out_dir, analysis, config, llm)
@@ -360,7 +361,8 @@ class RemoteVitisTests(unittest.TestCase):
         remote.run_phase.side_effect = [
             PhaseResult("csim", "pass"),
             PhaseResult("csynth", "pass"),
-            PhaseResult("cosim", "pass"),
+            # A real CoSim states its verdict; an exit code alone is not one.
+            PhaseResult("cosim", "pass", stdout="C/RTL co-simulation finished: PASS\n"),
         ]
         remote.pull.return_value = PhaseResult("vitis_pull", "pass")
         with tempfile.TemporaryDirectory() as tmp:
@@ -369,13 +371,34 @@ class RemoteVitisTests(unittest.TestCase):
         remote.push.assert_called_once()
         remote.pull.assert_called_once()
 
+    def test_run_vitis_cosim_without_a_verdict_is_blocked_not_passed(self):
+        """Vitis can exit 0 having produced no verdict; that judges nothing."""
+
+        remote = mock.Mock()
+        remote.host = "u@h"
+        remote.push.return_value = PhaseResult("vitis_push", "pass")
+        remote.run_phase.side_effect = [
+            PhaseResult("csim", "pass"),
+            PhaseResult("csynth", "pass"),
+            PhaseResult("cosim", "pass", stdout="INFO: [SIM 2] CSIM start\n"),
+        ]
+        remote.pull.return_value = PhaseResult("vitis_pull", "pass")
+        with tempfile.TemporaryDirectory() as tmp:
+            phases = run_vitis(Path(tmp), True, remote=remote)
+        self.assertEqual(phases["cosim"].status, "blocked")
+        self.assertIn("no verdict", phases["cosim"].summary)
+
     def test_run_vitis_remote_push_failure_blocks_ladder(self):
         remote = mock.Mock()
         remote.host = "u@h"
         remote.push.return_value = PhaseResult("vitis_push", "fail", stderr="ssh: no route", summary="ssh: no route")
         with tempfile.TemporaryDirectory() as tmp:
             phases = run_vitis(Path(tmp), True, remote=remote)
-        self.assertEqual(phases["csim"].status, "fail")
+        # A tool that never ran has not judged the design: an unreachable remote Vitis is
+        # blocked on every rung, never a csim failure attributed to the generated code.
+        self.assertEqual(phases["csim"].status, "blocked")
+        self.assertEqual(phases["csynth"].status, "blocked")
+        self.assertEqual(phases["cosim"].status, "blocked")
         self.assertIn("u@h", phases["csim"].summary)
         remote.run_phase.assert_not_called()
 
@@ -390,6 +413,7 @@ class RemoteVitisTests(unittest.TestCase):
             phases = run_vitis(Path(tmp), True, remote=remote)
         state = VerificationState()
         state.add_phase(PhaseResult("software_equivalence", "pass"))
+        state.add_phase(PhaseResult("trace_consistency", "pass"))
         for p in phases.values():
             state.add_phase(p)
         # despite the "port 22" text, this is toolchain_unavailable (blocked), not interface_contract

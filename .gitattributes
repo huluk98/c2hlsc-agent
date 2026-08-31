@@ -1,0 +1,47 @@
+# Git for Windows defaults to core.autocrlf=true, which rewrites LF to CRLF on checkout.
+# Without this file a Windows clone silently gets CRLF in shell scripts and TCL, which
+# breaks them the moment they run on a Vitis host or in a container. Normalise in the
+# index and pin the files whose line endings are load-bearing.
+
+* text=auto eol=lf
+
+# Executed on Linux/macOS or inside containers — CRLF makes the shebang unparseable.
+*.sh            text eol=lf
+*.bash          text eol=lf
+
+# Read by vitis_hls on the (Linux) synthesis host.
+*.tcl           text eol=lf
+
+# Tabs are syntax here; CRLF confuses some make implementations.
+Makefile        text eol=lf
+*.mk            text eol=lf
+
+# Python is CRLF-tolerant, but keeping one ending avoids whole-file diffs between
+# contributors on different platforms.
+*.py            text eol=lf
+*.c             text eol=lf
+*.h             text eol=lf
+*.cpp           text eol=lf
+*.hpp           text eol=lf
+*.v             text eol=lf
+*.sv            text eol=lf
+
+*.md            text eol=lf
+*.yml           text eol=lf
+*.yaml          text eol=lf
+*.json          text eol=lf
+*.jsonl         text eol=lf
+*.toml          text eol=lf
+*.txt           text eol=lf
+
+# PowerShell is the one thing that genuinely wants CRLF on Windows.
+*.ps1           text eol=crlf
+*.psm1          text eol=crlf
+
+# Never touch these.
+*.png           binary
+*.jpg           binary
+*.pdf           binary
+*.gz            binary
+*.zip           binary
+*.ktest         binary

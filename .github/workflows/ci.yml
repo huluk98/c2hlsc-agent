@@ -47,16 +47,21 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $parseErrors = $null
-          [System.Management.Automation.Language.Parser]::ParseFile(
-            (Resolve-Path 'scripts/team_preflight.ps1'),
-            [ref]$null,
-            [ref]$parseErrors
-          ) | Out-Null
-          if ($parseErrors.Count -gt 0) {
-            $parseErrors | Format-List
-            exit 1
+          $failed = $false
+          foreach ($script in 'scripts/team_preflight.ps1', 'scripts/setup_windows.ps1') {
+            $parseErrors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path $script),
+              [ref]$null,
+              [ref]$parseErrors
+            ) | Out-Null
+            if ($parseErrors.Count -gt 0) {
+              Write-Host "::error file=$script::PowerShell parse errors"
+              $parseErrors | Format-List
+              $failed = $true
+            }
           }
+          if ($failed) { exit 1 }
       - name: Validate Python helper syntax
         run: python -m py_compile scripts/verify_github_guardrails.py
       - name: Install package
@@ -67,14 +72,49 @@ jobs:
         # LLM-unavailable fallback paths.
         run: python -m unittest discover -s tests
 
+      - name: Convert an example with no make on PATH
+        if: runner.os == 'Windows'
+        # The host tier must work with native Windows tools only. The runner has a
+        # GCC-style compiler; make is deliberately not used, so this fails if anything
+        # reintroduces a make or POSIX-shell dependency on the path to a verdict.
+        shell: pwsh
+        run: |
+          python -m c2hlsc_agent convert `
+            --input examples/vector_add/input.c `
+            --top vector_add `
+            --config examples/vector_add/config.yaml `
+            --out build/ci_windows
+          $report = Get-Content build/ci_windows/conversion_report.json | ConvertFrom-Json
+          Write-Host "software_equivalence=$($report.software_equivalence) trace_consistency=$($report.trace_consistency)"
+          if ($report.status -ne 'pass') { throw "conversion status was $($report.status)" }
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install ruff
+        run: python -m pip install ruff
+      - name: Check for unused names, undefined references and lost exception chains
+        # Scoped to correctness rules by pyproject.toml; style is intentionally not gated.
+        run: ruff check --output-format github .
+
   ci:
     name: ci
     if: ${{ always() }}
-    needs: unittest
+    needs: [unittest, lint]
     runs-on: ubuntu-latest
     timeout-minutes: 2
     steps:
       - name: Require every Python job to pass
         env:
           MATRIX_RESULT: ${{ needs.unittest.result }}
-        run: test "$MATRIX_RESULT" = "success"
+          LINT_RESULT: ${{ needs.lint.result }}
+        run: |
+          test "$MATRIX_RESULT" = "success"
+          test "$LINT_RESULT" = "success"

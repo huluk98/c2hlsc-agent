@@ -1,13 +1,14 @@
 from __future__ import annotations
 
-import os
+import json
+import re
 import shutil
 import stat
 from dataclasses import dataclass
 from pathlib import Path
 
 from .analyze import AnalysisResult
-from .config import AgentConfig
+from .config import AgentConfig, stimulus_contract
 from .convert import GeneratedSource
 from .leveri_testgen import generate_leveri_testbenches
 from .testgen import generate_testbench
@@ -76,77 +77,274 @@ exit
 """
 
 
-def render_makefile(config: AgentConfig) -> str:
-    flags = " ".join(config.compiler_flags)
-    return f"""CXX ?= g++
-CXXFLAGS ?= -std=c++17 -Wall -Wextra -I src {flags}
-TB_EXE ?= c2hlsc_tb
-LEVERI_GOLDEN_EXE ?= leveri_golden_tb
-LEVERI_HLS_EXE ?= leveri_hls_tb
-RTL_VECTORS_EXE ?= rtl_vectors_tb
+def render_host_build(config: AgentConfig) -> str:
+    """The cross-platform build/run driver. See its own docstring for why it exists."""
 
-.PHONY: all test leveri-test gcov-coverage klee-coverage coverage \\
+    extra = json.dumps([str(flag) for flag in config.compiler_flags])
+    return r"""#!/usr/bin/env python3
+'''Cross-platform build/run driver for this generated project.
+
+`make` is not a native Windows tool, and the host tier -- the oracle testbench and the
+paired-trace dual-tier check -- is required on every verification. Putting the recipes
+here rather than only in the Makefile means the agent drives them identically on Linux,
+macOS and native Windows, with no MSYS, no Cygwin and no WSL.
+
+The Makefile is a thin alias over this file, so `make test` keeps working and there is
+still exactly one definition of each recipe.
+
+  python tb/host_build.py test           compile + run the golden-C oracle testbench
+  python tb/host_build.py leveri-test    paired traces + the dual-tier consistency check
+  python tb/host_build.py gcov-coverage  structural coverage
+  python tb/host_build.py klee-coverage  symbolic exploration
+  python tb/host_build.py rtl-vectors    golden vectors for the standalone RTL flow
+  python tb/host_build.py clean          remove build outputs
+
+  CXX=clang++  override the compiler   CXXFLAGS=...  replace the default flags
+'''
+from __future__ import annotations
+
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+EXE = ".exe" if os.name == "nt" else ""
+
+# Substituted at generation time from the project's AgentConfig.
+EXTRA_FLAGS = __EXTRA_FLAGS__
+
+# -Wno-narrowing: the golden reference is C, compiled here as C++. C allows
+# `int t[] = {0xFFFFFFFF}`; C++11 brace-init calls that a narrowing conversion and
+# rejects it outright. Refusing to build valid C over a C++-only rule would fail the
+# run for a difference that changes no value -- the initialiser means what it meant.
+BASE_FLAGS = ["-std=c++17", "-Wall", "-Wextra", "-Wno-narrowing", "-I", "src", "-I", "."]
+
+# name -> (sources, dependencies that should trigger a rebuild)
+PROGRAMS = {
+    "c2hlsc_tb": (["tb/testbench.cpp", "src/hls_top.cpp"], ["src/hls_top.hpp", "input.c"]),
+    "leveri_golden_tb": (["tb/leveri_golden_tb.cpp"], ["input.c"]),
+    "leveri_hls_tb": (["tb/leveri_hls_tb.cpp", "src/hls_top.cpp"], ["src/hls_top.hpp"]),
+    "rtl_vectors_tb": (["tb/rtl_vectors_tb.cpp"], ["input.c"]),
+}
+
+
+def fail(message: str) -> int:
+    print(f"host_build: {message}", file=sys.stderr)
+    return 1
+
+
+def resolve_compiler() -> tuple[str | None, str]:
+    '''Find a GCC/Clang-style C++ driver.
+
+    MSVC is deliberately not auto-used: its flag syntax is entirely different (/std:c++17,
+    /Fe) and silently mistranslating flags would produce confusing failures, so it is
+    detected and reported rather than guessed at.
+    '''
+    override = os.environ.get("CXX")
+    if override:
+        return override, f"$CXX ({override})"
+    for name in ("g++", "clang++", "c++"):
+        found = shutil.which(name)
+        if found:
+            return found, name
+    if shutil.which("cl"):
+        return None, (
+            "only MSVC (cl.exe) was found. This project builds with GCC/Clang-style flags; "
+            "install a native g++ or clang++ (winget install LLVM.LLVM, or MSYS2 mingw-w64-gcc) "
+            "or point CXX at one"
+        )
+    return None, "no C++ compiler found (looked for g++, clang++, c++; set CXX to override)"
+
+
+def flags() -> list[str]:
+    override = os.environ.get("CXXFLAGS")
+    if override:
+        return override.split()
+    return BASE_FLAGS + EXTRA_FLAGS
+
+
+def needs_rebuild(target: Path, inputs: list[Path]) -> bool:
+    if not target.exists():
+        return True
+    stamp = target.stat().st_mtime
+    return any(item.exists() and item.stat().st_mtime > stamp for item in inputs)
+
+
+def build(name: str) -> int:
+    compiler, source = resolve_compiler()
+    if compiler is None:
+        return fail(source)
+    sources, deps = PROGRAMS[name]
+    target = ROOT / f"{name}{EXE}"
+    inputs = [ROOT / item for item in sources + deps]
+    missing = [item for item in (ROOT / s for s in sources) if not item.exists()]
+    if missing:
+        return fail(f"missing source(s): {', '.join(str(m.relative_to(ROOT)) for m in missing)}")
+    if not needs_rebuild(target, inputs):
+        return 0
+    command = [compiler, *flags(), *sources, "-o", str(target)]
+    print(" ".join(command))
+    result = subprocess.run(command, cwd=ROOT)
+    return result.returncode
+
+
+def run_program(name: str) -> int:
+    target = ROOT / f"{name}{EXE}"
+    print(f"./{target.name}")
+    return subprocess.run([str(target)], cwd=ROOT).returncode
+
+
+def run_script(relative: str, *args: str) -> int:
+    # sys.executable, never a bare "python3": on Windows the interpreter is usually
+    # `python`, and in a virtualenv `python3` may not be this interpreter at all.
+    command = [sys.executable, str(ROOT / relative), *args]
+    print(" ".join(command))
+    return subprocess.run(command, cwd=ROOT).returncode
+
+
+def target_test() -> int:
+    return build("c2hlsc_tb") or run_program("c2hlsc_tb")
+
+
+def target_leveri_test() -> int:
+    return (
+        build("leveri_golden_tb")
+        or build("leveri_hls_tb")
+        or run_program("leveri_golden_tb")
+        or run_program("leveri_hls_tb")
+        or run_script("tb/leveri_compare.py", "leveri_golden_trace.csv", "leveri_hls_trace.csv")
+    )
+
+
+def target_rtl_vectors() -> int:
+    (ROOT / "rtl_vectors").mkdir(exist_ok=True)
+    return build("rtl_vectors_tb") or run_program("rtl_vectors_tb")
+
+
+def target_clean() -> int:
+    for name in PROGRAMS:
+        (ROOT / f"{name}{EXE}").unlink(missing_ok=True)
+    for name in ("leveri_golden_trace.csv", "leveri_hls_trace.csv"):
+        (ROOT / name).unlink(missing_ok=True)
+    for directory in ("coverage", "rtl_vectors", "c2hlsc_project"):
+        shutil.rmtree(ROOT / directory, ignore_errors=True)
+    for pattern in ("*.gcda", "*.gcno", "*.gcov", "tb/*_tb.sv"):
+        for path in ROOT.glob(pattern):
+            path.unlink(missing_ok=True)
+    return 0
+
+
+TARGETS = {
+    "test": target_test,
+    "leveri-test": target_leveri_test,
+    "gcov-coverage": lambda: run_script("tb/run_gcov.py"),
+    "klee-coverage": lambda: run_script("tb/run_klee.py"),
+    "rtl-vectors": target_rtl_vectors,
+    "rtl-testbench": lambda: run_script("tb/gen_rtl_tb.py", "--from-contract"),
+    "rtl-cosim": lambda: run_script("tb/run_rtl_sim.py"),
+    "clean": target_clean,
+}
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) != 2 or argv[1] not in TARGETS:
+        print(f"usage: {Path(argv[0]).name} {{{' | '.join(TARGETS)}}}", file=sys.stderr)
+        return 2
+    return TARGETS[argv[1]]()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))
+""".replace("__EXTRA_FLAGS__", extra)
+
+
+def render_makefile(config: AgentConfig) -> str:
+    """A thin alias over tb/host_build.py.
+
+    Every recipe lives in the Python driver so there is one definition of each, and so the
+    host tier works on native Windows where make is not available. Keeping the Makefile
+    means `make test` still does what everyone expects.
+    """
+
+    return """# Generated by c2hlsc_agent. Every target delegates to tb/host_build.py, which is
+# where the real recipes live -- see that file's docstring. make is optional: the agent
+# drives host_build.py directly, so a machine without make (native Windows) still verifies.
+PYTHON ?= python3
+
+.PHONY: all test leveri-test gcov-coverage klee-coverage coverage refine-coverage \\
         rtl-vectors rtl-testbench rtl-cosim clean vitis
 
 all: test
 
-$(TB_EXE): tb/testbench.cpp src/hls_top.cpp src/hls_top.hpp input.c
-\t$(CXX) $(CXXFLAGS) tb/testbench.cpp src/hls_top.cpp -o $(TB_EXE)
+test:
+\t$(PYTHON) tb/host_build.py test
 
-$(LEVERI_GOLDEN_EXE): tb/leveri_golden_tb.cpp input.c
-\t$(CXX) $(CXXFLAGS) tb/leveri_golden_tb.cpp -o $(LEVERI_GOLDEN_EXE)
-
-$(LEVERI_HLS_EXE): tb/leveri_hls_tb.cpp src/hls_top.cpp src/hls_top.hpp
-\t$(CXX) $(CXXFLAGS) tb/leveri_hls_tb.cpp src/hls_top.cpp -o $(LEVERI_HLS_EXE)
-
-test: $(TB_EXE)
-\t./$(TB_EXE)
-
-leveri-test: $(LEVERI_GOLDEN_EXE) $(LEVERI_HLS_EXE)
-\t./$(LEVERI_GOLDEN_EXE)
-\t./$(LEVERI_HLS_EXE)
-\tpython3 tb/leveri_compare.py leveri_golden_trace.csv leveri_hls_trace.csv
+leveri-test:
+\t$(PYTHON) tb/host_build.py leveri-test
 
 gcov-coverage:
-\tpython3 tb/run_gcov.py
+\t$(PYTHON) tb/host_build.py gcov-coverage
 
 klee-coverage:
-\tpython3 tb/run_klee.py
+\t$(PYTHON) tb/host_build.py klee-coverage
 
 coverage: gcov-coverage klee-coverage
 
+# Coverage-driven stimulus refinement: measure, find what the schedule never reaches,
+# get inputs that reach it (KLEE), fold them back in as directed cases, measure again.
+refine-coverage:
+\t$(PYTHON) -m c2hlsc_agent refine --project .
+
 # Standalone RTL (Verilog) testbench flow. Produces golden expected vectors from the
 # original C, renders a self-checking testbench, and (post-synthesis) simulates the RTL.
-$(RTL_VECTORS_EXE): tb/rtl_vectors_tb.cpp input.c
-\t$(CXX) $(CXXFLAGS) tb/rtl_vectors_tb.cpp -o $(RTL_VECTORS_EXE)
-
-rtl-vectors: $(RTL_VECTORS_EXE)
-\tmkdir -p rtl_vectors
-\t./$(RTL_VECTORS_EXE)
+rtl-vectors:
+\t$(PYTHON) tb/host_build.py rtl-vectors
 
 rtl-testbench:
-\tpython3 tb/gen_rtl_tb.py --from-contract
+\t$(PYTHON) tb/host_build.py rtl-testbench
 
 rtl-cosim:
-\tpython3 tb/run_rtl_sim.py
+\t$(PYTHON) tb/host_build.py rtl-cosim
 
 vitis:
 \tvitis_hls -f run_hls.tcl
 
 clean:
-\trm -f $(TB_EXE) $(LEVERI_GOLDEN_EXE) $(LEVERI_HLS_EXE) $(RTL_VECTORS_EXE)
-\trm -f leveri_golden_trace.csv leveri_hls_trace.csv
-\trm -rf coverage rtl_vectors
-\trm -f $(wildcard tb/*_tb.sv)
-\trm -f $(wildcard *.gcda) $(wildcard *.gcno) $(wildcard *.gcov)
-\trm -rf c2hlsc_project
+\t$(PYTHON) tb/host_build.py clean
 """
+
+
+def render_run_all_py() -> str:
+    """Cross-platform sibling of run_all.sh, for machines without a POSIX shell."""
+
+    return '''#!/usr/bin/env python3
+"""Run the host tier, then Vitis if it is installed. Works anywhere Python does."""
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+
+for target in ("test", "leveri-test"):
+    code = subprocess.run([sys.executable, str(ROOT / "tb" / "host_build.py"), target], cwd=ROOT).returncode
+    if code:
+        raise SystemExit(code)
+
+if shutil.which("vitis_hls"):
+    raise SystemExit(subprocess.run(["vitis_hls", "-f", "run_hls.tcl"], cwd=ROOT).returncode)
+print("vitis_hls not found; host tier completed, Vitis phases skipped.", file=sys.stderr)
+'''
 
 
 def render_run_all() -> str:
     return """#!/usr/bin/env bash
 set -euo pipefail
-make test
+"${PYTHON:-python3}" tb/host_build.py test
+"${PYTHON:-python3}" tb/host_build.py leveri-test
 if command -v vitis_hls >/dev/null 2>&1; then
   vitis_hls -f run_hls.tcl
 else
@@ -155,13 +353,55 @@ fi
 """
 
 
+_LOCAL_INCLUDE = re.compile(r'^[ \t]*#[ \t]*include[ \t]*"([^"]+)"', re.M)
+
+
+def _copy_local_headers(source: Path, out_dir: Path, depth: int = 0, seen: set[Path] | None = None) -> None:
+    """Copy the headers the golden C includes with quotes into the project, recursively.
+
+    A design is rarely one file: the HLS-LeVeri benchmark keeps every array bound in a
+    companion ``test.h``. Copying only ``input.c`` left both the golden testbench and the
+    generated design with ``fatal error: test.h: No such file or directory``, so the
+    project has to carry the headers to be self-contained.
+    """
+
+    seen = seen if seen is not None else set()
+    if depth > 4 or not source.exists():
+        return
+    resolved = source.resolve()
+    if resolved in seen:
+        return
+    seen.add(resolved)
+    try:
+        text = source.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return
+    for name in _LOCAL_INCLUDE.findall(text):
+        candidate = source.parent / name
+        if not candidate.exists():
+            continue
+        destination = out_dir / name
+        if destination.exists() and candidate.resolve() == destination.resolve():
+            continue
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(candidate, destination)
+        _copy_local_headers(candidate, out_dir, depth + 1, seen)
+
+
 def write_project(out_dir: Path, analysis: AnalysisResult, generated: GeneratedSource, config: AgentConfig) -> ProjectFiles:
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "src").mkdir(exist_ok=True)
     (out_dir / "tb").mkdir(exist_ok=True)
     leveri_bundle = generate_leveri_testbenches(analysis, config)
     verilog_bundle = generate_verilog_testbenches(analysis, config)
-    shutil.copyfile(analysis.function.source_path, out_dir / "input.c")
+    golden = out_dir / "input.c"
+    source = Path(analysis.function.source_path)
+    _copy_local_headers(source, out_dir)
+    if not (golden.exists() and source.exists() and source.samefile(golden)):
+        # Re-emitting a project in place (refinement) reads the golden C from the project
+        # itself; copying it onto itself is both an error and a needless rewrite of the
+        # one file that must stay byte-identical.
+        shutil.copyfile(source, golden)
     files = [
         out_dir / "input.c",
         out_dir / "src" / "hls_top.hpp",
@@ -174,16 +414,19 @@ def write_project(out_dir: Path, analysis: AnalysisResult, generated: GeneratedS
         out_dir / "tb" / "klee_driver.cpp",
         out_dir / "tb" / "run_klee.py",
         out_dir / "tb" / "leveri_manifest.json",
+        out_dir / "tb" / "stimulus_contract.json",
         out_dir / "tb" / "rtl_vectors_tb.cpp",
         out_dir / "tb" / "gen_rtl_tb.py",
         out_dir / "tb" / "run_rtl_sim.py",
         out_dir / "tb" / "rtl_tb_manifest.json",
+        out_dir / "tb" / "host_build.py",
         out_dir / "run_hls.tcl",
         out_dir / "run_csim.tcl",
         out_dir / "run_csynth.tcl",
         out_dir / "run_cosim.tcl",
         out_dir / "Makefile",
         out_dir / "run_all.sh",
+        out_dir / "run_all.py",
     ]
     (out_dir / "src" / "hls_top.hpp").write_text(generated.header, encoding="utf-8")
     (out_dir / "src" / "hls_top.cpp").write_text(generated.source, encoding="utf-8")
@@ -195,21 +438,30 @@ def write_project(out_dir: Path, analysis: AnalysisResult, generated: GeneratedS
     (out_dir / "tb" / "klee_driver.cpp").write_text(leveri_bundle.klee_driver, encoding="utf-8")
     (out_dir / "tb" / "run_klee.py").write_text(leveri_bundle.klee_script, encoding="utf-8")
     (out_dir / "tb" / "leveri_manifest.json").write_text(leveri_bundle.manifest_json, encoding="utf-8")
+    # Makes the project self-describing: a later in-place regeneration can rebuild the
+    # same stimulus without being handed the original config file again.
+    (out_dir / "tb" / "stimulus_contract.json").write_text(
+        json.dumps(stimulus_contract(config), indent=2) + "\n", encoding="utf-8"
+    )
     (out_dir / "tb" / "rtl_vectors_tb.cpp").write_text(verilog_bundle.vectors_tb, encoding="utf-8")
     (out_dir / "tb" / "gen_rtl_tb.py").write_text(verilog_bundle.gen_script, encoding="utf-8")
     (out_dir / "tb" / "run_rtl_sim.py").write_text(verilog_bundle.run_script, encoding="utf-8")
     (out_dir / "tb" / "rtl_tb_manifest.json").write_text(verilog_bundle.manifest_json, encoding="utf-8")
+    (out_dir / "tb" / "host_build.py").write_text(render_host_build(config), encoding="utf-8")
     (out_dir / "run_hls.tcl").write_text(render_run_hls(analysis, config), encoding="utf-8")
     (out_dir / "run_csim.tcl").write_text(render_run_csim(analysis, config), encoding="utf-8")
     (out_dir / "run_csynth.tcl").write_text(render_run_csynth(), encoding="utf-8")
     (out_dir / "run_cosim.tcl").write_text(render_run_cosim(config), encoding="utf-8")
     (out_dir / "Makefile").write_text(render_makefile(config), encoding="utf-8")
+    run_all_py = out_dir / "run_all.py"
+    run_all_py.write_text(render_run_all_py(), encoding="utf-8")
+    run_all_py.chmod(run_all_py.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     run_all = out_dir / "run_all.sh"
     run_all.write_text(render_run_all(), encoding="utf-8")
     run_all.chmod(run_all.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     leveri_compare = out_dir / "tb" / "leveri_compare.py"
     leveri_compare.chmod(leveri_compare.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-    for script_name in ("run_gcov.py", "run_klee.py", "gen_rtl_tb.py", "run_rtl_sim.py"):
+    for script_name in ("run_gcov.py", "run_klee.py", "gen_rtl_tb.py", "run_rtl_sim.py", "host_build.py"):
         script = out_dir / "tb" / script_name
         script.chmod(script.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     return ProjectFiles(out_dir, files)

@@ -7,7 +7,22 @@ from pathlib import Path
 
 from .analyze import analyze_source
 from .candidates import select_best_candidate
-from .config import AgentConfig, load_config, merge_cli_config
+from .components import (
+    DEFAULT_PIPELINE,
+    component_specs,
+    describe_components,
+    get_component,
+    render_components_markdown,
+    workflow_stages,
+)
+from .config import (
+    STIMULUS_CONTRACT_PATH,
+    AgentConfig,
+    apply_stimulus_contract,
+    load_config,
+    merge_cli_config,
+    read_stimulus_contract,
+)
 from .convert import ReferenceGenerationError, generate_hls_sources, generate_reference_c
 from .equivalence import VerificationState
 from .hlsc_repair_agent import clear_repair_audit, repair_project
@@ -16,6 +31,16 @@ from .hls_runner import verify_project
 from .llm import build_llm_client, missing_llm_reason
 from .remote import RemoteVitis
 from .report import final_status, write_reports
+from .toolchain import (
+    TIER_PURPOSE,
+    TIERS,
+    container_diagnostics,
+    check as check_tools,
+    install as install_tools,
+    missing as missing_tools,
+    package_manager,
+    summary_line,
+)
 from .run_control import (
     RUN_LEDGER_FILENAME,
     BudgetedLLMClient,
@@ -144,7 +169,12 @@ def build_parser() -> argparse.ArgumentParser:
     convert.add_argument("--verbose", action="store_true", help="print command output")
     repair = sub.add_parser("repair", help="apply a repair from externally supplied Vitis/verification evidence")
     repair.add_argument("--project", required=True, help="existing generated project directory")
-    repair.add_argument("--stage", required=True, choices=["software_equivalence", "csim", "csynth", "cosim"], help="earliest failing stage from the external run")
+    repair.add_argument(
+        "--stage",
+        required=True,
+        choices=["software_equivalence", "trace_consistency", "csim", "csynth", "cosim"],
+        help="earliest failing stage from the external run",
+    )
     repair.add_argument("--evidence", action="append", default=[], help="path to a log/report file from the failing stage; may be repeated")
     repair.add_argument("--evidence-text", default="", help="inline failing-stage evidence text")
     repair.add_argument("--input", help="original input C file; defaults to PROJECT/input.c")
@@ -202,6 +232,69 @@ def build_parser() -> argparse.ArgumentParser:
     optimize.add_argument("--verbose", action="store_true", help="print per-candidate progress")
     _add_remote_vitis_arguments(optimize)
     _add_llm_arguments(optimize)
+    components = sub.add_parser(
+        "components",
+        help="inspect the agent component scaffold: stages, gates, artifacts, budgets, and LLM seams",
+    )
+    components.add_argument("--component", help="show one component by name instead of the whole scaffold")
+    components.add_argument("--stages", action="store_true", help="show only the stage graph")
+    components.add_argument(
+        "--pipeline",
+        action="store_true",
+        help="show the default start-to-finish component order run_stages executes",
+    )
+    components_format = components.add_mutually_exclusive_group()
+    components_format.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    components_format.add_argument(
+        "--markdown",
+        action="store_true",
+        help="emit the full docs/agent_components.md reference",
+    )
+    refine = sub.add_parser(
+        "refine",
+        help="coverage-driven stimulus refinement: drive structural coverage up by feeding "
+        "uncovered code back into the testbenches (shift_left_testbench_agent)",
+    )
+    refine.add_argument("--project", required=True, help="existing generated project directory")
+    refine.add_argument("--top", help="top function name; defaults to conversion_report.json top when available")
+    refine.add_argument("--input", help="original input C file; defaults to PROJECT/input.c")
+    refine.add_argument("--config", help="YAML/JSON config file used for the original conversion")
+    refine.add_argument(
+        "--target",
+        type=float,
+        help="structural coverage target in percent, measured as the WEAKER of line and "
+        "branch coverage; without one the loop simply improves what it can",
+    )
+    refine.add_argument("--max-rounds", type=int, default=5, help="max refinement rounds (default 5)")
+    refine.add_argument("--max-vectors", type=int, default=64, help="max refinement vectors to add (default 64)")
+    refine.add_argument(
+        "--no-widen",
+        action="store_true",
+        help="fail instead of falling back to widening the random schedule when KLEE is unavailable",
+    )
+    refine.add_argument("--verbose", action="store_true", help="print per-round progress")
+    doctor = sub.add_parser(
+        "doctor",
+        help="check the external tools each verification tier needs, and install the missing ones",
+    )
+    doctor.add_argument(
+        "--install",
+        action="store_true",
+        help="actually install the missing tools with this machine's package manager "
+        "(Homebrew on macOS, apt/dnf/pacman on Linux); without it, doctor only reports",
+    )
+    doctor.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="with --install, print the commands that would run instead of running them",
+    )
+    doctor.add_argument(
+        "--tier",
+        action="append",
+        choices=list(TIERS),
+        help="limit to one or more tiers; may be repeated (default: all)",
+    )
+    doctor.add_argument("--json", action="store_true", help="emit machine-readable JSON")
     status = sub.add_parser(
         'status',
         help='show the latest persistent bounded-run state for a project',
@@ -333,7 +426,7 @@ def run_convert(args: argparse.Namespace) -> int:
                 RunStatus.BLOCKED,
                 f'NL-only reference generation backend failed: {exc}',
             )
-            raise SystemExit(f"NL-only reference generation failed (LLM backend error): {exc}")
+            raise SystemExit(f"NL-only reference generation failed (LLM backend error): {exc}") from exc
         if not reference:
             controller.finish(
                 RunStatus.FAILED,
@@ -581,10 +674,10 @@ def _read_evidence(paths: list[str], inline: str) -> str:
 
 
 def _external_failure_state(stage: str, evidence: str, run_vitis: bool):
-    from .equivalence import PhaseResult, VerificationState
+    from .equivalence import PhaseResult
 
     state = VerificationState()
-    phases = ["software_equivalence"]
+    phases = ["software_equivalence", "trace_consistency"]
     if run_vitis:
         phases.extend(["csim", "csynth", "cosim"])
     if stage not in phases:
@@ -611,7 +704,7 @@ def run_repair(args: argparse.Namespace) -> int:
         config.top = _load_project_top(project_dir)
     if not config.top:
         raise SystemExit("--top is required because conversion_report.json does not record a top function")
-    config.run_vitis = args.stage != "software_equivalence"
+    config.run_vitis = args.stage not in {"software_equivalence", "trace_consistency"}
     evidence = _read_evidence(args.evidence, args.evidence_text)
     if not evidence:
         raise SystemExit("--evidence or --evidence-text is required")
@@ -703,7 +796,7 @@ def run_optimize(args: argparse.Namespace) -> int:
             verbose=args.verbose,
         )
     except RuntimeError as exc:
-        raise SystemExit(f"QoR optimization could not run: {exc}")
+        raise SystemExit(f"QoR optimization could not run: {exc}") from exc
     print(outcome.summary)
     print(f"QoR report: {project_dir / 'qor_report.json'} (+ .md" + (" + qor_table.tex)" if outcome.delta else ")"))
     if outcome.rolled_back:
@@ -719,6 +812,252 @@ def run_optimize(args: argparse.Namespace) -> int:
         # Every candidate died before scoring (toolchain outage, all-unparsable, all
         # equivalence failures): not a QoR verdict, so don't exit 0 as if it were.
         return 1
+    return 0
+
+
+def run_components(args: argparse.Namespace) -> int:
+    """Inspect the agent component scaffold without running anything."""
+
+    if args.markdown:
+        print(render_components_markdown(), end="")
+        return 0
+
+    if args.pipeline:
+        payload = {"default_pipeline": list(DEFAULT_PIPELINE)}
+        if args.json:
+            print(json.dumps(payload, indent=2))
+            return 0
+        print("Default start-to-finish component order (c2hlsc_agent.components.run_stages):")
+        for index, name in enumerate(DEFAULT_PIPELINE, start=1):
+            spec = get_component(name).spec
+            print(f"  {index}. {name:<28} [{spec.stage}] {spec.gate}")
+        print(
+            "\nRepair (hlsc_repair_agent) is a loop body driven by convert --auto-repair; "
+            "optimization (rtl_optimizer_agent) is the separate optimize command."
+        )
+        return 0
+
+    if args.stages:
+        stages = workflow_stages()
+        if args.json:
+            print(json.dumps(stages, indent=2))
+            return 0
+        for index, stage in enumerate(stages, start=1):
+            members = ", ".join(stage["components"]) or "-"
+            print(f"{index}. {stage['stage']:<9} {members}")
+            print(f"   {stage['purpose']}")
+        return 0
+
+    if args.component:
+        try:
+            spec = get_component(args.component).spec
+        except KeyError:
+            names = ", ".join(item.name for item in component_specs())
+            raise SystemExit(f"unknown component {args.component!r}; known components: {names}") from None
+        if args.json:
+            print(json.dumps(spec.to_dict(), indent=2))
+            return 0
+        print(f"{spec.name} ({spec.role})")
+        print(f"  stage         : {spec.stage}")
+        print(f"  status        : {spec.status}")
+        print(f"  owns          : {spec.owns}")
+        print(f"  inputs        : {', '.join(spec.procedure.inputs) or '-'}")
+        print(f"  outputs       : {', '.join(spec.procedure.outputs) or '-'}")
+        print(f"  implemented by: {', '.join(spec.implementation)}")
+        print(f"  driven by     : {', '.join(spec.cli) or 'library only'}")
+        print(f"  reads         : {', '.join(spec.reads) or '-'}")
+        print(f"  writes        : {', '.join(spec.writes) or '-'}")
+        print(f"  budgets       : {', '.join(spec.budgets) or '-'}")
+        print(f"  gate          : {spec.gate}")
+        print(f"  stop condition: {spec.stop_condition}")
+        print(f"  llm seam      : {spec.llm_seam}")
+        print("  invariants    :")
+        for item in spec.invariants:
+            print(f"    - {item}")
+        return 0
+
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "stages": workflow_stages(),
+                    "components": describe_components(),
+                    "default_pipeline": list(DEFAULT_PIPELINE),
+                },
+                indent=2,
+            )
+        )
+        return 0
+
+    for index, stage in enumerate(workflow_stages(), start=1):
+        print(f"{index}. {stage['stage']}: {stage['purpose']}")
+        for name in stage["components"]:
+            spec = get_component(name).spec
+            print(f"     {spec.name} [{spec.status}] - {spec.role}")
+            print(f"       gate  : {spec.gate}")
+            print(f"       writes: {', '.join(spec.writes) or '-'}")
+    print(
+        "\nUse --component NAME for one component, --stages for the stage graph, "
+        "--pipeline for the default run order, --json or --markdown for the full reference."
+    )
+    return 0
+
+
+def run_refine(args: argparse.Namespace) -> int:
+    """Coverage-driven stimulus refinement on an existing project."""
+
+    from .coverage_refine import RefinementError, refine_project
+
+    project_dir = Path(args.project).expanduser().resolve()
+    if args.config:
+        base = load_config(Path(args.config).resolve())
+    else:
+        # Refinement regenerates the testbenches in place, so it needs the stimulus the
+        # project was built with. Recovering it from the project keeps --config optional
+        # without silently drawing arguments outside their declared ranges.
+        base = AgentConfig()
+        contract = read_stimulus_contract(project_dir)
+        if contract is None:
+            print(
+                f"warning: {project_dir / STIMULUS_CONTRACT_PATH} is missing, so argument "
+                "ranges and lengths cannot be recovered; pass --config to regenerate the "
+                "same stimulus this project was built with",
+                file=sys.stderr,
+            )
+        else:
+            apply_stimulus_contract(base, contract)
+    config = merge_cli_config(base, args)
+    if not config.input_files:
+        config.input_files = [(project_dir / "input.c").resolve()]
+    if not config.input_files[0].exists():
+        raise SystemExit("--input is required because PROJECT/input.c does not exist")
+    if not config.top:
+        config.top = _load_project_top(project_dir)
+    if not config.top:
+        raise SystemExit("--top is required because conversion_report.json does not record a top function")
+
+    analysis = analyze_source(config.input_files[0], config.top, config)
+    try:
+        outcome = refine_project(
+            project_dir,
+            analysis,
+            config,
+            target=args.target,
+            max_rounds=args.max_rounds,
+            max_vectors=args.max_vectors,
+            allow_widen=not args.no_widen,
+            verbose=args.verbose,
+        )
+    except RefinementError as exc:
+        raise SystemExit(f"coverage refinement could not run: {exc}") from exc
+
+    print(outcome.summary)
+    print(f"Refinement report: {project_dir / 'coverage_refinement.json'}")
+    if outcome.uncovered_branches:
+        print(f"Still uncovered: {len(outcome.uncovered_branches)} branch(es), {len(outcome.uncovered_lines)} line(s)")
+    print(
+        "Re-run verification after refinement: the added cases are real tests and the "
+        "design has not been checked against them yet."
+    )
+    if outcome.status == "blocked":
+        return 1
+    if args.target is not None and outcome.status != "met":
+        return 1
+    return 0
+
+
+def run_doctor(args: argparse.Namespace) -> int:
+    """Report — and optionally install — the tools each verification tier needs."""
+
+    manager = package_manager()
+    statuses = check_tools(args.tier)
+    absent = missing_tools(statuses)
+
+    results: list[dict[str, object]] = []
+    if args.install and absent:
+        results = install_tools(absent, dry_run=args.dry_run)
+        if not args.dry_run:
+            statuses = check_tools(args.tier)  # re-probe so the report reflects reality
+            absent = missing_tools(statuses)
+
+    # The KLEE container route has three independent preconditions that all look the
+    # same from outside when one fails. Probe them whenever KLEE is not native.
+    container: dict[str, object] | None = None
+    if any(s.tool.name == "klee" and not s.present for s in statuses):
+        container = container_diagnostics()
+
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "platform": sys.platform,
+                    "package_manager": manager,
+                    "tools": [status.to_dict() for status in statuses],
+                    "install_results": results,
+                    "klee_container": container,
+                },
+                indent=2,
+            )
+        )
+        return 0 if not absent else 1
+
+    print(f"Package manager: {manager or 'none detected'}")
+    by_tier: dict[str, list] = {}
+    for status in statuses:
+        by_tier.setdefault(status.tool.tier, []).append(status)
+    for tier, entries in by_tier.items():
+        print(f"\n{tier} — {TIER_PURPOSE.get(tier, '')}")
+        for status in entries:
+            print(summary_line(status))
+
+    if container is not None:
+        print("\nKLEE container route (used only when KLEE is not native):")
+        print(f"  docker cli    : {container.get('cli') or 'not installed'}")
+        print(f"  daemon        : {container.get('daemon')}")
+        # Only meaningful once a daemon answered; an empty OSType from a dead daemon
+        # is not evidence of the wrong container type.
+        if container.get("daemon") == "ok":
+            os_type = container.get("os_type") or "(empty)"
+            note = "" if os_type == "linux" else "  <- klee/klee is a Linux image"
+            print(f"  container type: {os_type}{note}")
+        if "image_present" in container:
+            present = container.get("image_present")
+            hint = "" if present is True else f"  <- docker pull {container.get('image')}"
+            print(f"  image local   : {present}{hint}")
+
+    if results:
+        print("\nInstall results:")
+        for row in results:
+            name = row.get("name")
+            state = row.get("status")
+            if state == "would_run":
+                print(f"  {name}: would run {' '.join(row.get('command', []))}")
+            elif state == "manual":
+                print(f"  {name}: needs manual installation — {row.get('reason')}")
+            elif state == "installed":
+                print(f"  {name}: installed at {row.get('path')}")
+            else:
+                print(f"  {name}: {state} ({str(row.get('error') or row.get('stderr') or '')[:200]})")
+
+    if absent:
+        installable = [status for status in absent if status.installable]
+        if installable and not args.install:
+            print(
+                f"\n{len(installable)} missing tool(s) can be installed here: "
+                "run `c2hlsc-agent doctor --install`."
+            )
+        manual = [status for status in absent if not status.installable]
+        if manual:
+            print(
+                f"{len(manual)} missing tool(s) need manual installation (see the notes above)."
+            )
+        # Missing OPTIONAL tools are not an error for the core flow; only a missing core
+        # tool means the agent cannot verify anything on this machine.
+        core_missing = [
+            status for status in absent if status.tool.tier == "core" and not status.tool.optional
+        ]
+        return 1 if core_missing else 0
+    print("\nEvery checked tool is present.")
     return 0
 
 
@@ -770,6 +1109,12 @@ def main(argv: list[str] | None = None) -> int:
         return run_repair(args)
     if args.command == "optimize":
         return run_optimize(args)
+    if args.command == "components":
+        return run_components(args)
+    if args.command == "refine":
+        return run_refine(args)
+    if args.command == "doctor":
+        return run_doctor(args)
     if args.command == 'status':
         return run_status(args)
     parser.error(f"unknown command {args.command}")
