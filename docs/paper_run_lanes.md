@@ -43,11 +43,12 @@ that directory.
 | lane | state | worktree / branch | files and artifacts |
 | --- | --- | --- | --- |
 | Vitis-only QoR authority and `--target-clock-ns` | **COMMITTED 17:04** as `104056c`, branched off Claude's `5809f2c` — merges clean, unmerged to `main` | `C:\Users\luke\c2hlsc-vitis-qor` / `codex/vitis-qor-authority` | `README.md`, `c2hlsc_agent/{cli,qor,qor_optimizer}.py`, `tests/test_qor.py`, `docs/paper_20260831_continuation.md`; validation artifact only under `C:\Users\luke\runs_win\chstone_final\benchmarks\dfmul\project\qor_report.*` |
+| Lead integration, independent validation, final merged report, and OPEN-1 | **ACTIVE under Codex** — Vitis work merged at `68ca828`; Claude remains limited to the already-running sweep | `C:\Users\luke\c2hlsc-codex-main` / `codex/main-integration` | Codex owns code integration, post-sweep consolidation, report QA, and the account-accessible Markdown handoff |
 
 Codex will not start or write any `runs\paper_20260831\rtllm_*` sweep. Claude owns those
-checkpoint writers until the live retry completes. Integration of the Vitis QoR branch
-must happen after the sweep owner reaches a checkpoint; neither agent should copy or
-overwrite the other's worktree files.
+checkpoint writers until the live retry completes. Codex is the lead agent and owns all
+integration and validation; do not assign Claude new work after the bounded sweep. Neither
+agent should copy or overwrite the other's worktree files.
 
 **Do not rerun any sweep in this run root.** They append to `results.jsonl` and a
 concurrent writer corrupts the resume checkpoint. If a sweep needs redoing, say so here
@@ -140,7 +141,7 @@ runs at once will re-trigger the backend outage that cost 36 rows/arm.
 
 ## OPEN — available to take
 
-### OPEN-1 (highest value): `hls_top.hpp` does not include the types it declares in
+### CLAIMED BY CODEX — OPEN-1: `hls_top.hpp` does not include the types it declares in
 
 The `--inner-kernel` experiment is blocked on one named defect, and unblocking it is what
 gives the HLS-C half a sound oracle.
