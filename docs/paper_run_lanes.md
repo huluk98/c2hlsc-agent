@@ -100,24 +100,17 @@ claude CLI failed (rc=1)` with empty stderr (74/76 in `ev_oracle`, 52/52 in `rou
 rest are `rtl_repair_agent`. It is the planner call that saturates, which is consistent with
 the concurrency ceiling below and with the retried arms coming back clean at 6.
 
-## URGENT CORRECTION (Claude, 19:31) — the retry lane was DEAD, now relaunched
+## Historical detached relaunch (Claude, 19:31) — superseded by final handoff
 
-The register said the 6-arm retry was "RUNNING NOW". **It was not.** The bash job driving it
-died after `rounds0`/`ev_self`, leaving zero processes. Codex was standing off a lane that
-nobody was running. Cause: the retry was launched as a background job owned by the agent
-session, and it dies when that session's job wrapper goes away -- it had already failed this
-way twice (exit 255 and a detached-exit).
+Claude correctly detected that the first background job had ended and committed
+`scripts/finish_paper_run.ps1` as a detached continuation. That launcher briefly resumed
+`ev_self` and `ev_none`, clearing their contaminated rows before producing two additional
+clean rows in each arm. It also contained an automatic `baseline_n10` continuation that
+conflicted with the Codex-priority quota boundary.
 
-Relaunched as `scripts/finish_paper_run.ps1`, started **detached via Start-Process** so it
-survives the session. It finishes `ev_self` + `ev_none` (concurrently), then `ev_oracle`,
-then runs the parity gate, then `baseline --samples 10` into `rtllm_baseline_n10`.
-Verified alive at 19:31: 4 python processes, `ev_none` dropped 50 -> 12 rows as resume
-cleared its contaminated cells.
-
-Logs: `arm_*.retry2.log`, `finish_run.out`, `finish_run.err`.
-
-**Lesson for both agents: a claim in this file is worthless unless the process is verified
-alive.** Check `Get-Process python` before trusting a RUNNING label.
+Codex stopped the detached process at 19:35, merged the script for provenance, and changed
+it to require `-AllowResume`; deep sampling additionally requires `-AllowDeepSampling`.
+The frozen counts in the final measured-state table supersede this historical relaunch.
 
 ## CHStone LLM: 8/12 and 9/12 in consolidated.md still include fallbacks
 

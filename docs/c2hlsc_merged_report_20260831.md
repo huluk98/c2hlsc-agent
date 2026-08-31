@@ -99,7 +99,7 @@ The optimizer correctly accepted the baseline without proposing a rewrite becaus
 | Claude | `C:\Users\luke\c2hlsc-rtllm` | `fix/self-contained-translation-unit` | Bounded RTLLM generation, parity contract, pass/fail and pass@k tooling. |
 | Codex | `C:\Users\luke\c2hlsc-vitis-qor` | `codex/vitis-qor-authority` | Vitis-only QoR authority, commit `104056c`. |
 | Codex | `C:\Users\luke\c2hlsc-codex-main` | `codex/main-integration` | Vitis merge `68ca828`, application-type closure fix `ec7a75d`. |
-| Codex | `C:\Users\luke\c2hlsc-final` | `codex/final-integration` | Final merge `ed94edc`, Windows path normalization `ec09c3b`, independent checks, canonical report. |
+| Codex | `C:\Users\luke\c2hlsc-final` | `codex/final-integration` | Claude merges `ed94edc` and `9ca583d`, Windows path normalization `ec09c3b`, independent checks, canonical report. |
 
 The agents did not edit the same checkpoint directory concurrently. Claude’s six-arm job processed pairs sequentially with three workers per arm, keeping the Claude CLI concurrency at six after a higher-concurrency attempt saturated the backend. Codex did not start or resume any RTLLM writer. When saturation returned during the self-evidence arm, Codex stopped the retry before the final pair began. A later detached Claude launcher briefly resumed `ev_self` and `ev_none`; Codex stopped that launcher, regenerated every consolidated output from the final frozen files, and made the launcher opt-in. Both queued `rtllm_baseline_n10` processes were stopped before generation because they were outside the bounded handoff and would have consumed roughly 500 additional Claude calls.
 

@@ -1,6 +1,16 @@
 # Finish the 6-arm retry, verify generation parity, then run baseline at --samples 10.
 # Launched detached so it survives the agent session that started it: earlier attempts died
 # with the session's job wrapper, leaving the lane register claiming a run that was dead.
+param(
+  [switch]$AllowResume,
+  [switch]$AllowDeepSampling
+)
+
+if (-not $AllowResume) {
+  Write-Output 'Disabled by Codex final handoff: pass -AllowResume only after explicitly reopening the Claude lane.'
+  exit 0
+}
+
 $ErrorActionPreference = 'Continue'
 Set-Location 'C:\Users\luke\c2hlsc-rtllm'
 $py = 'C:\Users\luke\c2hlsc-agent\.venv\Scripts\python.exe'
@@ -28,6 +38,11 @@ Receive-Job $j1,$j2 | Out-Null
 Remove-Job $j1,$j2
 
 Run-Arm 'ev_oracle' @('--evidence-policy','oracle')
+
+if (-not $AllowDeepSampling) {
+  Write-Output 'Bounded six-arm retry complete; deep sampling not authorised.'
+  exit 0
+}
 
 # Gate: never start the deep-sampling arm under settings that differ from the arms it will
 # be compared against.
