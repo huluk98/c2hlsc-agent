@@ -11,7 +11,7 @@ Claude session driving the sweeps.
 | RTLLM 6-arm sweep (`baseline`, `no-plan`, `rounds=0`, `evidence=self/none/oracle`) | **RUNNING NOW — DO NOT START `scripts/resume_paper_20260831.ps1` AGAINST THIS RUN ROOT** | `rtllm_*/results.jsonl`, `arm_*.retry.log` |
 | RTLLM baselines (`--reference`, `--empty-baseline`) | DONE — 47/50 and 4/50, reproduce published | `rtllm_reference/`, `rtllm_empty/` |
 | RTLLM external sets (gpt-4, gpt-3.5) | DONE — 0.414 / 0.255 pass@1, reproduce published | `rtllm_ext_gpt-4/`, `rtllm_ext_gpt-35/` |
-| CHStone `chstone_main` arms (det + LLM ×2) | DONE — det 6/12, LLM 8/12 and 9/12 | `chstone_det/`, `chstone_llm_s*/` |
+| CHStone `chstone_main` arms (det + LLM ×2) | DONE — det 6/12; LLM **7/12 clean** both samples (see below) | `chstone_det/`, `chstone_llm_s*/` |
 | CHStone `--inner-kernel` arms (det + LLM ×2) | DONE — 0/5 both, blocked (see OPEN-1) | `chstone_inner_*/` |
 | Rosetta arms (det + LLM ×2) | DONE — no quotable score (see OPEN-2) | `rosetta_*/` |
 | `consolidate_paper_results.py`, `report_pass_fail_paths.py` | DONE, committed | `scripts/` |
@@ -87,6 +87,30 @@ the fifth of five inner kernels.
 failures on this Windows box — mostly g++/path issues in `test_hlsc_repair_agent`,
 `test_llm_agents`, `test_qor`, `test_run_chstone_staging`. Not blocking any sweep. Baseline
 list is in the session scratchpad; regenerate with a `git stash` + rerun if needed.
+
+### VERIFIED: CHStone LLM arms are 7/12, not 8/12 and 9/12
+
+Codex flagged that the LLM aggregates include deterministic fallbacks. Confirmed
+independently by hashing `src/hls_top.cpp` against the `chstone_det` arm's output for the
+same benchmark -- byte-identical means the model never produced that file
+(`convert.py`: "the conservative deterministic source is always built first and used as the
+fallback"). The conversion report carries no `missing_llm_reason`, so the hash is the only
+reliable signal.
+
+| arm | raw | fell back | clean LLM passes |
+| --- | :-: | --- | :-: |
+| `chstone_llm_s1` | 8/12 | `dfadd` | **7/12** — adpcm, dfdiv, dfmul, gsm, mips, motion, sha |
+| `chstone_llm_s2` | 9/12 | `dfadd`, `dfmul` | **7/12** — adpcm, aes, dfdiv, dfsin, gsm, mips, sha |
+
+Both land on 7, matching Codex's count exactly.
+
+Two different claims, and the paper must not merge them:
+ - **agent system** (any generator, repair on): 8/12 and 9/12 -- the fallback is part of the
+   system and dfadd/dfmul genuinely pass, consistent with `chstone_det` 6/12;
+ - **LLM generator**: 7/12 and 7/12.
+
+Still the docs' 6/12 beaten on both readings, and `mips`/`sha`/`adpcm`/`motion` -- the
+symbol-collision and C-not-valid-C++ casualties -- now pass, which is this branch's thesis.
 
 ## Facts both agents should not re-derive
 
