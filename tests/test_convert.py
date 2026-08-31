@@ -82,11 +82,11 @@ class ConvertTests(unittest.TestCase):
         analysis, cfg = self._analysis()
         testbench = generate_testbench(analysis, cfg)
         self.assertIn("// - out: direction=output length=4 compare first clamp(n, 4) elements", testbench)
-        self.assertIn("const int compare_len_out = clamp_count(static_cast<long long>(n), 4);", testbench)
+        self.assertIn("const int compare_len_out = clamp_count(printable(n), 4);", testbench)
         self.assertIn("for (int i = 0; i < compare_len_out; ++i)", testbench)
-        self.assertIn("if (!values_equal(ref_out[i], hls_out[i]))", testbench)
+        self.assertIn("if (!values_equal(ref_out_storage[i], hls_out_storage[i]))", testbench)
         self.assertIn('<< " compare_len=" << compare_len_out', testbench)
-        self.assertIn('<< " n=" << static_cast<long long>(n)', testbench)
+        self.assertIn('<< " n=" << printable(n)', testbench)
         self.assertIn('"Mismatch test=" << test_idx << " arg=out index="', testbench)
 
     def test_generated_testbench_uses_vitis_friendly_stimulus(self):

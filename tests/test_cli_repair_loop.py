@@ -21,6 +21,22 @@ def _state(*phases: PhaseResult) -> VerificationState:
     return state
 
 
+def _without_closure():
+    """Run the generator as if libclang were not installed.
+
+    The repair agent's standard-include and helper-inclusion repairs are the fallback for
+    exactly that case: with the closure available the generated header already carries the
+    include, and the repair correctly does nothing.
+    """
+
+    from c2hlsc_agent.closure import ClosureResult
+
+    return patch(
+        "c2hlsc_agent.convert.extract_closure",
+        return_value=ClosureResult(available=False, diagnostics=["closure disabled for this test"]),
+    )
+
+
 class CliRepairLoopTests(unittest.TestCase):
     def test_max_iterations_reruns_from_beginning_after_applied_repair(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -54,7 +70,9 @@ class CliRepairLoopTests(unittest.TestCase):
             first = _state(PhaseResult("software_equivalence", "fail", stderr="error: 'size_t' has not been declared"))
             second = _state(PhaseResult("software_equivalence", "pass"))
 
-            with patch("c2hlsc_agent.cli.verify_project", side_effect=[first, second]) as verify:
+            with _without_closure(), patch(
+                "c2hlsc_agent.cli.verify_project", side_effect=[first, second]
+            ) as verify:
                 rc = run_convert(args)
 
             self.assertEqual(rc, 0)
@@ -98,7 +116,9 @@ class CliRepairLoopTests(unittest.TestCase):
             )
             first = _state(PhaseResult("software_equivalence", "fail", stderr="mysterious failure with no safe repair"))
 
-            with patch("c2hlsc_agent.cli.verify_project", return_value=first) as verify:
+            with _without_closure(), patch(
+                "c2hlsc_agent.cli.verify_project", return_value=first
+            ) as verify:
                 rc = run_convert(args)
 
             self.assertEqual(rc, 1)
@@ -138,7 +158,9 @@ class CliRepairLoopTests(unittest.TestCase):
             )
             first = _state(PhaseResult("software_equivalence", "fail", stderr="error: 'size_t' has not been declared"))
 
-            with patch("c2hlsc_agent.cli.verify_project", return_value=first) as verify:
+            with _without_closure(), patch(
+                "c2hlsc_agent.cli.verify_project", return_value=first
+            ) as verify:
                 rc = run_convert(args)
 
             self.assertEqual(rc, 1)
@@ -174,7 +196,8 @@ class CliRepairLoopTests(unittest.TestCase):
                 ]
             )
             with patch("c2hlsc_agent.cli.verify_project", return_value=_state(PhaseResult("software_equivalence", "fail"))):
-                run_convert(convert_args)
+                with _without_closure():
+                    run_convert(convert_args)
             evidence = root / "software.log"
             evidence.write_text("error: 'size_t' has not been declared", encoding="utf-8")
             repair_args = build_parser().parse_args(

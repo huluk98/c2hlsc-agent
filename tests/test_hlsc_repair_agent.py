@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 import sys
@@ -10,6 +11,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from c2hlsc_agent.analyze import analyze_source
+from c2hlsc_agent.closure import ClosureResult
 from c2hlsc_agent.config import AgentConfig, ArgumentConfig
 from c2hlsc_agent.convert import generate_hls_sources
 from c2hlsc_agent.equivalence import PhaseResult, VerificationState
@@ -28,7 +30,14 @@ class HlscRepairAgentTests(unittest.TestCase):
         cfg.input_files = [input_path]
         cfg.top = top
         analysis = analyze_source(input_path, top, cfg)
-        generated = generate_hls_sources(analysis, cfg)
+        # These tests exercise the repair agent, which is the fallback for when closure
+        # extraction is unavailable; with it on, the generated header already carries the
+        # includes the repairs would add.
+        with patch(
+            "c2hlsc_agent.convert.extract_closure",
+            return_value=ClosureResult(available=False, diagnostics=["closure disabled for this test"]),
+        ):
+            generated = generate_hls_sources(analysis, cfg)
         project = write_project(root / "project", analysis, generated, cfg)
         return project, analysis, cfg
 

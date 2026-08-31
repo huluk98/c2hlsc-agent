@@ -13,6 +13,10 @@ dependencies = []
 [project.optional-dependencies]
 yaml = ["PyYAML>=6"]
 llm = ["anthropic>=0.40"]
+# Closure extraction (c2hlsc_agent.closure) needs a real C frontend. Without it the
+# converter still runs, but the generated translation unit carries no file-scope context
+# and records that it could not.
+closure = ["libclang>=16"]
 
 [project.scripts]
 c2hlsc-agent = "c2hlsc_agent.cli:main"
