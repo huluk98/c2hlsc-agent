@@ -49,6 +49,16 @@ Simulator notes (measured on this benchmark checkout with iverilog 12.0):
   a small, semantics-preserving rewrite to a *copy* of the testbench -- see
   ``TESTBENCH_SHIMS``. Each shim was verified to (a) compile and pass with the benchmark's
   own reference RTL and (b) still fail on obviously wrong RTL.
+- One testbench (``LFSR``) binds the DUT *positionally* in an order its specification never
+  states. Four of the 50 testbenches instantiate positionally; on three the reference's
+  declaration order is the order the spec lists the ports in, so position and name agree.
+  ``LFSR`` is the one design where they disagree: the spec lists ``clk, rst, out`` and the
+  reference declares ``module LFSR (out, clk, rst)``, so a candidate that declares its ports
+  in the order the spec introduces them fails to *elaborate* -- with a port-width error and
+  a cascading "continuously assigned" error on the testbench's own reset reg -- no matter how
+  correct its logic is. The shim rewrites that one instantiation to bind by name. The spec
+  states the port names unambiguously; it is the order that is undefined, so named binding
+  tests exactly what the specification actually specifies.
 
 With both of those in place the **oracle ceiling** measured on RTLLM v2.0 with iverilog 12.0
 is 50/50 syntax and 47/50 functional, for the official and the strict oracle alike; the
@@ -251,10 +261,11 @@ _RING_COUNTER_ARRAY_INIT = """reg [7:0] data [0:9];
     end"""
 
 #: design name -> ordered ``(pattern, replacement, rationale)`` rewrites applied to a COPY
-#: of ``testbench.v``. Both entries translate SystemVerilog that iverilog rejects into
-#: plain Verilog-2001 with identical behaviour; neither weakens a check. Verified by
-#: running the shimmed testbench against the reference RTL (passes) and against RTL with
-#: the outputs tied to zero (still fails).
+#: of ``testbench.v``. The first two translate SystemVerilog that iverilog rejects into
+#: plain Verilog-2001 with identical behaviour; the third replaces a positional DUT binding
+#: with the equivalent named one. None weakens a check. Verified by running each shimmed
+#: testbench against the reference RTL (passes) and against RTL with the outputs tied to
+#: zero (still fails).
 TESTBENCH_SHIMS = {
     "ring_counter": (
         (
@@ -279,6 +290,19 @@ TESTBENCH_SHIMS = {
             "iverilog rejects 'break' ('sorry: break statements not supported'). Nothing "
             "follows the repeat inside that block, so disabling the enclosing named block "
             "is exactly 'leave the loop' and preserves the write sequence.",
+        ),
+    ),
+    "LFSR": (
+        (
+            r"\bLFSR\s+(\w+)\s*\(\s*(\w+)\s*,\s*(\w+)\s*,\s*(\w+)\s*\)\s*;",
+            r"LFSR \1(.out(\2), .clk(\3), .rst(\4));",
+            "The testbench binds the DUT positionally as LFSR(out_tb, clk_tb, rst_tb), but "
+            "design_description.txt lists the ports as clk, rst, out and never states a "
+            "declaration order. A candidate that declares them in the order the spec "
+            "introduces them fails elaboration on port widths, so the design scores the "
+            "model's guess about the reference's port order rather than its logic. Binding "
+            "by name uses the three port names the spec does state, leaves the connected "
+            "signals and every check untouched, and lets both port orders elaborate.",
         ),
     ),
 }
@@ -2086,8 +2110,26 @@ def oracle_behaviour_diff(
     got_lines = _diff_lines(candidate_sim_log)
     note = ""
     if not reference_sim.syntax_pass:
-        note = "the reference RTL itself did not compile here, so the comparison is unreliable"
-    elif not reference_sim.func_pass:
+        # No answer key was produced, so there is nothing to diff against. Returning
+        # ran=True here would hand the repair agent a silent false green: an absent
+        # reference transcript trivially "matches" a candidate that also printed nothing,
+        # and diverged=False reads as "your output agrees with the reference". Say
+        # instead that the comparison did not happen.
+        return BehaviourDiff(
+            design=design.name,
+            ran=False,
+            diverged=False,
+            line=None,
+            expected=None,
+            got=None,
+            reference_lines=0,
+            candidate_lines=len(got_lines),
+            note=(
+                "the reference RTL itself did not compile here, so no expected output "
+                "exists and no comparison was made"
+            ),
+        )
+    if not reference_sim.func_pass:
         note = (
             "the reference RTL does not pass this testbench either (a known upstream oracle "
             "defect), so a matching output would not score"

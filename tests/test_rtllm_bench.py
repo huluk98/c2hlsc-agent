@@ -371,8 +371,10 @@ class ReferenceRtlTextTests(unittest.TestCase):
 
 
 class ShimTests(unittest.TestCase):
-    def test_shim_table_covers_only_the_two_known_designs(self):
-        self.assertEqual(set(TESTBENCH_SHIMS), {"ring_counter", "asyn_fifo"})
+    def test_shim_table_covers_only_the_three_known_designs(self):
+        # The table is a list of exceptions to "run the benchmark as shipped", so it must
+        # never grow without someone updating this assertion and writing the rationale.
+        self.assertEqual(set(TESTBENCH_SHIMS), {"ring_counter", "asyn_fifo", "LFSR"})
         for name in TESTBENCH_SHIMS:
             self.assertTrue(shim_rationale(name))
 
@@ -380,6 +382,17 @@ class ShimTests(unittest.TestCase):
         text, applied = apply_testbench_shims("adder_8bit", "module tb; endmodule\n")
         self.assertFalse(applied)
         self.assertEqual(text, "module tb; endmodule\n")
+
+    def test_lfsr_shim_rewrites_the_positional_bind_to_a_named_one(self):
+        text, applied = apply_testbench_shims("LFSR", "LFSR DUT(out_tb,clk_tb,rst_tb);\n")
+        self.assertTrue(applied)
+        self.assertEqual(text, "LFSR DUT(.out(out_tb), .clk(clk_tb), .rst(rst_tb));\n")
+
+    def test_lfsr_shim_connects_the_same_three_signals(self):
+        # The rewrite may reorder the port list; it may not change what is wired to what.
+        text, _ = apply_testbench_shims("LFSR", "LFSR DUT(out_tb,clk_tb,rst_tb);\n")
+        for port, signal in (("out", "out_tb"), ("clk", "clk_tb"), ("rst", "rst_tb")):
+            self.assertIn(".%s(%s)" % (port, signal), text)
 
     def test_ring_counter_shim_matches_the_upstream_declaration(self):
         text, applied = apply_testbench_shims("ring_counter", UPSTREAM_RING_COUNTER_DECL)
@@ -1474,6 +1487,7 @@ class TimeoutReadingTests(unittest.TestCase):
         self.assertNotIn("terminating condition", report)
 
 
+@unittest.skipUnless(HAS_IVERILOG, "iverilog/vvp not installed")
 class OracleBehaviourDiffTests(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
@@ -1538,6 +1552,43 @@ class OracleBehaviourDiffTests(unittest.TestCase):
         self.assertTrue(diff.diverged)
         self.assertEqual(diff.candidate_lines, 0)
         self.assertIn("your run stopped here", diff.report())
+
+
+class OracleBehaviourDiffWithoutAnAnswerKeyTests(unittest.TestCase):
+    """A reference that cannot be simulated must report "no comparison", not "no divergence".
+
+    Deliberately free of the ``HAS_IVERILOG`` guard: with a simulator the reference fails to
+    compile because the source below is invalid, and without one it fails because nothing can
+    compile. Both are the same defect from the caller's point of view, and the answer is the
+    same either way.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        root = self.tmp / "bench"
+        _write_design(
+            root,
+            "Arithmetic/Adder",
+            "tiny_adder",
+            TINY_ADDER_TB,
+            "module verified_tiny_adder( this is not verilog at all\n",
+        )
+        self.design = {d.name: d for d in discover_designs(root)}["tiny_adder"]
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_an_uncompilable_reference_reports_that_no_comparison_happened(self):
+        diff = oracle_behaviour_diff(self.design, "", self.tmp / "o")
+        self.assertFalse(diff.ran)
+        self.assertFalse(diff.diverged)
+        self.assertIn("no comparison was made", diff.report())
+
+    def test_it_does_not_read_as_agreement_with_the_reference(self):
+        # The regression this guards: an absent transcript trivially "matches" a candidate
+        # that also printed nothing, and diverged=False then reads as a clean bill of health.
+        diff = oracle_behaviour_diff(self.design, "", self.tmp / "o2")
+        self.assertNotIn("identical", diff.report())
 
 
 if __name__ == "__main__":
