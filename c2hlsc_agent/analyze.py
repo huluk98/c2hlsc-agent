@@ -167,6 +167,35 @@ _DEFINE_INT = re.compile(r"^[ \t]*#[ \t]*define[ \t]+(?P<name>\w+)[ \t]+(?P<valu
 _ENUM_BODY = re.compile(r"(?<![\w])enum\s+\w*\s*\{(?P<body>[^}]*)\}", re.S)
 
 
+def _source_with_local_headers(
+    source: str, source_path: Path, config: AgentConfig, _depth: int = 0
+) -> str:
+    """The top's text plus the local headers it includes, for constant collection.
+
+    A kernel almost never defines its own bounds: Rosetta keeps ``IMAGE_HEIGHT`` and
+    ``NUM_TRAINING`` in ``src/host/typedefs.h``. Reading only the top's file left every
+    such bound unresolved, which is the fallback-to-16 this work exists to remove.
+    """
+
+    if _depth > 4:
+        return source
+    search = [source_path.parent, *getattr(config, "include_dirs", [])]
+    collected = [source]
+    for match in re.finditer(r'^[ \t]*#[ \t]*include[ \t]*"([^"]+)"', source, re.M):
+        name = match.group(1)
+        for directory in search:
+            candidate = Path(directory) / name
+            if not candidate.is_file():
+                continue
+            try:
+                text = candidate.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                break
+            collected.append(_source_with_local_headers(text, candidate, config, _depth + 1))
+            break
+    return "\n".join(collected)
+
+
 def collect_constants(source: str) -> dict[str, int]:
     """Compile-time integer constants a bound may be written in terms of.
 
@@ -231,6 +260,10 @@ def evaluate_constant(expression: str, constants: dict[str, int]) -> int | None:
             substituted.append(token)
     candidate = "".join(substituted)
     if not re.fullmatch(r"[0-9+\-*/%()<>\s]*", candidate):
+        return None
+    # `SIZE()` substitutes to `4()`, which is a call, not arithmetic. Reject it here
+    # rather than letting eval raise (and warn) on it.
+    if re.search(r"[0-9)]\s*\(", candidate):
         return None
     try:
         value = eval(candidate, {"__builtins__": {}}, {})  # noqa: S307 - digits/operators only
@@ -310,7 +343,7 @@ def _extract_function(source: str, top: str, source_path: Path, config: AgentCon
     open_brace = searchable.find("{", match.start())
     close_brace = _find_matching_brace(searchable, open_brace)
     params = match.group("params")
-    constants = collect_constants(source)
+    constants = collect_constants(_source_with_local_headers(source, source_path, config))
     args = [
         _parse_arg(part, config.arguments.get(_guess_arg_name(part)), constants)
         for part in _split_params(params)
@@ -339,10 +372,21 @@ def _infer_pointer_directions(function: FunctionInfo, config: AgentConfig) -> No
         writes = bool(re.search(write_pattern, body))
         body_without_lhs_writes = re.sub(write_pattern, "", body)
         reads = bool(re.search(rf"(?:\*\s*{name}|{name}\s*\[[^\]]+\]|{name}\s*\+)", body_without_lhs_writes))
+        # An argument written by a *callee* is invisible to the pattern above: Rosetta's
+        # `SgdLR_sw` never assigns `theta`, it calls `updateParameter(theta, ...)`. Calling
+        # that an input makes it uncompared, and a kernel whose only output is uncompared
+        # passes its equivalence check without testing anything.
+        #
+        # For an equivalence oracle the safe direction is to compare: a buffer that turns
+        # out not to change still matches, whereas one wrongly skipped hides every
+        # mismatch in it. So a non-const pointer handed to any call counts as inout.
+        passed_to_call = bool(re.search(rf"[A-Za-z_]\w*\s*\([^;{{}}]*\b{name}\b", body))
         if writes and reads:
             arg.direction = "inout"
         elif writes:
             arg.direction = "output"
+        elif passed_to_call and not arg.is_const:
+            arg.direction = "inout"
         else:
             arg.direction = "input"
 

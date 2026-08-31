@@ -79,7 +79,7 @@ exit
 def render_makefile(config: AgentConfig) -> str:
     flags = " ".join(config.compiler_flags)
     return f"""CXX ?= g++
-CXXFLAGS ?= -std=c++17 -Wall -Wextra -I src {flags}
+CXXFLAGS ?= -std=c++17 -Wall -Wextra -I src -I . {flags}
 TB_EXE ?= c2hlsc_tb
 LEVERI_GOLDEN_EXE ?= leveri_golden_tb
 LEVERI_HLS_EXE ?= leveri_hls_tb

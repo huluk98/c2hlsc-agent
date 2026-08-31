@@ -49,6 +49,21 @@ def _element_count(arg: FunctionArg) -> int:
     return min(int(arg.length or 0), _MAX_TEST_ELEMENTS)
 
 
+# Total element-writes per iteration above which the configured repetition count is
+# reduced. Chosen so a full-size kernel still runs several complete iterations.
+_STIMULUS_BUDGET = 1 << 21
+
+
+def _effective_tests(arrays: list[FunctionArg], configured: int) -> int:
+    """How many iterations the configured stimulus can actually afford."""
+
+    per_iteration = sum(_element_count(arg) for arg in arrays)
+    if per_iteration <= 0:
+        return configured
+    affordable = max(1, _STIMULUS_BUDGET // per_iteration)
+    return max(1, min(configured, affordable))
+
+
 def _array_declaration(arg: FunctionArg) -> list[str]:
     """Storage plus a view whose type matches the parameter's declared shape.
 
@@ -176,7 +191,14 @@ def generate_testbench(analysis: AnalysisResult, config: AgentConfig) -> str:
     fn = analysis.function
     arrays = [arg for arg in fn.args if arg.is_pointer_like]
     scalars = [arg for arg in fn.args if not arg.is_pointer_like]
+    num_tests = _effective_tests(arrays, config.num_tests)
     contract_comment = _contract_comment(fn.args, fn.return_type, arrays, scalars)
+    if num_tests != config.num_tests:
+        contract_comment += (
+            f"\n// - iterations reduced from {config.num_tests} to {num_tests}: the stimulus is "
+            f"{sum(_element_count(a) for a in arrays)} elements per iteration at the kernel's "
+            "declared bounds, which is the real shape rather than a truncated one"
+        )
     declarations: list[str] = []
     initializers: list[str] = []
     array_declarations: list[str] = []
@@ -370,7 +392,7 @@ int main() {{
 // Argument storage is allocated once, not per test: at a real bound these are tens of
 // megabytes, and the testbench holds two copies of every argument.
 {chr(10).join(array_declarations)}
-  for (int test_idx = 0; test_idx < {config.num_tests}; ++test_idx) {{
+  for (int test_idx = 0; test_idx < {num_tests}; ++test_idx) {{
 {chr(10).join(declarations)}
 {chr(10).join(initializers)}
 {chr(10).join(compare_declarations)}
@@ -380,7 +402,7 @@ int main() {{
 {return_compare}
 {chr(10).join(comparisons)}
   }}
-  std::cout << "c2hlsc_agent: all {config.num_tests} tests passed, seed={config.seed}\\n";
+  std::cout << "c2hlsc_agent: all {num_tests} tests passed, seed={config.seed}\\n";
   return 0;
 }}
 """

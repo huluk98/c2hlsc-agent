@@ -200,6 +200,29 @@ def libclang_status() -> tuple[bool, str]:
 # --------------------------------------------------------------------------------------
 
 
+_HEADER_SUFFIXES = (".h", ".hpp", ".hh", ".hxx", ".inc")
+
+# Declarations a hoisted body may reference without any file in the closure including the
+# header that provides them -- the original build often supplied these transitively or
+# through `-include` flags. Stating them is what makes the generated TU stand alone.
+# Math functions a hoisted body may call with no math header anywhere in the closure.
+# Only names the closure does *not* define itself are treated as coming from <cmath>.
+_MATH_NAMES = frozenset(
+    """
+    exp expf expl log logf logl log2 log2f log10 log10f pow powf powl
+    sqrt sqrtf sqrtl cbrt cbrtf hypot hypotf
+    sin sinf cos cosf tan tanf asin asinf acos acosf atan atanf atan2 atan2f
+    sinh sinhf cosh coshf tanh tanhf
+    ceil ceilf floor floorf round roundf trunc truncf fmod fmodf
+    fabs fabsf fmin fminf fmax fmaxf isnan isinf
+    """.split()
+)
+
+
+def _is_header(path: str | None) -> bool:
+    return bool(path) and path.lower().endswith(_HEADER_SUFFIXES)
+
+
 def _is_system(path: str | None) -> bool:
     if not path:
         return True
@@ -226,6 +249,21 @@ def _extent_text(cursor, cache: dict[str, bytes]) -> str:
         return ""
     data = _read(extent.start.file.name, cache)
     return data[extent.start.offset : extent.end.offset].decode("utf-8", "replace")
+
+
+def _system_includes_of(path: str) -> list[str]:
+    """The ``#include <...>`` lines of one file."""
+
+    try:
+        text = Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    found = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#include") and "<" in stripped and stripped not in found:
+            found.append(stripped)
+    return found
 
 
 def _original_includes(source_path: Path) -> list[str]:
@@ -361,6 +399,26 @@ def _is_kr_definition(cursor, cache: dict[str, bytes]) -> bool:
     return ";" in after_parens
 
 
+def _has_visible_declaration(cursor) -> bool:
+    """True when something other than this definition already declares the function.
+
+    A re-included header that declares the helper `extern` makes a `static` definition
+    ill-formed, so the emitted linkage has to follow whatever is already visible.
+    """
+
+    canonical = cursor.canonical
+    if canonical is None:
+        return False
+    try:
+        same = canonical == cursor
+    except Exception:  # noqa: BLE001 - comparison is not always available
+        same = False
+    if same:
+        return False
+    location = canonical.location.file.name if canonical.location.file else None
+    return _is_header(location) or _is_system(location)
+
+
 def _function_text(cursor, cache: dict[str, bytes]) -> tuple[str, bool]:
     """Emit a function definition in ANSI form. Returns (text, was_rewritten).
 
@@ -374,11 +432,12 @@ def _function_text(cursor, cache: dict[str, bytes]) -> tuple[str, bool]:
     text = _extent_text(cursor, cache)
     if not text:
         return "", False
+    storage = "" if _has_visible_declaration(cursor) else "static "
     brace = text.find("{")
     if brace < 0:  # a bare prototype
-        return f"static {_ansi_signature(cursor)};", True
+        return f"{storage}{_ansi_signature(cursor)};", True
     body = text[brace:]
-    return f"static {_ansi_signature(cursor)} {body}", True
+    return f"{storage}{_ansi_signature(cursor)} {body}", True
 
 
 class _ClosureBuilder:
@@ -395,7 +454,50 @@ class _ClosureBuilder:
         self.ordered: list[object] = []
         self.used_macros: list[str] = []
         self.normalizations: list[str] = []
+        self._includable: dict[str, bool] = {}
         self._index_translation_unit()
+
+    def _header_is_includable(self, path: str) -> bool:
+        """A header is safe to re-include when it defines no mutable file-scope variable.
+
+        C lets a header write `int key[32];`, which is a tentative *definition*: every
+        translation unit that includes it gets its own, and the link then fails with
+        `multiple definition of 'key'`. Such a header has to be hoisted, not included.
+        """
+
+        cached = self._includable.get(path)
+        if cached is not None:
+            return cached
+        safe = True
+        for cursor in self.tu.cursor.get_children():
+            if _kind_name(cursor) != "VAR_DECL":
+                continue
+            location = cursor.location.file.name if cursor.location.file else None
+            if location != path:
+                continue
+            if cursor.type.is_const_qualified():
+                continue
+            if "extern" in _extent_text(cursor, self.cache):
+                continue
+            safe = False
+            break
+        self._includable[path] = safe
+        return safe
+
+    def _at_file_scope(self, cursor) -> bool:
+        """True only for declarations directly in the translation unit.
+
+        ``walk_preorder`` reaches every nested cursor, so a plain kind check also matches
+        the top's own *locals* -- and hoisting those emits ``static`` copies at file scope
+        whose initializers reference parameters that do not exist there
+        (``static FeatureType dot = dotProduct(theta, ...)``). Only what the file scope
+        actually declares can be part of the file-scope closure.
+        """
+
+        parent = cursor.semantic_parent
+        if parent is None:
+            return False
+        return _kind_name(parent) == "TRANSLATION_UNIT"
 
     def _index_translation_unit(self) -> None:
         for cursor in self.tu.cursor.walk_preorder():
@@ -405,7 +507,7 @@ class _ClosureBuilder:
                     self.macros.setdefault(cursor.spelling, cursor)
             elif kind == "MACRO_INSTANTIATION":
                 self.macro_uses.append(cursor)
-            elif kind in _HOISTABLE and cursor.spelling:
+            elif kind in _HOISTABLE and cursor.spelling and self._at_file_scope(cursor):
                 # An anonymous aggregate cannot be re-spelled on its own; whichever
                 # typedef or variable declaration encloses it carries it instead.
                 if kind in _TYPE_KINDS and (
@@ -414,8 +516,16 @@ class _ClosureBuilder:
                     continue
                 if cursor.location.file and not _is_system(cursor.location.file.name):
                     existing = self.file_scope.get(cursor.spelling)
-                    # prefer the definition over a forward declaration
-                    if existing is None or (cursor.is_definition() and not existing.is_definition()):
+                    # Prefer a definition over a forward declaration, and a typedef over
+                    # the aggregate it names: `typedef struct {...} MySize;` yields both a
+                    # STRUCT_DECL and a TYPEDEF_DECL spelled `MySize`, but only the
+                    # typedef's extent carries the name.
+                    better = existing is None
+                    if not better and cursor.is_definition() and not existing.is_definition():
+                        better = True
+                    if not better and kind == "TYPEDEF_DECL" and _kind_name(existing) != "TYPEDEF_DECL":
+                        better = True
+                    if better:
                         self.file_scope[cursor.spelling] = cursor
 
     def find_top(self):
@@ -516,6 +626,7 @@ class _ClosureBuilder:
                 available=True,
                 diagnostics=[f"top function {self.top_name!r} has no definition in {source_path.name}"],
             )
+        signature_text = _ansi_signature(top)
         self.visit(top)
         referenced_directly = len(self.ordered)
         if complete:
@@ -532,13 +643,27 @@ class _ClosureBuilder:
 
         includes = _original_includes(source_path)
         macro_lines: list[str] = []
-        for name in self.used_macros:
-            text = _extent_text(self.macros[name], self.cache).rstrip()
+        for name in list(self.used_macros):
+            cursor = self.macros[name]
+            origin = cursor.location.file.name if cursor.location.file else None
+            if origin and not _is_header(origin):
+                # A hoisted body brings its own libc needs with it (`expf` from <math.h>).
+                for line in _system_includes_of(origin):
+                    if line not in includes:
+                        includes.append(line)
+            if _is_header(origin) and self._header_is_includable(origin):
+                line = f'#include "{os.path.basename(origin)}"'
+                if line not in includes:
+                    includes.append(line)
+                self.used_macros.remove(name)
+                continue
+            text = _extent_text(cursor, self.cache).rstrip()
             if not text.startswith("#"):
                 text = "#define " + text
             macro_lines.append(f"#ifndef {name}\n{text}\n#endif")
 
         type_lines: list[str] = []
+        const_lines: list[str] = []
         value_lines: list[str] = []
         prototypes: list[str] = []
         bodies: list[str] = []
@@ -547,7 +672,28 @@ class _ClosureBuilder:
             text = _extent_text(cursor, self.cache).strip()
             if not text:
                 continue
+            origin = cursor.location.file.name if cursor.location.file else None
+            if origin and not _is_header(origin):
+                # A hoisted body brings its own libc needs with it (`expf` from <math.h>).
+                for line in _system_includes_of(origin):
+                    if line not in includes:
+                        includes.append(line)
+            if _is_header(origin) and self._header_is_includable(origin):
+                # The header declares it and guards itself; re-including is duplicate-free
+                # where hoisting a second copy into the same TU is a redefinition.
+                name = os.path.basename(origin)
+                line = f'#include "{name}"'
+                if line not in includes:
+                    includes.append(line)
+                    self.normalizations.append(
+                        f"included {name!r} rather than hoisting the declarations it guards"
+                    )
+                continue
             if kind in _TYPE_KINDS:
+                # An aggregate cursor whose extent omits its own name (the anonymous half
+                # of a typedef) is an abstract declarator and will not compile.
+                if cursor.spelling and cursor.spelling not in text:
+                    continue
                 type_lines.append(text if text.endswith(";") else text + ";")
             elif kind in _VALUE_KINDS:
                 # file-scope storage gets internal linkage so the hoisted copy cannot
@@ -555,7 +701,20 @@ class _ClosureBuilder:
                 decl, note = _var_decl_text(cursor, self.cache)
                 if note:
                     self.normalizations.append(note)
-                value_lines.append(decl)
+                # A const scalar is a compile-time constant that the *signature* may be
+                # written in terms of, so it has to reach the header, not just the source.
+                # A constant reaches the header only when the signature is written in
+                # terms of it. Putting every constant there duplicates definitions into
+                # any TU that also holds the original source -- which the testbench does.
+                needed_by_signature = re.search(rf"\b{re.escape(cursor.spelling)}\b", signature_text)
+                if (
+                    cursor.type.is_const_qualified()
+                    and "[" not in decl.split("=")[0]
+                    and needed_by_signature
+                ):
+                    const_lines.append(decl)
+                else:
+                    value_lines.append(decl)
             elif kind in _FUNCTION_KINDS:
                 body, rewritten = _function_text(cursor, self.cache)
                 if not body:
@@ -568,13 +727,30 @@ class _ClosureBuilder:
                     self.normalizations.append(
                         f"gave helper {cursor.spelling!r} internal linkage"
                     )
-                prototypes.append(f"static {_ansi_signature(cursor)};")
+                storage = "" if _has_visible_declaration(cursor) else "static "
+                prototypes.append(f"{storage}{_ansi_signature(cursor)};")
                 bodies.append(body)
 
         def block(title: str, lines: list[str]) -> str:
             if not lines:
                 return ""
             return f"\n// --- {title} ---\n" + "\n".join(lines) + "\n"
+
+        # A math call the closure does not define itself can only come from <cmath>, and
+        # nothing in the hoisted sources necessarily includes it.
+        hoisted_text = "\n".join(bodies)
+        defined_here = {c.spelling for c in self.ordered}
+        for name in _MATH_NAMES:
+            if name in defined_here:
+                continue
+            if re.search(rf"\b{name}\s*\(", hoisted_text):
+                line = "#include <cmath>"
+                if line not in includes:
+                    includes.insert(0, line)
+                    self.normalizations.append(
+                        f"stated <cmath>: {name!r} is called but declared nowhere in the closure"
+                    )
+                break
 
         header_note = (
             "// c2hlsc_agent closure: file-scope context the top function references,\n"
@@ -586,6 +762,7 @@ class _ClosureBuilder:
             + block("includes", includes)
             + block("macros", macro_lines)
             + block("types", type_lines)
+            + block("constants", const_lines)
             + block("globals", value_lines)
             + block("prototypes", prototypes)
             + block("definitions", bodies)
@@ -595,6 +772,7 @@ class _ClosureBuilder:
             + block("includes", includes)
             + block("macros", macro_lines)
             + block("types", type_lines)
+            + block("constants", const_lines)
         )
         # What a source file that already includes the header still needs. Types are
         # deliberately absent: they came in via the header, and repeating them here would
