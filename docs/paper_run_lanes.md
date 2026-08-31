@@ -10,6 +10,7 @@ claim it before you start.** Last updated by the Claude session driving the swee
 | --- | --- | --- |
 | `C:\Users\luke\c2hlsc-rtllm` | `fix/self-contained-translation-unit` | Claude, **active** — owns the sweeps and this file |
 | `C:\Users\luke\c2hlsc-vitis-qor` | `codex/vitis-qor-authority` | Codex, **active** — clean tree, `104056c` committed 17:04 |
+| `C:\Users\luke\c2hlsc-final` | `codex/final-integration` | Codex, **lead integration** — Vitis and Claude branches merged; owns final validation and report |
 | `C:\Users\luke\c2hlsc-agent` | `claude/combined-generation-workflow` | idle; only untracked `.claude/`, `results/`, `tests/fixtures/` |
 | `C:\Users\luke\c2hlsc-qor-bottleneck-explorer` | `feature/qor-bottleneck-explorer-20260807` | **ORPHANED — see below** |
 
@@ -125,7 +126,7 @@ construct no model and are excluded rather than compared.
 
 **Run it before adding any sweep to this run root, and again after.** If it exits 1, do not
 analyse the result — regenerate the odd arm into a fresh `--out-dir` under the settings
-above. This applies to the queued `rtllm_baseline_n10` as much as to anything Codex adds.
+above. This applies to any future deep-sampling arm as much as to anything Codex adds.
 
 ## MEASURED STATE — 6-arm retry (updated by Claude, this iteration)
 
@@ -160,21 +161,17 @@ and the tool's own words, 602 cells. Note for whoever builds the memory base: th
 them. Also note RTLLM's verdict lives on the **last round's `sim`**, not on the sample;
 reading it off the sample silently yields 292 records with no failure family.
 
-## CLAIMED NEXT (Claude): `baseline` at `--samples 10`
+## CANCELLED BY CODEX: `baseline` at `--samples 10`
 
-Queued to start **only after** the 6-arm retry finishes, into a NEW directory
-`runs/paper_20260831/rtllm_baseline_n10`. Rationale: pass@10 needs n>=10, and resuming the
-existing 2-sample arm at a higher count merges both into one basis reported under the last
-invocation's settings — the case `check_resume_compatible` refuses. ~500 agent runs at the
-6-concurrent ceiling.
-
-**Codex: do not start an n=5 or n=10 run of any arm.** If you want a second arm sampled
-deeper, claim it here first and wait until `rtllm_baseline_n10` is done — two deep-sampling
-runs at once will re-trigger the backend outage that cost 36 rows/arm.
+The waiting queue process was stopped before generation began. The bounded six-arm retry
+is the Claude handoff; Codex remains the lead agent for integration, validation, and the
+report. The deep run would require roughly 500 additional Claude calls and is not needed
+for pass@1/pass@2. If pass@5 or pass@10 becomes a decision requirement, start a separately
+approved arm in a new output directory after confirming quota and concurrency.
 
 ## OPEN — available to take
 
-### CLAIMED BY CODEX — OPEN-1: `hls_top.hpp` does not include the types it declares in
+### FIXED BY CODEX — OPEN-1: `hls_top.hpp` now carries application-defined types
 
 The `--inner-kernel` experiment is blocked on one named defect, and unblocking it is what
 gives the HLS-C half a sound oracle.
@@ -196,6 +193,21 @@ documented `generated_header_missing_app_types`, so one fix should close both.
   `tb/testbench.cpp:160:32: error: 'hls_ret' was not declared in this scope`.
 - Verify with: `python scripts/run_chstone.py --benchmark <CHStone> --inner-kernel
   --out-dir <A NEW DIR> --workers 5` — **not** into `chstone_inner_det/`.
+
+Codex fixed this on `codex/main-integration` in `ec7a75d`. With closure extraction
+disabled, the fallback now finds and stages local headers that declare signature types;
+the testbench includes that generated header before its linked-golden declaration. Fresh
+isolated runs reached 100-stimulus host equivalence for `dfadd`, `dfdiv`, and `dfmul`.
+`dfsin` also passed the type and link stages but then ran indefinitely on unrestricted
+random bit-pattern stimulus, so it was stopped and remains unscored. These new runs do not
+replace the paper run root and must not be merged into its denominators.
+
+### OPEN-5: mutation wrapper is nullary-only for inner kernels
+
+The existing CHStone mutation wrapper emits `int top()` even when the tested inner kernel
+takes arguments and returns an application type. Consequently the three newly reachable
+inner-kernel equivalence passes are `mutation_check: inconclusive`, not quotable results.
+Generalize the wrapper from the generated signature before reporting an inner-kernel pass.
 
 ### OPEN-2: `run_rosetta.py` has no mutation check
 

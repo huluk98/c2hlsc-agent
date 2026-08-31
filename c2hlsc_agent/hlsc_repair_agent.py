@@ -291,9 +291,9 @@ def _sha256(text: str) -> str:
 
 def _relative(project_dir: Path, path: Path) -> str:
     try:
-        return str(path.relative_to(project_dir))
+        return path.relative_to(project_dir).as_posix()
     except ValueError:
-        return str(path)
+        return path.as_posix()
 
 
 def _rewrite_file(project_dir: Path, path: Path, action: str, new_text: str) -> RepairFileChange | None:
