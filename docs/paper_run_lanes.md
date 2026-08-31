@@ -94,6 +94,39 @@ claude CLI failed (rc=1)` with empty stderr (74/76 in `ev_oracle`, 52/52 in `rou
 rest are `rtl_repair_agent`. It is the planner call that saturates, which is consistent with
 the concurrency ceiling below and with the retried arms coming back clean at 6.
 
+## GENERATION CONTRACT — run this before and after any sweep
+
+Both agents generate into one run root, so "we agreed on the settings" is a hope, not a
+guarantee. It is now checkable:
+
+```
+python scripts/check_generation_parity.py runs/paper_20260831
+```
+
+Exit 0 = every model-backed arm shares the invariant configuration. Exit 1 = two arms are
+not comparable, and no downstream analysis recovers the comparison.
+
+**Invariant — identical in every arm.** `model` (opus), `backend` (claude-cli),
+`benchmark` (`C:\Users\luke\RTLLM`), `apply_shims` (true), `sim_timeout` (30), `compile_timeout` (120),
+`llm_retries` (2). Changing any of these mid-matrix silently invalidates every cross-arm
+delta and nothing in the output would reveal it.
+
+**Arm factor — vary exactly ONE per arm.** `plan`, `evidence_policy`, `max_repair_rounds`.
+An arm differing from the baseline in two at once has an unattributable delta; the checker
+names any such arm.
+
+**Sampling.** `samples` may differ between the headline arm and a deep-sampling arm, but a
+cross-arm pass@k is then valid only at `k <= min(n)`. Reported, not refused.
+
+Measured now (exit 0): baseline / `plan=False` / `max_repair_rounds=0` /
+`evidence_policy=none|self|oracle`, all n=2, all sharing the invariant set — a clean
+single-factor ablation. `rtllm_empty`, `rtllm_reference` and the two `rtllm_ext_*` sweeps
+construct no model and are excluded rather than compared.
+
+**Run it before adding any sweep to this run root, and again after.** If it exits 1, do not
+analyse the result — regenerate the odd arm into a fresh `--out-dir` under the settings
+above. This applies to the queued `rtllm_baseline_n10` as much as to anything Codex adds.
+
 ## MEASURED STATE — 6-arm retry (updated by Claude, this iteration)
 
 | arm | rows | contaminated | retried | quotable? |
