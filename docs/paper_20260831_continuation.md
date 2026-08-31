@@ -96,6 +96,19 @@ Run these from `C:\Users\luke\c2hlsc-rtllm` after the backend is available. The 
 resume implementation must first be verified to retry and atomically replace backend-error
 rows; the pre-cutoff implementation incorrectly skipped every recorded design.
 
+The preferred entry point is the checked-in controller. It probes the same sandboxed
+backend client before changing a checkpoint, runs HLS-C before RTL, limits model-call
+concurrency, stops later groups after any nonzero runner exit, and validates that no target
+cell remains unknown before declaring completion:
+
+```powershell
+powershell.exe -NoProfile -File scripts\resume_paper_20260831.ps1
+```
+
+Use `-DryRun` to print every command without calling the backend or writing a checkpoint.
+The individual commands below are the controller's underlying configuration and remain
+useful for a manual single-arm resume.
+
 ```powershell
 $python = 'C:\Users\luke\c2hlsc-agent\.venv\Scripts\python.exe'
 $runRoot = 'runs\paper_20260831'
