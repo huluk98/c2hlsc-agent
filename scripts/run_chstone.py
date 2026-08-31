@@ -103,14 +103,54 @@ VITIS_RUNGS = ("csim", "csynth", "cosim")
 RUNG_ORDER = ("discovered", "native_pass", "analyzed", "generated", "host_equivalence")
 
 
+#: benchmark -> (kernel function, the sibling source that DEFINES it).
+#:
+#: The suite-declared top is ``chstone_main``, the benchmark's own ``main``: it takes no
+#: arguments, so host equivalence reduces to calling both versions and comparing one
+#: return value. There are no stimuli to vary, which makes a CHStone "equivalence pass" a
+#: far weaker claim than the argument-driven equivalence this repo performs on ordinary
+#: kernels. ``--inner-kernel`` retargets the conversion at the computational kernel that
+#: ``main`` calls, which does take arguments, so the generated testbench drives real
+#: randomized stimulus and the oracle has something to discriminate with.
+#:
+#: Only the kernels below take arguments. Surveyed across all 12 benchmarks:
+#:   * ``adpcm``, ``aes``, ``blowfish``, ``jpeg``, ``sha`` -- the kernel is also
+#:     zero-argument and closes over file-scope globals, so retargeting buys nothing;
+#:   * ``mips`` -- ``main`` is the CPU simulator loop itself, with no inner kernel;
+#:   * ``motion`` -- ``motion_vectors`` takes ``int PMV[2][2][2]`` and two more
+#:     multi-dimensional arrays, which the testbench generator cannot express (it declares
+#:     one flat 1-D array per pointer-like argument).
+#: Quote inner-kernel results as 5 benchmarks, not 12, and say which 5.
+CHSTONE_INNER_KERNELS: "dict[str, tuple[str, str]]" = {
+    "dfadd": ("float64_add", "softfloat.c"),
+    "dfdiv": ("float64_div", "softfloat.c"),
+    "dfmul": ("float64_mul", "softfloat.c"),
+    "dfsin": ("local_sin", "dfsin.c"),
+    "gsm": ("Gsm_LPC_Analysis", "lpc.c"),
+}
+
+
 @dataclass
 class ChstoneBenchmark:
     name: str
     directory: Path
     top_file: Path
+    #: The function the conversion targets. ``chstone_main`` in the default (suite-declared)
+    #: mode; the inner kernel under ``--inner-kernel``.
+    top_function: str = CHSTONE_TOP_FUNCTION
+
+    @property
+    def targets_inner_kernel(self) -> bool:
+        return self.top_function != CHSTONE_TOP_FUNCTION
 
     def to_dict(self) -> dict[str, object]:
-        return {"name": self.name, "directory": str(self.directory), "top_file": self.top_file.name}
+        return {
+            "name": self.name,
+            "directory": str(self.directory),
+            "top_file": self.top_file.name,
+            "top_function": self.top_function,
+            "targets_inner_kernel": self.targets_inner_kernel,
+        }
 
 
 @dataclass
@@ -169,7 +209,9 @@ def log(message: str) -> None:
 # --------------------------------------------------------------------------- #
 
 
-def discover_benchmarks(root: Path, only: tuple[str, ...] = ()) -> list[ChstoneBenchmark]:
+def discover_benchmarks(
+    root: Path, only: tuple[str, ...] = (), *, inner_kernel: bool = False
+) -> list[ChstoneBenchmark]:
     """Find CHStone benchmarks, taking each top file from the benchmark's own hls.tcl.
 
     The top file is *not* always ``<dir>/<dir>.c`` -- jpeg uses ``main.c``, motion uses
@@ -187,6 +229,18 @@ def discover_benchmarks(root: Path, only: tuple[str, ...] = ()) -> list[ChstoneB
             continue
         top_file = directory / match.group(1)
         if not top_file.exists():
+            continue
+        if inner_kernel:
+            entry = CHSTONE_INNER_KERNELS.get(directory.name)
+            if entry is None:
+                # No argument-taking kernel: skip rather than silently fall back to
+                # chstone_main, which would put a weak-oracle row in an inner-kernel table.
+                continue
+            kernel, source_name = entry
+            kernel_source = directory / source_name
+            if not kernel_source.exists():
+                continue
+            found.append(ChstoneBenchmark(directory.name, directory, kernel_source, kernel))
             continue
         found.append(ChstoneBenchmark(directory.name, directory, top_file))
     return found
@@ -333,13 +387,14 @@ def _classify_conversion(report: dict, log_text: str) -> tuple[str, str | None]:
 
 
 def _convert_command(top_copy: Path, project: Path, args: argparse.Namespace,
-                     *, max_iterations: int, auto_repair: bool) -> list[str]:
+                     *, max_iterations: int, auto_repair: bool,
+                     top: str = CHSTONE_TOP_FUNCTION) -> list[str]:
     """Build the ``c2hlsc_agent.cli convert`` invocation for one benchmark."""
 
     cmd = [
         sys.executable, "-m", "c2hlsc_agent.cli", "convert",
         "--input", str(top_copy),
-        "--top", CHSTONE_TOP_FUNCTION,
+        "--top", top,
         "--out", str(project),
         "--no-run-vitis",
     ]
@@ -362,7 +417,8 @@ def _convert_command(top_copy: Path, project: Path, args: argparse.Namespace,
 
 
 def _repair_command(project: Path, top_copy: Path, log_path: Path, iteration: int,
-                    args: argparse.Namespace, stage: str = "software_equivalence") -> list[str]:
+                    args: argparse.Namespace, stage: str = "software_equivalence",
+                    top: str = CHSTONE_TOP_FUNCTION) -> list[str]:
     """One repair round driven from the *staged* equivalence log.
 
     Running repair outside ``convert`` is the whole point of the staged flow: the evidence
@@ -376,7 +432,7 @@ def _repair_command(project: Path, top_copy: Path, log_path: Path, iteration: in
         "--stage", stage,
         "--evidence", str(log_path),
         "--input", str(top_copy),
-        "--top", CHSTONE_TOP_FUNCTION,
+        "--top", top,
         "--iteration", str(iteration),
     ]
     if args.use_llm:
@@ -408,7 +464,8 @@ def _stimulus_count(log_text: str) -> int | None:
     return int(match.group(1)) if match else None
 
 
-def run_mutation_check(project: Path, timeout: int) -> tuple[str, str]:
+def run_mutation_check(project: Path, timeout: int,
+                       top: str = CHSTONE_TOP_FUNCTION) -> tuple[str, str]:
     """Prove the equivalence test is not vacuous: perturb the candidate, expect red.
 
     Returns ``(verdict, detail)`` where verdict is one of:
@@ -420,7 +477,7 @@ def run_mutation_check(project: Path, timeout: int) -> tuple[str, str]:
                        wrapped); no claim either way
     """
 
-    mutant = chstone_staging.write_mutant_source(project, CHSTONE_TOP_FUNCTION)
+    mutant = chstone_staging.write_mutant_source(project, top)
     if mutant is None:
         return "inconclusive", "could not rename the candidate's top to build a mutant"
     code, output = _make(project, chstone_staging.MUTANT_TARGET, timeout)
@@ -440,7 +497,8 @@ def run_mutation_check(project: Path, timeout: int) -> tuple[str, str]:
 
 
 def _vitis_ladder(project: Path, staged: Path, top_copy: Path,
-                  args: argparse.Namespace, result: "BenchmarkResult") -> None:
+                  args: argparse.Namespace, result: "BenchmarkResult",
+                  top: str = CHSTONE_TOP_FUNCTION) -> None:
     """Run CSim -> CSynth -> CoSim, repairing against whichever phase fails first.
 
     Only reached once host equivalence passes, so a Vitis failure here is about
@@ -475,7 +533,8 @@ def _vitis_ladder(project: Path, staged: Path, top_copy: Path,
             break
         try:
             repair = subprocess.run(
-                _repair_command(project, top_copy, evidence, attempt + 1, args, stage=failing),
+                _repair_command(project, top_copy, evidence, attempt + 1, args,
+                                stage=failing, top=top),
                 capture_output=True, text=True, timeout=args.timeout, cwd=str(REPO_ROOT))
         except (subprocess.TimeoutExpired, OSError) as exc:
             result.notes.append(f"vitis repair round {attempt + 1} did not complete: {exc}")
@@ -484,7 +543,7 @@ def _vitis_ladder(project: Path, staged: Path, top_copy: Path,
         summary = ((repair.stdout or "").strip().splitlines() or [""])[0][:160]
         result.notes.append(f"vitis repair round {attempt + 1} ({failing}): {summary}")
         again = chstone_staging.stage_project(
-            project, staged, top_copy.name, CHSTONE_TOP_FUNCTION,
+            project, staged, top_copy.name, top,
             relax_narrowing=args.relax_narrowing,
         )
         if not again.applied:
@@ -523,20 +582,24 @@ def run_agent_staged(bench: ChstoneBenchmark, out_dir: Path, args: argparse.Name
     staged = work / "src_copy"
     shutil.copytree(bench.directory, staged)
     top_copy = staged / bench.top_file.name
-    renamed, count = rename_main(top_copy.read_text(encoding="utf-8", errors="replace"))
     result = BenchmarkResult(benchmark=bench.name, mode="agent", rung="discovered", ok=False)
     result.staging = "golden_c_tu"
     result.repair_rounds_allowed = repair_rounds(args)
-    if count != 1:
-        result.failure_family = "main_rename_failed"
-        result.evidence = f"expected exactly one main definition, renamed {count}"
-        result.duration_s = round(time.time() - started, 2)
-        return result
-    top_copy.write_text(renamed, encoding="utf-8")
+    if not bench.targets_inner_kernel:
+        # Only the suite-declared flow renames main; an inner kernel is an ordinary
+        # function in a sibling source and there is no main in that file to rename.
+        renamed, count = rename_main(top_copy.read_text(encoding="utf-8", errors="replace"))
+        if count != 1:
+            result.failure_family = "main_rename_failed"
+            result.evidence = f"expected exactly one main definition, renamed {count}"
+            result.duration_s = round(time.time() - started, 2)
+            return result
+        top_copy.write_text(renamed, encoding="utf-8")
 
     project = work / "project"
     # Phase 1: generation only. Repair is driven below, after staging.
-    cmd = _convert_command(top_copy, project, args, max_iterations=1, auto_repair=False)
+    cmd = _convert_command(top_copy, project, args, max_iterations=1,
+                           auto_repair=False, top=bench.top_function)
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=args.timeout,
                               cwd=str(REPO_ROOT))
@@ -554,7 +617,7 @@ def run_agent_staged(bench: ChstoneBenchmark, out_dir: Path, args: argparse.Name
         return result
 
     staging = chstone_staging.stage_project(
-        project, staged, top_copy.name, CHSTONE_TOP_FUNCTION,
+        project, staged, top_copy.name, bench.top_function,
         relax_narrowing=args.relax_narrowing,
     )
     result.staging_detail = staging.to_dict()
@@ -580,7 +643,8 @@ def run_agent_staged(bench: ChstoneBenchmark, out_dir: Path, args: argparse.Name
             break
         try:
             repair = subprocess.run(
-                _repair_command(project, top_copy, log_path, attempt + 1, args),
+                _repair_command(project, top_copy, log_path, attempt + 1, args,
+                                top=bench.top_function),
                 capture_output=True, text=True, timeout=args.timeout, cwd=str(REPO_ROOT))
         except (subprocess.TimeoutExpired, OSError) as exc:
             result.notes.append(f"repair round {attempt + 1} did not complete: {exc}")
@@ -592,7 +656,7 @@ def run_agent_staged(bench: ChstoneBenchmark, out_dir: Path, args: argparse.Name
         # the macro-included golden). Re-assert the staging so a repair can never quietly
         # put CHStone's C back in front of g++.
         again = chstone_staging.stage_project(
-            project, staged, top_copy.name, CHSTONE_TOP_FUNCTION,
+            project, staged, top_copy.name, bench.top_function,
             relax_narrowing=args.relax_narrowing,
         )
         if not again.applied:
@@ -624,7 +688,7 @@ def run_agent_staged(bench: ChstoneBenchmark, out_dir: Path, args: argparse.Name
             {"diagnostics": report.get("diagnostics"), "software_equivalence": "fail"}, log_text
         )
     if result.ok and getattr(args, "run_vitis", False):
-        _vitis_ladder(project, staged, top_copy, args, result)
+        _vitis_ladder(project, staged, top_copy, args, result, bench.top_function)
     result.stimulus_count = _stimulus_count(log_text) if result.ok else None
     result.diagnostics = [
         f"[{d.get('severity')}] {d.get('code')}: {d.get('message')}"
@@ -633,12 +697,12 @@ def run_agent_staged(bench: ChstoneBenchmark, out_dir: Path, args: argparse.Name
     result.evidence = log_text[-EVIDENCE_LIMIT:]
     result.project_dir = str(project)
     result.vitis_followup_cmd = (
-        f"python3 -m c2hlsc_agent.cli convert --input {top_copy} --top {CHSTONE_TOP_FUNCTION} "
+        f"python3 -m c2hlsc_agent.cli convert --input {top_copy} --top {bench.top_function} "
         f"--out {project} --vitis-ssh USER@VITIS_HOST --keep-going"
     )
 
     if result.ok and args.mutation_check:
-        verdict, detail = run_mutation_check(project, args.timeout)
+        verdict, detail = run_mutation_check(project, args.timeout, bench.top_function)
         result.mutation_check = verdict
         result.mutation_detail = detail
         if verdict == "FALSE_GREEN":
@@ -684,7 +748,7 @@ def run_agent(bench: ChstoneBenchmark, out_dir: Path, args: argparse.Namespace) 
     cmd = [
         sys.executable, "-m", "c2hlsc_agent.cli", "convert",
         "--input", str(top_copy),
-        "--top", CHSTONE_TOP_FUNCTION,
+        "--top", bench.top_function,
         "--out", str(project),
         "--no-run-vitis",
     ]
@@ -768,7 +832,7 @@ def run_agent(bench: ChstoneBenchmark, out_dir: Path, args: argparse.Namespace) 
     result.evidence = log_text[-EVIDENCE_LIMIT:]
     result.project_dir = str(project)
     result.vitis_followup_cmd = (
-        f"python3 -m c2hlsc_agent.cli convert --input {top_copy} --top {CHSTONE_TOP_FUNCTION} "
+        f"python3 -m c2hlsc_agent.cli convert --input {top_copy} --top {bench.top_function} "
         f"--out {project} --vitis-ssh USER@VITIS_HOST --keep-going"
     )
     result.duration_s = round(time.time() - started, 2)
@@ -939,6 +1003,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--native-baseline", action="store_true",
                         help="Compile and run CHStone's own C (the calibration rung); no conversion")
+    parser.add_argument(
+        "--inner-kernel", action="store_true",
+        help="Target each benchmark's argument-taking inner kernel instead of the "
+             "suite-declared zero-argument chstone_main. Host equivalence then drives real "
+             "randomized stimulus over the kernel's arguments rather than comparing a single "
+             "return value. Only the "
+             f"{len(CHSTONE_INNER_KERNELS)} benchmarks in CHSTONE_INNER_KERNELS have such a "
+             "kernel (" + ", ".join(sorted(CHSTONE_INNER_KERNELS)) + "); the rest are SKIPPED "
+             "rather than silently falling back, so an inner-kernel table never mixes oracles.")
     parser.add_argument("--keep-going", action="store_true", default=True,
                         help="Emit the project even when static diagnostics contain errors (default: on, "
                              "matching CHStone's own Vitis flow which tolerates printf in the top)")
@@ -1006,7 +1079,8 @@ def main(argv: list[str] | None = None) -> int:
     root: Path = args.benchmark
     if not root.exists():
         raise SystemExit(f"CHStone checkout not found: {root} (clone {CHSTONE_URL})")
-    benchmarks = discover_benchmarks(root, tuple(args.benchmarks))
+    benchmarks = discover_benchmarks(root, tuple(args.benchmarks),
+                                     inner_kernel=args.inner_kernel)
     if not benchmarks:
         raise SystemExit(f"no CHStone benchmarks found under {root}")
 
