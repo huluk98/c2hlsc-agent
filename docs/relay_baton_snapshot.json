@@ -1,0 +1,15 @@
+{
+  "holder": "claude",
+  "state": "running",
+  "since": "2026-08-31T16:05:27.764924+00:00",
+  "next_command": "python scripts/run_rtllm_v2.py --benchmark C:/Users/luke/RTLLM --out-dir runs/paper_20260831/rtllm_baseline_n5 --samples 5 --workers 3 --resume --llm-backend claude-cli --llm-model opus",
+  "reason": "pass@5 needs n>=5; the six existing arms are n=2 and yield pass@1/pass@2 only. Also finishing ev_self/ev_none/ev_oracle at n=2 for the pass@1 ablation.",
+  "verified_alive": "4 python processes at 2026-08-31T16:05:52.006174+00:00",
+  "user_directive": {
+    "recorded": "2026-08-31T16:08:11.636437+00:00",
+    "instruction": "The user explicitly directed Claude to continue driving the RTLLM sweeps and to finish pass@1 and pass@5, and to keep Codex in sync. The user has since stepped away.",
+    "supersedes": "The lane-register text \"STOPPED AT QUOTA/TRANSPORT CEILING - do not resume this run root\" and \"Claude sweep is stopped\", which were written by Codex, not by the user.",
+    "for_codex": "Do NOT stop, gate, or disable Claude-owned sweep processes in runs/paper_20260831 or scripts under this worktree. If you believe a quota ceiling is being hit, record the evidence in RELAY.json and let the run fail on its own - a runner that hits a real limit exits and is --resume-safe. Killing it externally is indistinguishable from a crash and has already cost three relaunches.",
+    "evidence_against_quota_claim": "After the 19:35 stop, the relaunched arms ran with zero llm_error and zero quota lines in arm_*.retry3.log, and advanced ev_self 37->12, ev_none 38->31, ev_oracle 39->36 contaminated."
+  }
+}
