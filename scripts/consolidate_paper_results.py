@@ -165,12 +165,68 @@ def normalise(row: dict, suite: str, sweep: str, results_path: Path) -> dict:
         "rungs_not_attempted",
         "func_pass_strict",
         "shim_applied",
+        "diagnostics",
         "repair_rounds_run",
         "duration_s",
     ):
         if field in row:
             record[field] = row[field]
     return record
+
+
+#: A diagnostic meaning the testbench sized an array argument by falling back to a default
+#: length instead of the declared bound. The kernel then indexes far past what was
+#: allocated, so the comparison reads out of bounds and a PASS is not evidence.
+_UNBOUNDED_ARG = "missing-pointer-bound"
+
+
+def assess_oracle(rec: dict, vacuous: "set[str]" = frozenset()) -> "tuple[str, str]":
+    """``(trust, reason)`` for the oracle behind one row's verdict.
+
+    ``trusted``     the run carries positive evidence its test discriminates.
+    ``unverified``  nothing disproves it, but nothing establishes it either -- most often a
+                    suite whose runner has no mutation check at all.
+    ``unsound``     a named reason the comparison could not be valid.
+
+    Absence of a mutation check is deliberately NOT treated as a pass. Rosetta rows carry no
+    ``mutation_check`` field because ``run_rosetta.py`` has no such stage, and reading that
+    silence as approval is exactly how a suite with no anti-false-green guard gets quoted
+    beside one that has it.
+    """
+
+    if rec["verdict"] != "pass":
+        return "n/a", "not a pass"
+
+    if rec["suite"] == "rtllm":
+        # RTLLM's anti-vacuity guard is not per-row: it is the empty-stub floor, which
+        # names every design a module with NO LOGIC already passes. Those designs cannot
+        # discriminate and their score means nothing; the rest are backed by that floor.
+        if rec["id"] in vacuous:
+            return "unsound", (
+                "a port-only module with no logic also passes this design, so its oracle "
+                "is vacuous and the score means nothing"
+            )
+        passed, strict = rec.get("samples_passed"), rec.get("samples_passed_strict")
+        if passed is not None and strict is not None and strict < passed:
+            return "unsound", (
+                f"{passed} sample(s) pass the official oracle but only {strict} pass the "
+                "strict one, so a testbench printed a failure line and a pass banner"
+            )
+        return "trusted", "backed by the empty-stub floor; official and strict oracles agree"
+
+    diagnostics = " ".join(rec.get("diagnostics") or []) if isinstance(rec.get("diagnostics"), list) else ""
+    if _UNBOUNDED_ARG in diagnostics:
+        return "unsound", (
+            "an array argument had no configured bound, so the testbench sized it by "
+            "fallback while the kernel indexes past it -- this comparison reads out of bounds"
+        )
+
+    mutation = rec.get("mutation_check")
+    if mutation == "red":
+        return "trusted", "a deliberately wrong candidate makes this test go red"
+    if mutation is None:
+        return "unverified", "this suite's runner performs no mutation check"
+    return "unsound", f"the mutation check returned {mutation!r} rather than 'red'"
 
 
 def main(argv: "list[str]") -> int:
@@ -196,12 +252,18 @@ def main(argv: "list[str]") -> int:
         if rec["verdict"] == "fail" and rec.get("failure_family"):
             walls[rec["sweep"]][rec["failure_family"]] += 1
 
-    # A pass whose mutation check did not go red is not evidence of anything; surface it
-    # separately rather than letting it sit inside the pass count.
-    false_greens = [
-        r for r in records
-        if r["verdict"] == "pass" and r.get("mutation_check") not in (None, "red")
-    ]
+    # Designs a no-logic stub already passes, taken from the empty-baseline sweep in this
+    # same run root rather than assumed.
+    vacuous = {
+        r["id"] for r in records
+        if r["suite"] == "rtllm" and "empty" in r["sweep"] and r["verdict"] == "pass"
+    }
+    for rec in records:
+        rec["oracle_trust"], rec["oracle_trust_reason"] = assess_oracle(rec, vacuous)
+
+    # Anything that passed on an oracle we cannot vouch for. Kept out of the headline count
+    # rather than silently inflating it.
+    suspect = [r for r in records if r["verdict"] == "pass" and r["oracle_trust"] != "trusted"]
 
     summary = {
         "run_root": str(root),
@@ -216,7 +278,7 @@ def main(argv: "list[str]") -> int:
             for sweep, counts in sorted(by_sweep.items())
         },
         "records": records,
-        "suspect_passes": false_greens,
+        "suspect_passes": suspect,
     }
 
     (root / "consolidated.json").write_text(
@@ -231,11 +293,20 @@ def main(argv: "list[str]") -> int:
             f"| `{sweep}` | {s['pass']} | {s['fail']} | {s['unknown']} | {s['total']} |"
         )
     lines.append("")
-    if false_greens:
+    if suspect:
+        by_trust = Counter(r["oracle_trust"] for r in suspect)
         lines.append(
-            f"> **{len(false_greens)} pass(es) without a red mutation check.** "
-            "These prove nothing and must not be counted."
+            f"> **{len(suspect)} pass(es) on an oracle that is not vouched for** "
+            + ", ".join(f"{n} {t}" for t, n in sorted(by_trust.items()))
+            + ". Do not fold these into a headline count."
         )
+        lines.append("")
+        lines.append("| design | sweep | trust | why |")
+        lines.append("| --- | --- | --- | --- |")
+        for r in suspect:
+            lines.append(
+                f"| `{r['id']}` | `{r['sweep']}` | `{r['oracle_trust']}` | {r['oracle_trust_reason']} |"
+            )
         lines.append("")
     lines.append("## Failure walls")
     lines.append("")
@@ -254,8 +325,10 @@ def main(argv: "list[str]") -> int:
     print(f"{len(records)} rows from {len(by_sweep)} sweep(s)")
     for sweep, s in summary["sweeps"].items():
         print(f"  {sweep:<24} pass={s['pass']:>3} fail={s['fail']:>3} unknown={s['unknown']:>3}")
-    if false_greens:
-        print(f"  !! {len(false_greens)} pass(es) without a red mutation check")
+    if suspect:
+        by_trust = Counter(r["oracle_trust"] for r in suspect)
+        for trust, n in sorted(by_trust.items()):
+            print(f"  !! {n} pass(es) with oracle_trust={trust}")
     print(f"wrote {root / 'consolidated.json'} and {root / 'consolidated.md'}")
     return 0
 
