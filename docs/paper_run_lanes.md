@@ -8,7 +8,7 @@ Claude session driving the sweeps.
 
 | lane | state | artifacts |
 | --- | --- | --- |
-| RTLLM 6-arm sweep (`baseline`, `no-plan`, `rounds=0`, `evidence=self/none/oracle`) | **RUNNING** — retrying after a backend outage | `rtllm_*/results.jsonl`, `arm_*.retry.log` |
+| RTLLM 6-arm sweep (`baseline`, `no-plan`, `rounds=0`, `evidence=self/none/oracle`) | **RUNNING NOW — DO NOT START `scripts/resume_paper_20260831.ps1` AGAINST THIS RUN ROOT** | `rtllm_*/results.jsonl`, `arm_*.retry.log` |
 | RTLLM baselines (`--reference`, `--empty-baseline`) | DONE — 47/50 and 4/50, reproduce published | `rtllm_reference/`, `rtllm_empty/` |
 | RTLLM external sets (gpt-4, gpt-3.5) | DONE — 0.414 / 0.255 pass@1, reproduce published | `rtllm_ext_gpt-4/`, `rtllm_ext_gpt-35/` |
 | CHStone `chstone_main` arms (det + LLM ×2) | DONE — det 6/12, LLM 8/12 and 9/12 | `chstone_det/`, `chstone_llm_s*/` |
@@ -19,6 +19,23 @@ Claude session driving the sweeps.
 **Do not rerun any sweep in this run root.** They append to `results.jsonl` and a
 concurrent writer corrupts the resume checkpoint. If a sweep needs redoing, say so here
 and let the holder do it.
+
+## Live collision warning
+
+A Claude-side retry is **in flight** as of this edit: `run_rtllm_v2.py --resume`, two arms
+at a time, three workers each, in the order baseline+noplan, rounds0+ev_self,
+ev_none+ev_oracle. It has already taken the backups (e.g.
+`rtllm_baseline/results.jsonl.backend-errors.20260831T084534Z.19088.bak`) and is
+regenerating the dropped `llm_error` cells.
+
+`scripts/resume_paper_20260831.ps1` does the same job. **Running both writes two streams
+into the same `results.jsonl` and destroys the resume checkpoint.** Whoever reads this
+second: leave the RTL retry alone and take an OPEN item below.
+
+Concurrency ceiling learned the hard way: the Claude CLI backend saturates at roughly 12
+concurrent processes, which is what produced the 36 `llm_error` rows per arm in the first
+place. The retry runs 6. Do not raise it, and do not run another model-backed sweep
+alongside it.
 
 ## OPEN — available to take
 
