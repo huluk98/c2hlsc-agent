@@ -17,7 +17,9 @@ from c2hlsc_agent.hls_project import write_project
 from c2hlsc_agent.hls_runner import run_vitis
 from c2hlsc_agent.qor import (
     CSYNTH_XML_RELPATH,
+    PPATargets,
     QoRMetrics,
+    evaluate_targets,
     objective_score,
     parse_csynth_xml,
     parse_sta_report,
@@ -150,6 +152,24 @@ class QoRParsingTests(unittest.TestCase):
         self.assertIsNotNone(balanced)
         self.assertLess(balanced, 1.0)  # 2x latency win outweighs the area increase
         self.assertIsNone(objective_score(QoRMetrics(), "latency"))
+
+    def test_vitis_estimated_clock_target(self):
+        targets = PPATargets(max_estimated_clock_ns=8.0)
+        self.assertTrue(targets.specified)
+        self.assertFalse(targets.needs_local_ppa)
+        met, gaps, score = evaluate_targets(
+            QoRMetrics(estimated_clock_ns=7.3), targets
+        )
+        self.assertTrue(met)
+        self.assertEqual(gaps, [])
+        self.assertEqual(score, 0.0)
+
+        met, gaps, score = evaluate_targets(
+            QoRMetrics(estimated_clock_ns=9.2), targets
+        )
+        self.assertFalse(met)
+        self.assertIn("Vitis estimated clock period", gaps[0])
+        self.assertGreater(score, 0.0)
 
     def test_render_latex_and_markdown(self):
         base = QoRMetrics(latency_worst=200, lut=1000)
@@ -705,11 +725,13 @@ class TargetLoopTests(OptimizerLoopTests):
 class OptimizeCliTests(unittest.TestCase):
     def test_parser_accepts_targets(self):
         args = build_parser().parse_args(
-            ["optimize", "--project", "p", "--target-latency", "150", "--target-slack", "0.5",
+            ["optimize", "--project", "p", "--target-latency", "150",
+             "--target-clock-ns", "8.5", "--target-slack", "0.5",
              "--target-area", "1000", "--target-power", "2e-3", "--max-rounds", "3",
              "--local-ppa", "--liberty", "/lib/n45.lib", "--no-gate-sim"]
         )
         self.assertEqual(args.target_latency, 150)
+        self.assertAlmostEqual(args.target_clock_ns, 8.5)
         self.assertAlmostEqual(args.target_power, 2e-3)
         self.assertEqual(args.max_rounds, 3)
         self.assertTrue(args.local_ppa)

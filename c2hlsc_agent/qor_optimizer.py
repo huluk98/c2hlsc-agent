@@ -13,8 +13,8 @@ Operates on a project that already passes the verification ladder. Loop:
 4. Promote the best strictly-improving candidate into the project and re-run the FULL
    ladder (host equivalence -> CSim -> CSynth -> CoSim). Acceptance requires the ladder
    to pass; otherwise the original source is restored.
-5. Emit the QoR delta report as JSON, Markdown, and a paper-ready LaTeX table, optionally
-   enriched by the local yosys/OpenSTA PPA flow (--ppa-script).
+5. Emit the QoR delta report as JSON, Markdown, and a paper-ready LaTeX table. Vitis is
+   the timing/resource authority; the legacy local ASIC PPA flow is optional enrichment.
 
 The LLM only proposes; equivalence and the Vitis reports decide, matching the
 equivalence-first contract of the rest of the pipeline.
@@ -260,6 +260,10 @@ def _targets_text(targets: PPATargets | None, gaps: list[str]) -> str:
     lines = ["PPA targets — the design must meet ALL of these; close the gaps listed:"]
     if targets.max_latency_cycles is not None:
         lines.append(f"- latency (worst cycles) <= {targets.max_latency_cycles}")
+    if targets.max_estimated_clock_ns is not None:
+        lines.append(
+            f"- Vitis estimated clock period <= {targets.max_estimated_clock_ns} ns"
+        )
     if targets.min_slack_ns is not None:
         lines.append(f"- worst setup slack >= {targets.min_slack_ns} ns (post-synthesis STA)")
     if targets.max_area_um2 is not None:
@@ -330,12 +334,13 @@ def optimize_project(
     """Run the post-equivalence QoR loop on ``project_dir`` and write the QoR reports.
 
     Without ``targets`` this is a single round of candidates and the best improver wins.
-    With ``targets`` (explicit latency / slack / area / power goals) the loop ITERATES:
+    With ``targets`` (explicit Vitis latency/clock or optional legacy ASIC goals), the
+    loop ITERATES:
     each round's best candidate becomes the new working point and the next round's
     prompts carry the remaining target gaps, until every target is met, no candidate
-    makes progress, or ``max_rounds`` is exhausted. Slack/area/power come from the local
-    synthesis+STA step (yosys + OpenSTA, with a best-effort gate-level waveform sim) run
-    on each scored candidate's Vitis RTL.
+    makes progress, or ``max_rounds`` is exhausted. Latency and estimated clock come from
+    Vitis ``csynth.xml``. Legacy ASIC slack/area/power targets still require the optional
+    local yosys/OpenSTA flow and are not part of the Vitis-only path.
     """
 
     src_path = project_dir / "src" / "hls_top.cpp"

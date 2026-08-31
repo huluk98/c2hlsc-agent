@@ -5,9 +5,9 @@ Sources, in priority order:
 - **Vitis csynth report** ``c2hlsc_project/solution1/syn/report/csynth.xml`` — latency,
   initiation interval, resource use (BRAM/DSP/FF/LUT/URAM), and the estimated clock.
   The remote-Vitis pull already brings this back to the local project.
-- **Local PPA flow** (optional) — yosys ``stat`` area report and an OpenSTA timing/power
-  report, as produced by the ``syn/run_ppa.sh`` recipe (Nangate45). Parsed when present
-  so the QoR report can carry ASIC-style area/slack/power next to the FPGA estimates.
+- **Local PPA flow** (legacy and optional) — yosys ``stat`` area and OpenSTA timing/power
+  reports. These can enrich a report when explicitly requested, but they are not required
+  by the agent and do not replace the Vitis FPGA estimates.
 
 The renderers emit the delta table three ways: JSON (machines), Markdown (humans), and a
 booktabs LaTeX table (papers).
@@ -248,13 +248,23 @@ class PPATargets:
     no targets behaves like classic single-pass optimization."""
 
     max_latency_cycles: int | None = None  # worst-case latency (Vitis csynth)
+    max_estimated_clock_ns: float | None = None  # estimated clock period (Vitis csynth)
     min_slack_ns: float | None = None  # worst setup slack (OpenSTA on the mapped netlist)
     max_area_um2: float | None = None  # std-cell area (yosys stat)
     max_power_w: float | None = None  # total power (OpenSTA report_power)
 
     @property
     def specified(self) -> bool:
-        return any(v is not None for v in (self.max_latency_cycles, self.min_slack_ns, self.max_area_um2, self.max_power_w))
+        return any(
+            v is not None
+            for v in (
+                self.max_latency_cycles,
+                self.max_estimated_clock_ns,
+                self.min_slack_ns,
+                self.max_area_um2,
+                self.max_power_w,
+            )
+        )
 
     @property
     def needs_local_ppa(self) -> bool:
@@ -263,6 +273,7 @@ class PPATargets:
     def to_dict(self) -> dict[str, object]:
         return {
             "max_latency_cycles": self.max_latency_cycles,
+            "max_estimated_clock_ns": self.max_estimated_clock_ns,
             "min_slack_ns": self.min_slack_ns,
             "max_area_um2": self.max_area_um2,
             "max_power_w": self.max_power_w,
@@ -298,6 +309,13 @@ def evaluate_targets(metrics: QoRMetrics, targets: PPATargets) -> tuple[bool, li
     if targets.max_latency_cycles is not None:
         latency = metrics.latency_worst if metrics.latency_worst is not None else metrics.interval_max
         check("latency (worst cycles)", latency, float(targets.max_latency_cycles), "<=")
+    if targets.max_estimated_clock_ns is not None:
+        check(
+            "Vitis estimated clock period (ns)",
+            metrics.estimated_clock_ns,
+            targets.max_estimated_clock_ns,
+            "<=",
+        )
     if targets.min_slack_ns is not None:
         check("worst setup slack (ns)", metrics.sta_worst_slack_max_ns, targets.min_slack_ns, ">=")
     if targets.max_area_um2 is not None:

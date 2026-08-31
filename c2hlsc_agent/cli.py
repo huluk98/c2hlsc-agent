@@ -135,19 +135,25 @@ def build_parser() -> argparse.ArgumentParser:
         "PPA targets",
         "explicit goals the loop iterates toward (each round's winner becomes the new "
         "working point until every specified target is met, no candidate makes progress, "
-        "or --max-rounds is exhausted). Slack/area/power targets enable the local "
-        "synthesis+waveform+STA step (yosys + OpenSTA) on every scored candidate.",
+        "or --max-rounds is exhausted). Latency and estimated-clock targets use Vitis "
+        "csynth evidence. Legacy ASIC slack/area/power targets enable the optional local "
+        "yosys/OpenSTA step.",
     )
     targets_group.add_argument("--target-latency", type=int, help="max worst-case latency in cycles (Vitis csynth)")
+    targets_group.add_argument(
+        "--target-clock-ns",
+        type=float,
+        help="max estimated clock period in ns (Vitis csynth; not post-route sign-off)",
+    )
     targets_group.add_argument("--target-slack", type=float, help="min worst setup slack in ns (OpenSTA on the mapped netlist)")
     targets_group.add_argument("--target-area", type=float, help="max std-cell area in um^2 (yosys stat)")
     targets_group.add_argument("--target-power", type=float, help="max total power in W (OpenSTA report_power), e.g. 2e-3")
     targets_group.add_argument("--max-rounds", type=int, default=5, help="max target-driven optimization rounds (default 5)")
-    local = optimize.add_argument_group("local synthesis / STA (waveform PPA step)")
+    local = optimize.add_argument_group("optional legacy local ASIC PPA enrichment")
     local.add_argument(
         "--local-ppa",
         action="store_true",
-        help="run the local yosys->gate-sim->OpenSTA step even without slack/area/power targets",
+        help="run the optional local yosys->gate-sim->OpenSTA enrichment step",
     )
     local.add_argument("--liberty", help="liberty file for synthesis/STA (default: syn/lib/*.lib or C2HLSC_LIBERTY)")
     local.add_argument("--sta-bin", help="OpenSTA binary (default: STA_BIN/C2HLSC_STA env, PATH, or ~/tools/eda/opensta/bin/sta)")
@@ -396,6 +402,7 @@ def run_optimize(args: argparse.Namespace) -> int:
 
     targets = PPATargets(
         max_latency_cycles=args.target_latency,
+        max_estimated_clock_ns=args.target_clock_ns,
         min_slack_ns=args.target_slack,
         max_area_um2=args.target_area,
         max_power_w=args.target_power,
