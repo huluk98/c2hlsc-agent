@@ -510,29 +510,34 @@ original source is restored (kept at `src/hls_top.cpp.pre_qor` on success).
 Objectives: `latency` (worst-case cycles), `area` (weighted LUT/FF/DSP/BRAM/URAM proxy),
 `balanced` (latency×area product vs the baseline).
 
-### Targeted PPA: iterate until the goals are met
+### Targeted Vitis QoR: iterate until the goals are met
 
-Give the loop explicit power/area/performance goals and it keeps iterating — each
+Give the loop explicit Vitis latency/timing goals and it keeps iterating — each
 round's best candidate becomes the new working point and the next round's prompts carry
 the remaining gaps — until **every** target is met, no candidate makes progress, or
 `--max-rounds` is exhausted (exit code 1 when targets were requested but not reached):
 
 ```bash
 python -m c2hlsc_agent.cli optimize --project build/cnn_3x3 \
-  --target-latency 150 --target-slack 0.5 --target-area 1000 --target-power 2e-3 \
+  --target-latency 150 --target-clock-ns 10 \
+  --objective balanced \
   --max-rounds 5 --vitis-ssh user@vitis-host
 ```
 
 - `--target-latency` — max worst-case cycles (from the Vitis csynth report)
-- `--target-slack` / `--target-area` / `--target-power` — min worst setup slack (ns),
-  max std-cell area (µm²), max total power (W), measured by the **local
-  synthesis+waveform+STA step** below, which runs automatically on every scored
-  candidate when any of these three targets is set (or with `--local-ppa`).
+- `--target-clock-ns` — max estimated clock period (from the Vitis csynth report)
+- `--objective area` or `--objective balanced` — minimize Vitis FPGA resources directly
+  or together with latency.
 
-### Local synthesis + waveform + STA step (slack checking)
+Vitis HLS 2024.2 is the agent's timing and resource authority. Its estimated clock is an
+HLS synthesis estimate, not post-route timing sign-off; reports must label it accordingly.
+No OpenSTA, liberty file, or external PDK is required for this workflow.
 
-Generalized from the `build/cnn_3x3/syn/run_ppa.sh` reference flow, per candidate and
-on the accepted design, entirely on the local machine:
+### Optional legacy local ASIC PPA enrichment
+
+The older yosys/OpenSTA path remains available for backward compatibility when ASIC-style
+numbers are explicitly needed. It is not run by the Vitis-only agent path. When enabled,
+it runs per candidate and on the accepted design:
 
 1. **yosys** maps the Vitis-generated RTL (pulled back from the remote run) to the
    target liberty (Nangate45 by default) → `syn/yosys_area.rpt` + gate netlist;
@@ -542,7 +547,7 @@ on the accepted design, entirely on the local machine:
    dumping `waves/<top>_gate.vcd` for GTKWave;
 3. **OpenSTA** reports worst setup/hold slack, TNS, and power → `syn/sta_report.txt`.
 
-Tool discovery: `--liberty` / `C2HLSC_LIBERTY` / `syn/lib/*.lib`; `--sta-bin` /
+Legacy tool discovery: `--liberty` / `C2HLSC_LIBERTY` / `syn/lib/*.lib`; `--sta-bin` /
 `STA_BIN` / `~/tools/eda/opensta/bin/sta`; `--clock-port` (default `ap_clk`);
 `--no-gate-sim` skips step 2. Every measurement lands in the QoR report and drives the
 target check.

@@ -19,6 +19,19 @@ Claude CLI quota cutoff so the experiment can be resumed without relying on chat
   for these sweeps, by design.
 - RTLLM: all 50 designs, two samples, with per-design checkpoint rows in `results.jsonl`.
 
+## Toolchain decision: Vitis-only QoR
+
+OpenSTA is not required for this agent or for continuing the paper run. Vitis HLS 2024.2
+`csynth.xml` is the authority for latency, initiation interval, FPGA resources, and
+estimated clock period. Use `optimize --target-clock-ns` for a timing target and the
+`area`/`balanced` objectives for resource optimization. The estimated clock is HLS
+synthesis evidence, not post-route timing sign-off, and must be reported with that scope.
+
+Fresh native-Windows validation used the existing CHStone `dfmul` Vitis report: 26-cycle
+worst latency, 25-cycle initiation interval, 7.067 ns estimated clock, 4,840 LUTs, 2,809
+FFs, 16 DSPs, and 7 BRAMs. The Vitis-only optimizer accepted the 30-cycle / 10 ns target
+without invoking local PPA and wrote `qor_report.json` in that project.
+
 ## Completed and trustworthy evidence
 
 - Deterministic CHStone: 6/12 pass; every pass has a red mutation check.
