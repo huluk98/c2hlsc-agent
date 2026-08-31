@@ -151,7 +151,92 @@ def _split_params(params: str) -> list[str]:
     return out
 
 
-def _parse_arg(raw: str, metadata: ArgumentConfig | None = None) -> FunctionArg:
+_CONST_INT = re.compile(
+    r"^[ \t]*(?:static\s+)?const\s+(?:unsigned\s+|signed\s+|long\s+|short\s+)*"
+    r"(?:int|char|size_t)\s+(?P<name>\w+)\s*=\s*(?P<value>[^;]+);",
+    re.M,
+)
+_DEFINE_INT = re.compile(r"^[ \t]*#[ \t]*define[ \t]+(?P<name>\w+)[ \t]+(?P<value>[^/\r\n]+)", re.M)
+_ENUM_BODY = re.compile(r"(?<![\w])enum\s+\w*\s*\{(?P<body>[^}]*)\}", re.S)
+
+
+def collect_constants(source: str) -> dict[str, int]:
+    """Compile-time integer constants a bound may be written in terms of.
+
+    Array bounds in real kernels are named, not literal: Rosetta writes
+    ``data[NUM_FEATURES * NUM_TRAINING]`` and ``Data[IMAGE_HEIGHT][IMAGE_WIDTH]``. Reading
+    a bound only when it is a literal digit string meant every such argument silently fell
+    back to test length 16, so the generated stimulus was smaller than the kernel's own
+    indexing by several orders of magnitude.
+    """
+
+    constants: dict[str, int] = {}
+    text = blank_comments(source)
+
+    def remember(name: str, value: str) -> None:
+        resolved = evaluate_constant(value, constants)
+        if resolved is not None:
+            constants[name] = resolved
+
+    for match in _DEFINE_INT.finditer(text):
+        if "(" in match.group("name"):
+            continue
+        remember(match.group("name"), match.group("value"))
+    for match in _CONST_INT.finditer(text):
+        remember(match.group("name"), match.group("value"))
+    for match in _ENUM_BODY.finditer(text):
+        counter = 0
+        for item in match.group("body").split(","):
+            item = item.strip()
+            if not item:
+                continue
+            if "=" in item:
+                name, _, value = item.partition("=")
+                resolved = evaluate_constant(value, constants)
+                if resolved is None:
+                    continue
+                counter = resolved
+                constants[name.strip()] = counter
+            else:
+                constants[item] = counter
+            counter += 1
+    return constants
+
+
+def evaluate_constant(expression: str, constants: dict[str, int]) -> int | None:
+    """Evaluate an integer constant expression against ``constants``.
+
+    Deliberately narrow: identifiers, integer literals and arithmetic only. Anything with
+    a call, a cast or an unknown name returns ``None`` so the caller keeps its
+    conservative default instead of inventing a bound.
+    """
+
+    text = expression.strip().rstrip("uUlL")
+    if not text:
+        return None
+    substituted = []
+    for token in re.split(r"(\w+)", text):
+        if token.isidentifier():
+            if token not in constants:
+                return None
+            substituted.append(str(constants[token]))
+        else:
+            substituted.append(token)
+    candidate = "".join(substituted)
+    if not re.fullmatch(r"[0-9+\-*/%()<>\s]*", candidate):
+        return None
+    try:
+        value = eval(candidate, {"__builtins__": {}}, {})  # noqa: S307 - digits/operators only
+    except Exception:  # noqa: BLE001 - an unevaluable bound is simply unknown
+        return None
+    return int(value) if isinstance(value, int) and value > 0 else None
+
+
+def _parse_arg(
+    raw: str,
+    metadata: ArgumentConfig | None = None,
+    constants: dict[str, int] | None = None,
+) -> FunctionArg:
     raw = raw.strip()
     # `restrict` is a C99 keyword that is not valid C++. Drop it from the parameter text
     # so the generated header/definition signatures (built from FunctionArg.raw) compile.
@@ -173,10 +258,20 @@ def _parse_arg(raw: str, metadata: ArgumentConfig | None = None) -> FunctionArg:
     direction = metadata.direction or ("input" if is_const or pointer_depth == 0 and not array_dims else "inout")
     length = metadata.length
     if length is None:
+        # The bound may be a literal, a named constant, or an expression over them
+        # (`NUM_FEATURES * NUM_TRAINING`). Multi-dimensional arrays contribute the product
+        # of their dimensions, so `length` stays the total element count.
+        total = 1
+        resolved_any = False
         for dim in array_dims:
-            if dim.strip().isdigit():
-                length = int(dim.strip())
+            value = evaluate_constant(dim, constants or {})
+            if value is None:
+                resolved_any = False
                 break
+            total *= value
+            resolved_any = True
+        if resolved_any:
+            length = total
     return FunctionArg(
         raw=raw,
         name=name,
@@ -205,7 +300,11 @@ def _extract_function(source: str, top: str, source_path: Path, config: AgentCon
     open_brace = searchable.find("{", match.start())
     close_brace = _find_matching_brace(searchable, open_brace)
     params = match.group("params")
-    args = [_parse_arg(part, config.arguments.get(_guess_arg_name(part))) for part in _split_params(params)]
+    constants = collect_constants(source)
+    args = [
+        _parse_arg(part, config.arguments.get(_guess_arg_name(part)), constants)
+        for part in _split_params(params)
+    ]
     return_type = re.sub(r"\s+", " ", match.group("ret")).strip()
     signature = f"{return_type} {top}({', '.join(arg.raw for arg in args)})"
     definition = source[match.start() : close_brace + 1].strip()

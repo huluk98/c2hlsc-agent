@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from .analyze import AnalysisResult, FunctionArg
+from .closure import ClosureResult, extract_closure
 from .config import AgentConfig
 from .hlsc_generator import HLSC_GENERATOR_PROMPT_ID, HLSC_GENERATOR_SYSTEM_PROMPT
 from .llm import (
@@ -21,14 +22,50 @@ class GeneratedSource:
     transformations: list[str] = field(default_factory=list)
     interface_pragmas: list[dict[str, str]] = field(default_factory=list)
     generator_prompt_id: str = HLSC_GENERATOR_PROMPT_ID
+    closure: ClosureResult | None = None
+    """What was hoisted to make the emitted TU self-contained; None when unavailable."""
 
 
 def _include_for_types(args: list[FunctionArg], return_type: str) -> str:
+    """The baseline include set, used when closure extraction is unavailable.
+
+    This alone is not enough for any kernel that names a type of its own -- see
+    :mod:`c2hlsc_agent.closure` for why, and for what replaces it when libclang is
+    installed.
+    """
+
     text = " ".join([return_type] + [arg.c_type for arg in args])
     includes = ["#include <stdint.h>"]
     if "ap_int" in text or "ap_uint" in text:
         includes.append("#include <ap_int.h>")
     return "\n".join(includes)
+
+
+def _closure_for(analysis: AnalysisResult, config: AgentConfig) -> ClosureResult:
+    """Compute the file-scope context the top closes over.
+
+    Returns an unavailable result (empty preamble) when libclang is missing, so the
+    caller falls back to the previous behaviour rather than emitting a TU that silently
+    lost its context.
+    """
+
+    defines = tuple(
+        flag[2:] for flag in getattr(config, "compiler_flags", []) if flag.startswith("-D")
+    )
+    include_dirs = tuple(str(path) for path in getattr(config, "include_dirs", []))
+    extra = tuple(
+        flag for flag in getattr(config, "compiler_flags", []) if not flag.startswith("-D")
+    )
+    try:
+        return extract_closure(
+            analysis.function.source_path,
+            analysis.function.name,
+            include_dirs=include_dirs,
+            defines=defines,
+            extra_args=extra,
+        )
+    except Exception as exc:  # noqa: BLE001 - closure extraction must never fail conversion
+        return ClosureResult(available=False, diagnostics=[f"closure extraction failed: {exc}"])
 
 
 def _pragma_lines(config: AgentConfig, args: list[FunctionArg]) -> tuple[list[str], list[dict[str, str]]]:
@@ -61,10 +98,20 @@ def _generate_conservative_sources(analysis: AnalysisResult, config: AgentConfig
     body = function.body.rstrip()
     if pragma_lines:
         body = "\n" + "\n".join(f"  {line}" for line in pragma_lines) + "\n" + body
+    closure = _closure_for(analysis, config)
+
+    # The header must be able to name the types in its own signature, and the source must
+    # be able to name everything the body closes over. Both come from the closure; the
+    # bare include list is only the fallback for when libclang is unavailable.
+    header_context = closure.type_preamble if closure.available and closure.type_preamble else (
+        _include_for_types(function.args, function.return_type)
+    )
+    source_context = closure.definition_preamble if closure.available else ""
+
     header = f"""#ifndef C2HLSC_GENERATED_HLS_TOP_HPP
 #define C2HLSC_GENERATED_HLS_TOP_HPP
 
-{_include_for_types(function.args, function.return_type)}
+{header_context}
 
 {function.signature};
 
@@ -75,19 +122,38 @@ def _generate_conservative_sources(analysis: AnalysisResult, config: AgentConfig
 // a conservative, equivalence-preserving refactor is explicitly recorded.
 
 #include "hls_top.hpp"
-
+{source_context}
+// --- generated top ---
 {function.return_type} {function.name}({', '.join(arg.raw for arg in function.args)}) {{
 {body}
 }}
 """
+    transformations = [
+        f"Applied {HLSC_GENERATOR_PROMPT_ID} as the HLS-C generator policy.",
+        "Preserved original top-function body and signature for equivalence-first HLS baseline.",
+    ]
+    if closure.available and closure.preamble:
+        transformations.append(
+            f"Hoisted the top's file-scope closure ({len(closure.symbols)} symbols, "
+            f"{len(closure.macros)} macros) so the emitted translation unit is self-contained."
+        )
+        transformations.extend(f"Normalized C to C++: {note}." for note in closure.normalizations[:20])
+        if len(closure.normalizations) > 20:
+            transformations.append(
+                f"Normalized C to C++: {len(closure.normalizations) - 20} further rewrites (see closure report)."
+            )
+    elif not closure.available:
+        transformations.append(
+            "Closure extraction unavailable ("
+            + "; ".join(closure.diagnostics[:1])
+            + "); emitted the bare include list, so the TU carries no file-scope context."
+        )
     return GeneratedSource(
         header=header,
         source=source,
-        transformations=[
-            f"Applied {HLSC_GENERATOR_PROMPT_ID} as the HLS-C generator policy.",
-            "Preserved original top-function body and signature for equivalence-first HLS baseline.",
-        ],
+        transformations=transformations,
         interface_pragmas=pragma_rows,
+        closure=closure,
     )
 
 
