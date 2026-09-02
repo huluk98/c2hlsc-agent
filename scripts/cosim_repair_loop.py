@@ -62,6 +62,7 @@ from run_hls_nl_vitis_batch import (  # noqa: E402
     run_design,
     source_fingerprint,
 )
+from c2hlsc_agent.evidence_context import distill_evidence  # noqa: E402
 from c2hlsc_agent.llm import extract_code_blocks  # noqa: E402
 from c2hlsc_agent.run_control import stable_fingerprint  # noqa: E402
 
@@ -137,18 +138,26 @@ def write_project(out_dir: Path, record: dict[str, Any], sig, record_id: int, pa
 
 
 def failing_evidence(design_dir: Path, result: dict[str, Any]) -> str:
-    phase = result.get("failed_phase", "")
+    """Distilled evidence from the earliest failing Vitis log.
+
+    Shares the repair-context definition with the main agent loop
+    (c2hlsc_agent.evidence_context): mismatch traces first, then an
+    error-anchored log window, instead of a blind last-120-lines slice.
+    """
+    phase = str(result.get("failed_phase", ""))
     log = design_dir / f"vitis_{phase}.log"
     if log.exists():
-        return "\n".join(log.read_text(encoding="utf-8", errors="replace").splitlines()[-120:])
-    return str(result.get("vitis_log_tail", ""))
+        raw = log.read_text(encoding="utf-8", errors="replace")
+    else:
+        raw = str(result.get("vitis_log_tail", ""))
+    return distill_evidence(raw, summary=str(result.get("error") or ""), phase=phase or None).text
 
 
 def repair(complete: Completer, record: dict[str, Any], hls_cpp: str, stage: str, evidence: str) -> str | None:
     user = (
         f"Design spec:\n{record.get('HLS_instruction', '')}\n\n"
         f"Current implementation that FAILED Vitis '{stage}':\n```cpp\n{hls_cpp}\n```\n\n"
-        f"Vitis {stage} error log (tail):\n{evidence}\n\n"
+        f"Vitis {stage} error evidence (distilled, mismatches first):\n{evidence}\n\n"
         "Return the corrected COMPLETE source in one ```cpp block."
     )
     resp = complete(REPAIR_SYSTEM, user)

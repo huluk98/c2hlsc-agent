@@ -264,5 +264,30 @@ class RecordLoopSafetyTests(unittest.TestCase):
             self.assertTrue(any(row[0]["status"] == "retry_pending" for row in rows))
 
 
+class FailingEvidenceTests(unittest.TestCase):
+    def test_distills_log_with_field_mismatch_and_drops_banner(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            design_dir = Path(tmp)
+            (design_dir / "vitis_cosim.log").write_text(
+                "    ** Copyright 1986-2022 Xilinx, Inc. All Rights Reserved.\n"
+                "INFO: [COSIM 212-316] Starting C post checking ...\n"
+                "Mismatch test=2 field=result expected=10 actual=12\n"
+                "ERROR: [COSIM 212-4] *** C/RTL co-simulation finished: FAIL ***\n",
+                encoding="utf-8",
+            )
+            text = loop.failing_evidence(design_dir, {"failed_phase": "cosim"})
+        self.assertIn("[mismatches] 1 recorded", text)
+        self.assertIn("test=2 result: expected=10 actual=12", text)
+        self.assertNotIn("** Copyright", text)
+
+    def test_falls_back_to_result_log_tail(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            text = loop.failing_evidence(
+                Path(tmp),
+                {"failed_phase": "csynth", "vitis_log_tail": "ERROR: [XFORM 203-103] cannot unroll"},
+            )
+        self.assertIn("ERROR: [XFORM 203-103] cannot unroll", text)
+
+
 if __name__ == "__main__":
     unittest.main()

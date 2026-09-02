@@ -79,6 +79,33 @@ class HlscRepairAgentTests(unittest.TestCase):
         self.assertIn("#define use_helper use_helper_c2hlsc_repair_reference", source)
         self.assertEqual(outcome.target_files, ("src/hls_top.cpp",))
 
+    def test_audit_records_distilled_evidence_with_provenance(self):
+        project, analysis, cfg = self._write_project(
+            """
+            int scale(int x) {
+              return x * 2;
+            }
+            """,
+            "scale",
+        )
+        state = VerificationState()
+        state.add_phase(
+            PhaseResult(
+                "software_equivalence",
+                "fail",
+                stdout="Mismatch test=0 arg=out index=1 expected=3 actual=4 seed=9",
+            )
+        )
+
+        outcome = repair_project(project.root, analysis, cfg, state, iteration=1)
+
+        self.assertTrue(outcome.evidence_excerpt.startswith("[mismatches]"))
+        self.assertIn("test=0 out[1]: expected=3 actual=4 seed=9", outcome.evidence_excerpt)
+        self.assertEqual(outcome.evidence_provenance["mismatch_count"], 1)
+        self.assertIn("mismatches", outcome.evidence_provenance["sections"])
+        [audit] = load_repair_audit(project.root)
+        self.assertEqual(audit.evidence_provenance, outcome.evidence_provenance)
+
     def test_removes_generated_interface_pragmas_after_interface_failure(self):
         cfg = AgentConfig(
             top="vector_add",

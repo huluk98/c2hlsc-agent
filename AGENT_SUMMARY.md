@@ -98,7 +98,7 @@ newest addition (`scripts/cosim_repair_loop.py`) drives repairs through the **lo
 - **`build_llm_client(config)`** — constructs the resolved backend or returns `None` (deterministic fallback); never networks at construction.
 - **`_argument_lines` / `_diagnostic_lines`** — prompt fragments from the analysis.
 - **`build_generator_user_prompt(analysis, original_source)`** — task + contract + diagnostics + hard AUTO-RTL requirements (exact signature, single self-contained ```cpp unit, equivalence-preserving pragmas only).
-- **`REPAIR_SYSTEM_PROMPT`** / **`build_repair_prompt(...)`** — minimal-patch repair prompt with truncated evidence (1600 chars) and the current file.
+- **`REPAIR_SYSTEM_PROMPT`** / **`build_repair_prompt(...)`** — minimal-patch repair prompt; renders the caller's pre-distilled, budgeted evidence (`evidence_context.build_repair_evidence`) verbatim with the current file.
 - **`_FENCE` / `extract_code_blocks(text)`** — fence-length-aware code block extraction.
 - **`_defines_function` / `_braces_balanced` / `_is_code_lang` / `_normalize`** — structural checks.
 - **`is_plausible_translation_unit(code, top)`** — cheap gate: balanced braces + defines the top.
@@ -169,7 +169,7 @@ newest addition (`scripts/cosim_repair_loop.py`) drives repairs through the **lo
 - **`load_repair_audit(project_dir)` / `clear_repair_audit`** — read/reset `repair_audit.json`.
 - **`repair_project(project_dir, analysis, config, state, iteration, llm=None)`** — the repair driver: classify → run the 4 mechanical repairs → if none applied and LLM enabled, `_llm_repair` → append audit; statuses `pass`/`blocked`/`applied`/`applied_llm`/`no_change`.
 - **`_llm_repair(...)`** — only ever rewrites `src/hls_top.cpp`; testbench and golden `input.c` are never model-writable; response structurally validated (`extract_full_file` + `is_plausible_translation_unit`); errors printed to stderr (not swallowed).
-- **`_phase_evidence(state, phase)`** — summary+stdout+stderr+log file text.
+- **`_phase_evidence(state, phase)`** — raw summary+stdout+stderr+log file text; kept un-normalized because the mechanical repairs regex-scan it. The LLM prompt and audit use `evidence_context.build_repair_evidence` (mismatches first → error-anchored log window → tail fallback, 4000-char budget, provenance in `evidence_provenance`).
 - **`_append_audit` / `_sha256` / `_relative` / `_rewrite_file`** — audit plumbing; `_rewrite_file` writes and returns the diffed change record.
 - **`_ensure_includes(text, includes)`** — insert missing `#include`s after the last include.
 - **`_includes_needed_from_evidence(evidence)`** — maps undeclared-symbol errors to standard headers (stddef/limits/string/math/ap_int).
@@ -195,7 +195,7 @@ newest addition (`scripts/cosim_repair_loop.py`) drives repairs through the **lo
 - **`REPAIR_SYSTEM`** — Vitis-repair system prompt (same top name, synthesizable, one ```cpp block).
 - **`pick_code(resp, top)`** — first C/C++ block defining the top, else first block, else raw text.
 - **`write_project(...)`** — reuses `write_design` + the 4 TCL renderers from the batch scripts.
-- **`failing_evidence(design_dir, result)`** — last 120 lines of the earliest failing `vitis_<phase>.log`.
+- **`failing_evidence(design_dir, result)`** — distilled evidence from the earliest failing `vitis_<phase>.log` via `c2hlsc_agent.evidence_context.distill_evidence` (shared definition with the main agent loop).
 - **`repair(complete, record, hls_cpp, stage, evidence)`** — builds the user prompt and extracts the corrected source.
 - **`select(records, args)`** — record selection: `--only-failing results.jsonl`, `--record-id`, or offset/limit.
 - **`main()`** — drives the loop; writes `results.jsonl` (per-record outcomes with per-attempt status) and `repaired_corpus.jsonl`; exit 0 iff no failures.

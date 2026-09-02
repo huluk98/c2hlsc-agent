@@ -4,7 +4,7 @@
 - NL spec input (C+NL and NL-only golden-reference generation)
 - best-of-N candidate generation and local host-equivalence selection
 - remote Vitis over SSH (only vitis_hls leaves the machine)
-- repair evidence tail-slicing, history-aware prompts, oscillation guard
+- repair evidence distillation, history-aware prompts, oscillation guard
 - timeout PhaseResults keep their log evidence
 """
 
@@ -31,6 +31,7 @@ from c2hlsc_agent.convert import (
     generate_reference_c,
 )
 from c2hlsc_agent.equivalence import PhaseResult, VerificationState
+from c2hlsc_agent.evidence_context import build_repair_evidence
 from c2hlsc_agent.hls_project import write_project
 from c2hlsc_agent.hls_runner import run_software_equivalence, run_vitis
 from c2hlsc_agent.hlsc_repair_agent import load_repair_audit, repair_project
@@ -473,15 +474,28 @@ class MinimalYamlTests(unittest.TestCase):
 
 
 class RepairUpgradeTests(unittest.TestCase):
-    def test_repair_evidence_is_tail_sliced(self):
+    def test_repair_evidence_is_distilled_and_budgeted(self):
+        # The evidence budget now lives in evidence_context.build_repair_evidence;
+        # build_repair_prompt renders the distilled bundle verbatim.
         with tempfile.TemporaryDirectory() as tmp:
             config = AgentConfig()
             analysis = _analysis(Path(tmp), config)
             decision = mock.Mock(family="cosim_failure", next_action="fix", repair_scope="dut")
-            evidence = "BANNER " * 2000 + "THE_ACTUAL_ERROR"
-            _system, user = build_repair_prompt(analysis, decision, "cosim", evidence, "src/hls_top.cpp", "void f() {}")
+            state = VerificationState()
+            state.add_phase(
+                PhaseResult(
+                    "cosim",
+                    "fail",
+                    stdout="ERROR: [COSIM 212-359] THE_ACTUAL_ERROR\n" + "BANNER chatter\n" * 2000,
+                )
+            )
+            bundle = build_repair_evidence(state, "cosim")
+            _system, user = build_repair_prompt(
+                analysis, decision, "cosim", bundle.text, "src/hls_top.cpp", "void f() {}"
+            )
         self.assertIn("THE_ACTUAL_ERROR", user)
-        # 4000-char tail slice: only ~570 of the 2000 leading BANNER tokens can survive
+        self.assertLessEqual(len(bundle.text), 4000)
+        # The repeated chatter collapses instead of drowning the error.
         self.assertLess(user.count("BANNER"), 700)
 
     def _seeded_project(self, tmp: Path, config: AgentConfig):

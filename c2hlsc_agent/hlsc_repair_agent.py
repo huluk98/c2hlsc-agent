@@ -5,20 +5,20 @@ import hashlib
 import json
 import re
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from .agent_loop import classify_failure
 from .analyze import AnalysisResult
 from .config import AgentConfig
 from .equivalence import VerificationState
+from .evidence_context import build_repair_evidence
 from .hls_runner import earliest_failing_phase
 from .llm import LLMClient, build_repair_prompt, extract_full_file, is_plausible_translation_unit
 
 
 REPAIR_AGENT_NAME = "hlsc_repair_agent"
 REPAIR_AUDIT_FILENAME = "repair_audit.json"
-_EVIDENCE_LIMIT = 4000
 
 
 @dataclass(frozen=True)
@@ -52,6 +52,7 @@ class RepairOutcome:
     evidence_excerpt: str
     next_action: str
     repair_scope: str
+    evidence_provenance: dict[str, object] = field(default_factory=dict)
 
     @property
     def changed(self) -> bool:
@@ -70,6 +71,7 @@ class RepairOutcome:
             "evidence_excerpt": self.evidence_excerpt,
             "next_action": self.next_action,
             "repair_scope": self.repair_scope,
+            "evidence_provenance": dict(self.evidence_provenance),
         }
 
 
@@ -103,6 +105,7 @@ def load_repair_audit(project_dir: Path) -> list[RepairOutcome]:
                 evidence_excerpt=str(item.get("evidence_excerpt", "")),
                 next_action=str(item.get("next_action", "")),
                 repair_scope=str(item.get("repair_scope", "")),
+                evidence_provenance=dict(item.get("evidence_provenance") or {}),
             )
         )
     return outcomes
@@ -125,6 +128,7 @@ def repair_project(
     phase = earliest_failing_phase(state, config.run_vitis)
     decision = classify_failure(state, config.run_vitis, analysis.diagnostics.has_errors)
     evidence = _phase_evidence(state, phase)
+    bundle = build_repair_evidence(state, phase)
     history = load_repair_audit(project_dir)
     changes: list[RepairFileChange] = []
 
@@ -144,7 +148,7 @@ def repair_project(
             summary = f"Applied {len(changes)} auditable mechanical repair(s); rerun verification from software equivalence."
         elif llm is not None and getattr(config, "use_llm", False):
             llm_changes, oscillated = _llm_repair(
-                project_dir, analysis, decision, phase, evidence, llm, config=config, history=history
+                project_dir, analysis, decision, phase, bundle.text, llm, config=config, history=history
             )
             changes.extend(llm_changes)
             if llm_changes:
@@ -176,9 +180,10 @@ def repair_project(
         summary=summary,
         target_files=target_files,
         changes=tuple(changes),
-        evidence_excerpt=evidence.strip()[-_EVIDENCE_LIMIT:],
+        evidence_excerpt=bundle.text,
         next_action=decision.next_action,
         repair_scope=decision.repair_scope,
+        evidence_provenance=bundle.to_dict(),
     )
     _append_audit(project_dir, outcome)
     return outcome
@@ -260,6 +265,13 @@ def _llm_repair(
 
 
 def _phase_evidence(state: VerificationState, phase: str | None) -> str:
+    """Raw, unmodified evidence for the mechanical repairs.
+
+    The mechanical repairs regex-scan this text for symbol names and file
+    paths, so it must stay un-normalized; the LLM prompt and the audit ledger
+    use ``evidence_context.build_repair_evidence`` instead.
+    """
+
     if phase is None:
         return ""
     result = state.phases.get(phase)

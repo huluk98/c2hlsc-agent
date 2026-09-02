@@ -40,9 +40,6 @@ DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
 DEFAULT_CLI_MODEL = "opus"
 _DEFAULT_MAX_TOKENS = 8000
-# Evidence is tail-sliced: the failure signature in a Vitis log is at the END, after the
-# tool banner. Matches PhaseResult.to_dict's [-4000:] report truncation.
-_EVIDENCE_LIMIT = 4000
 _HTTP_TIMEOUT = 600  # local models can be slow
 _CLI_TIMEOUT = 900  # claude CLI runs with thinking; give it room
 
@@ -442,15 +439,16 @@ def build_repair_prompt(
     nl_spec: str | None = None,
 ) -> tuple[str, str]:
     fn = analysis.function
-    # Tail slice: Vitis logs put the failure at the end, after the tool banner.
-    excerpt = (evidence or "").strip()[-_EVIDENCE_LIMIT:] or "(no captured evidence)"
+    # The caller passes distilled evidence (evidence_context.build_repair_evidence),
+    # which already enforces the character budget; render it verbatim.
+    excerpt = (evidence or "").strip() or "(no captured evidence)"
     user = f"""Failing stage: {phase}
 Failure family: {getattr(decision, 'family', 'unknown')}
 Repair intent: {getattr(decision, 'next_action', '')}
 Repair scope: {getattr(decision, 'repair_scope', '')}
 Must-preserve top-function signature: `{fn.signature}`
 {_nl_spec_section(nl_spec)}{_history_section(history)}
-Earliest-failure evidence (tail of the log):
+Earliest-failure evidence (distilled, mismatches first):
 ```
 {excerpt}
 ```
