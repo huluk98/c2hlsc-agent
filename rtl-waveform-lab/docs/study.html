@@ -1,0 +1,799 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f6f9fc">
+  <meta name="description" content="A private RTL study workspace with full-PDF storage, a verified waveform lesson, and a self-grading quiz.">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src 'self'; img-src 'self' data: blob:; style-src 'unsafe-inline'; script-src 'self' 'unsafe-inline'; frame-src 'self' blob:; object-src 'none'; base-uri 'self'; form-action 'self'">
+  <title>RTL Sprint Lab</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #0a2540;
+      --muted: #526474;
+      --canvas: #f6f9fc;
+      --surface: rgba(255, 255, 255, 0.88);
+      --surface-solid: #ffffff;
+      --line: rgba(10, 37, 64, 0.11);
+      --purple: #635bff;
+      --blue: #0a72e8;
+      --cyan: #00a6c7;
+      --gold: #e98d20;
+      --green: #138a61;
+      --red: #c43d4f;
+      --shadow: 0 24px 70px rgba(50, 50, 93, 0.10), 0 5px 18px rgba(0, 0, 0, 0.04);
+      --shadow-soft: 0 12px 35px rgba(50, 50, 93, 0.08);
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      position: relative;
+      min-height: 100vh;
+      margin: 0;
+      color: var(--ink);
+      background: var(--canvas);
+      font: 16px/1.62 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", sans-serif;
+      -webkit-font-smoothing: antialiased;
+      text-rendering: optimizeLegibility;
+    }
+    body::before {
+      position: fixed;
+      inset: 0;
+      z-index: -2;
+      content: "";
+      background:
+        radial-gradient(circle at 8% 5%, rgba(99, 91, 255, 0.18), transparent 25rem),
+        radial-gradient(circle at 92% 10%, rgba(0, 212, 255, 0.16), transparent 27rem),
+        radial-gradient(circle at 72% 48%, rgba(255, 184, 77, 0.10), transparent 24rem),
+        linear-gradient(180deg, #ffffff 0, var(--canvas) 30rem);
+    }
+    body::after {
+      position: absolute;
+      inset: 0 0 auto;
+      z-index: -1;
+      height: 31rem;
+      content: "";
+      opacity: 0.34;
+      background-image: linear-gradient(118deg, transparent 33%, rgba(99, 91, 255, 0.08) 33%, rgba(0, 166, 199, 0.08) 66%, transparent 66%);
+      clip-path: polygon(0 0, 100% 0, 100% 72%, 0 100%);
+    }
+
+    ::selection { color: #fff; background: var(--purple); }
+    a { color: var(--blue); text-underline-offset: 0.18em; }
+    button, input { color: inherit; font: inherit; }
+    code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    :focus-visible { outline: 3px solid rgba(99, 91, 255, 0.32); outline-offset: 3px; }
+    .skip-link { position: fixed; top: 0.7rem; left: 0.7rem; z-index: 100; padding: 0.65rem 0.9rem; border-radius: 999px; color: #fff; background: var(--ink); transform: translateY(-160%); }
+    .skip-link:focus { transform: translateY(0); }
+
+    .shell { width: min(1180px, calc(100% - 2.5rem)); margin: 0 auto; }
+    .masthead { position: relative; overflow: hidden; padding: 6.2rem 0 4rem; }
+    .masthead::after {
+      position: absolute;
+      top: 4.4rem;
+      right: 3%;
+      width: clamp(8rem, 18vw, 14rem);
+      aspect-ratio: 1;
+      border: 1px solid rgba(99, 91, 255, 0.20);
+      border-radius: 38% 62% 58% 42%;
+      content: "";
+      background: linear-gradient(145deg, rgba(99, 91, 255, 0.17), rgba(0, 212, 255, 0.06));
+      box-shadow: inset 0 0 50px rgba(255, 255, 255, 0.78), 0 30px 80px rgba(99, 91, 255, 0.12);
+      transform: rotate(14deg);
+    }
+    .eyebrow {
+      margin: 0 0 0.65rem;
+      color: var(--purple);
+      font-size: 0.74rem;
+      font-weight: 750;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+    }
+    h1, h2, h3 { line-height: 1.08; }
+    h1 {
+      position: relative;
+      z-index: 1;
+      max-width: 820px;
+      margin: 0;
+      color: var(--ink);
+      font-size: clamp(3.1rem, 8vw, 6.8rem);
+      font-weight: 750;
+      letter-spacing: -0.065em;
+      background: linear-gradient(120deg, var(--ink) 12%, var(--purple) 58%, var(--cyan));
+      -webkit-background-clip: text;
+      background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+    h2 { margin: 0 0 1rem; color: var(--ink); font-size: clamp(2rem, 4.3vw, 3.25rem); font-weight: 700; letter-spacing: -0.045em; }
+    h3 { margin: 0 0 0.65rem; color: var(--ink); font-size: 1.15rem; letter-spacing: -0.018em; }
+    .lede { position: relative; z-index: 1; max-width: 740px; margin: 1.4rem 0 1.7rem; color: var(--muted); font-size: clamp(1.08rem, 2vw, 1.28rem); }
+
+    .status-row { display: flex; flex-wrap: wrap; gap: 0.7rem; }
+    .pill { display: inline-flex; align-items: center; gap: 0.5rem; padding: 0.55rem 0.82rem; border: 1px solid rgba(10, 37, 64, 0.10); border-radius: 999px; background: rgba(255, 255, 255, 0.68); box-shadow: 0 5px 20px rgba(50, 50, 93, 0.05); font-size: 0.84rem; font-weight: 650; backdrop-filter: blur(16px); }
+    .dot { width: 0.62rem; height: 0.62rem; border-radius: 50%; background: var(--green); box-shadow: 0 0 0 4px rgba(19, 138, 97, 0.12); }
+
+    .nav {
+      position: sticky;
+      top: 0;
+      z-index: 20;
+      border-block: 1px solid rgba(10, 37, 64, 0.08);
+      background: rgba(246, 249, 252, 0.82);
+      backdrop-filter: saturate(160%) blur(18px);
+    }
+    .nav-inner { display: flex; gap: 0.25rem; overflow-x: auto; padding: 0.68rem 0; scrollbar-width: none; }
+    .nav a { display: flex; flex: 0 0 auto; min-height: 44px; padding: 0.48rem 0.75rem; border-radius: 999px; align-items: center; color: var(--ink); font-size: 0.86rem; font-weight: 650; text-decoration: none; }
+    .nav a:hover { background: rgba(255, 255, 255, 0.92); box-shadow: 0 4px 14px rgba(50, 50, 93, 0.06); }
+
+    main { padding: 3.3rem 0 6rem; }
+    section { scroll-margin-top: 5.4rem; margin-bottom: 6rem; }
+    .section-intro { max-width: 780px; margin-top: -0.35rem; color: var(--muted); font-size: 1.02rem; }
+
+    .concept-chain { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 0.85rem; margin-top: 1.7rem; }
+    .concept-chain div { position: relative; min-height: 7rem; padding: 1.15rem; border: 1px solid var(--line); border-radius: 1.2rem; background: var(--surface); box-shadow: var(--shadow-soft); backdrop-filter: blur(18px); transition: transform 180ms ease, box-shadow 180ms ease; }
+    .concept-chain div:hover { box-shadow: var(--shadow); transform: translateY(-2px); }
+    .step-number { display: block; margin-bottom: 0.5rem; color: var(--purple); font-size: 0.7rem; font-weight: 800; letter-spacing: 0.15em; }
+
+    .day-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1rem; margin-top: 1.5rem; }
+    .day-card { position: relative; overflow: hidden; padding: 1.5rem; border: 1px solid var(--line); border-radius: 1.35rem; background: var(--surface-solid); box-shadow: var(--shadow); }
+    .day-card::before { position: absolute; inset: 0 0 auto; height: 0.3rem; content: ""; background: linear-gradient(90deg, var(--accent, var(--purple)), color-mix(in srgb, var(--accent, var(--purple)) 35%, white)); }
+    .day-label { color: var(--accent, var(--purple)); font-size: 0.74rem; font-weight: 800; letter-spacing: 0.14em; text-transform: uppercase; }
+    .day-card ul { margin: 0.85rem 0 1rem; padding-left: 1.15rem; }
+    .task { display: flex; gap: 0.65rem; align-items: flex-start; margin-top: 0.65rem; padding-top: 0.65rem; border-top: 1px solid var(--line); }
+    .task input { width: 1.08rem; height: 1.08rem; margin-top: 0.25rem; accent-color: var(--purple); }
+    .task label { cursor: pointer; }
+
+    .lesson-grid { display: grid; grid-template-columns: minmax(0, 1.45fr) minmax(17rem, 0.55fr); gap: 1rem; align-items: start; }
+    .panel { padding: 1.5rem; border: 1px solid var(--line); border-radius: 1.35rem; background: var(--surface-solid); box-shadow: var(--shadow); }
+    .rule { margin: 0 0 1rem; padding: 0.9rem 1rem; border-left: 3px solid var(--gold); border-radius: 0.7rem; background: #fff8e9; }
+    .signal-list { display: grid; gap: 0.7rem; margin: 0; }
+    .signal-list div { padding-bottom: 0.7rem; border-bottom: 1px solid var(--line); }
+    .signal-list dt { color: var(--purple); font-family: ui-monospace, monospace; font-weight: 750; }
+    .signal-list dd { margin: 0.15rem 0 0; color: var(--muted); }
+
+    .table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 0.9rem; }
+    .table-hint { margin: 0 0 0.45rem; color: var(--muted); font-size: 0.8rem; }
+    table { width: 100%; min-width: 740px; border-collapse: collapse; background: #fff; font-size: 0.9rem; }
+    th, td { padding: 0.65rem 0.7rem; border-bottom: 1px solid #e9e6de; text-align: left; white-space: nowrap; }
+    th { position: sticky; top: 0; background: var(--ink); color: #fff; font-size: 0.72rem; letter-spacing: 0.07em; text-transform: uppercase; }
+    tr:last-child td { border-bottom: 0; }
+    .valid { color: var(--green); font-weight: 800; }
+    .invalid { color: var(--muted); }
+    .reset-row { background: #fff7e8; }
+
+    pre { overflow-x: auto; margin: 1rem 0 0; padding: 1.15rem; border-radius: 1rem; background: #0a2540; color: #eaf6ff; box-shadow: inset 0 1px rgba(255, 255, 255, 0.08); font-size: 0.85rem; line-height: 1.6; }
+    .resources { display: grid; gap: 0.6rem; }
+    .resources a { display: flex; min-height: 44px; padding: 0.78rem 0.9rem; border: 1px solid var(--line); border-radius: 0.8rem; align-items: center; background: #fff; color: var(--ink); font-weight: 650; text-decoration: none; transition: border-color 160ms ease, transform 160ms ease; }
+    .resources a:hover { border-color: rgba(99, 91, 255, 0.5); transform: translateX(2px); }
+
+    .library-shell { display: grid; grid-template-columns: minmax(16rem, 0.72fr) minmax(0, 1.28fr); gap: 1rem; margin-top: 1.5rem; }
+    .library-card { min-width: 0; padding: 1.25rem; border: 1px solid var(--line); border-radius: 1.35rem; background: var(--surface-solid); box-shadow: var(--shadow); }
+    .reading-route { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 16rem), 1fr)); gap: 0.75rem; margin-top: 1.3rem; }
+    .reading-step { padding: 1rem; border: 1px solid var(--line); border-radius: 1rem; background: rgba(255, 255, 255, 0.72); box-shadow: var(--shadow-soft); }
+    .reading-step h3 { margin: 0.35rem 0 0.45rem; font-size: 1rem; }
+    .reading-step p { margin: 0; color: var(--muted); font-size: 0.88rem; }
+    .route-label { color: var(--purple); font-size: 0.7rem; font-weight: 800; letter-spacing: 0.1em; text-transform: uppercase; }
+    .reading-coach { margin-bottom: 0.9rem; padding: 1rem; border: 1px solid rgba(99, 91, 255, 0.20); border-radius: 1rem; background: linear-gradient(145deg, rgba(99, 91, 255, 0.055), rgba(0, 166, 199, 0.035)); }
+    .coach-head { display: flex; justify-content: space-between; gap: 1rem; align-items: flex-start; }
+    .coach-badge { display: inline-block; margin-bottom: 0.35rem; color: var(--purple); font-size: 0.7rem; font-weight: 800; letter-spacing: 0.09em; text-transform: uppercase; }
+    .coach-controls { display: grid; flex: 0 0 min(100%, 15rem); gap: 0.3rem; }
+    .coach-controls label { color: var(--muted); font-size: 0.74rem; font-weight: 700; }
+    .coach-controls select { min-height: 44px; padding: 0.55rem 2rem 0.55rem 0.7rem; border: 1px solid var(--line); border-radius: 0.75rem; background: #fff; }
+    .coach-summary { margin: 0.7rem 0; color: var(--muted); font-size: 0.88rem; }
+    .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+    .coach-sync { margin: 0.8rem 0; padding: 0.8rem; border: 1px solid rgba(35, 105, 166, 0.18); border-radius: 0.85rem; background: rgba(242, 247, 251, 0.82); }
+    .coach-sync-head { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 0.5rem; align-items: center; }
+    .coach-sync-head h4 { margin: 0; font-size: 0.9rem; }
+    .coach-sync-state { padding: 0.2rem 0.48rem; border-radius: 999px; color: #8b5a00; background: #fff3cf; font-size: 0.68rem; font-weight: 800; text-transform: uppercase; }
+    .coach-sync-state.ready { color: #176144; background: #def5e9; }
+    .coach-sync-message { margin: 0.45rem 0 0.7rem; color: var(--muted); font-size: 0.78rem; }
+    .coach-sync fieldset { min-width: 0; margin: 0; padding: 0; border: 0; }
+    .coach-sync-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.55rem; }
+    .coach-sync label { display: grid; gap: 0.25rem; color: var(--muted); font-size: 0.72rem; font-weight: 700; }
+    .coach-sync input[type="text"], .coach-sync input[type="number"], .coach-sync select { width: 100%; min-height: 42px; padding: 0.5rem 0.6rem; border: 1px solid var(--line); border-radius: 0.65rem; color: var(--ink); background: #fff; }
+    .coach-sync-check { display: flex !important; grid-column: 1 / -1; grid-template-columns: auto 1fr; min-height: 40px; align-items: center; }
+    .coach-sync-check input { width: 1rem; height: 1rem; }
+    .coach-locators { display: grid; gap: 0.5rem; margin-top: 0.65rem; }
+    .coach-locator { display: grid; grid-template-columns: minmax(0, 1fr) minmax(7rem, 0.32fr) auto; gap: 0.5rem; align-items: end; }
+    .coach-locator .coach-sync-check { grid-column: auto; min-height: 42px; }
+    .coach-sync-actions, .coach-output-actions { display: flex; flex-wrap: wrap; gap: 0.6rem; align-items: center; margin-top: 0.7rem; }
+    .coach-sync-save-status, .coach-output-status { color: var(--muted); font-size: 0.76rem; }
+    .pdf-analysis { grid-column: 1 / -1; margin-top: 0.2rem; padding: 0.75rem; border: 1px solid rgba(99, 91, 255, 0.16); border-radius: 0.75rem; background: #fff; }
+    .pdf-analysis h5 { margin: 0; font-size: 0.86rem; }
+    .pdf-analysis > p { margin: 0.35rem 0 0.55rem; color: var(--muted); font-size: 0.75rem; }
+    .pdf-analysis-results, .pdf-starters { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.55rem; margin-top: 0.6rem; }
+    .pdf-analysis-card, .pdf-starter { min-width: 0; padding: 0.65rem; border: 1px solid var(--line); border-radius: 0.7rem; background: rgba(242, 247, 251, 0.66); }
+    .pdf-analysis-card h6, .pdf-starter h6 { margin: 0 0 0.3rem; color: var(--ink); font-size: 0.8rem; }
+    .pdf-analysis-card p, .pdf-starter p { margin: 0.26rem 0; color: var(--muted); font-size: 0.7rem; }
+    .pdf-analysis-card .analysis-snippet { padding-top: 0.35rem; border-top: 1px solid rgba(10, 37, 64, 0.08); }
+    .pdf-starter pre { max-height: 12rem; margin-top: 0.45rem; padding: 0.65rem; font-size: 0.67rem; }
+    .pdf-analysis-actions { display: flex; flex-wrap: wrap; gap: 0.55rem; align-items: center; margin-top: 0.55rem; }
+    .pdf-analysis-status { color: var(--muted); font-size: 0.74rem; }
+    .coach-steps { margin: 0.65rem 0 0.8rem; padding-left: 1.25rem; font-size: 0.88rem; }
+    .coach-resource-section { margin-top: 0.9rem; }
+    .coach-resource-section h4 { margin: 0 0 0.55rem; font-size: 0.86rem; }
+    .coach-resource-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.65rem; }
+    .coach-resource { min-width: 0; padding: 0.75rem; border: 1px solid rgba(10, 37, 64, 0.10); border-radius: 0.8rem; background: rgba(255, 255, 255, 0.84); }
+    .coach-resource-top { display: flex; flex-wrap: wrap; gap: 0.35rem; align-items: center; }
+    .coach-resource-kind { padding: 0.16rem 0.4rem; border-radius: 999px; color: var(--purple); background: rgba(99, 91, 255, 0.09); font-size: 0.64rem; font-weight: 800; letter-spacing: 0.06em; text-transform: uppercase; }
+    .coach-resource-stage { color: var(--muted); font-size: 0.7rem; font-weight: 700; }
+    .coach-resource h5 { margin: 0.45rem 0 0.35rem; font-size: 0.9rem; }
+    .coach-resource h5 a { color: var(--ink); text-underline-offset: 0.18em; }
+    .coach-resource p { margin: 0.32rem 0; color: var(--muted); font-size: 0.76rem; }
+    .coach-resource strong { color: var(--ink); }
+    .coach-resource-availability { padding-top: 0.35rem; border-top: 1px solid rgba(10, 37, 64, 0.08); }
+    .coach-resource-locator { color: #176144 !important; }
+    .coach-proof { display: grid; gap: 0.45rem; padding: 0.75rem; border-radius: 0.8rem; background: rgba(255, 255, 255, 0.78); font-size: 0.84rem; }
+    .coach-proof p { margin: 0; }
+    .coach-handoff { margin-top: 0.75rem; }
+    .coach-handoff summary { min-height: 44px; padding: 0.6rem 0; color: var(--ink); font-weight: 750; cursor: pointer; }
+    .coach-handoff p { color: var(--muted); font-size: 0.82rem; }
+    .coach-prompt { max-height: 15rem; margin: 0.6rem 0; font-size: 0.75rem; white-space: pre-wrap; }
+    .coach-copy-row { display: flex; flex-wrap: wrap; gap: 0.65rem; align-items: center; }
+    .coach-status { color: var(--muted); font-size: 0.8rem; }
+    .coach-output { margin-top: 0.9rem; padding: 0.8rem; border: 1px solid rgba(36, 122, 87, 0.18); border-radius: 0.85rem; background: rgba(245, 252, 248, 0.78); }
+    .coach-output h4 { margin: 0; font-size: 0.9rem; }
+    .coach-output p { margin: 0.35rem 0 0; color: var(--muted); font-size: 0.78rem; }
+    .coach-output pre { max-height: 18rem; margin-top: 0.65rem; font-size: 0.72rem; }
+    .drop-zone { display: grid; place-items: center; min-height: 10.5rem; padding: 1.3rem; border: 1.5px dashed rgba(99, 91, 255, 0.38); border-radius: 1rem; background: linear-gradient(145deg, rgba(99, 91, 255, 0.06), rgba(0, 166, 199, 0.045)); text-align: center; transition: border-color 160ms ease, background 160ms ease, transform 160ms ease; }
+    .drop-zone.dragover { border-color: var(--purple); background: rgba(99, 91, 255, 0.11); transform: scale(1.005); }
+    .drop-zone strong { display: block; margin-bottom: 0.35rem; font-size: 1.05rem; }
+    .drop-zone p { margin: 0.2rem 0 0.9rem; color: var(--muted); font-size: 0.9rem; }
+    .privacy-note { margin: 0.85rem 0 0; padding: 0.78rem 0.9rem; border-radius: 0.8rem; color: #40566b; background: #f2f7fb; font-size: 0.84rem; }
+    .pdf-status { min-height: 1.5rem; margin: 0.8rem 0 0; color: var(--muted); font-size: 0.88rem; }
+    .pdf-list-head, .pdf-viewer-head { display: flex; justify-content: space-between; gap: 0.8rem; align-items: flex-start; margin-bottom: 0.85rem; }
+    .pdf-count { padding: 0.22rem 0.55rem; border-radius: 999px; color: var(--purple); background: rgba(99, 91, 255, 0.09); font-size: 0.76rem; font-weight: 750; }
+    .pdf-list { display: grid; gap: 0.55rem; max-height: 26rem; margin-top: 1rem; overflow-y: auto; }
+    .pdf-item { width: 100%; padding: 0.82rem 0.9rem; border: 1px solid var(--line); border-radius: 0.85rem; color: var(--ink); background: #fff; text-align: left; cursor: pointer; transition: border-color 160ms ease, background 160ms ease, transform 160ms ease; }
+    .pdf-item:hover { border-color: rgba(99, 91, 255, 0.42); transform: translateY(-1px); }
+    .pdf-item.selected { border-color: var(--purple); background: rgba(99, 91, 255, 0.055); box-shadow: 0 0 0 3px rgba(99, 91, 255, 0.08); }
+    .pdf-item strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .pdf-item span { color: var(--muted); font-size: 0.78rem; }
+    .empty-state { padding: 1.25rem; border: 1px dashed var(--line); border-radius: 0.85rem; color: var(--muted); text-align: center; }
+    .pdf-title { margin: 0; overflow-wrap: anywhere; font-size: 1rem; }
+    .pdf-meta { margin: 0.18rem 0 0; color: var(--muted); font-size: 0.8rem; }
+    .viewer-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 0.5rem; }
+    .viewer-frame { position: relative; display: grid; min-height: 38rem; overflow: hidden; border: 1px solid var(--line); border-radius: 1rem; background: #edf2f7; }
+    .viewer-frame iframe { width: 100%; height: 100%; min-height: 38rem; border: 0; background: #fff; }
+    .viewer-placeholder { place-self: center; max-width: 27rem; padding: 2rem; color: var(--muted); text-align: center; }
+
+    .quiz-head { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 1rem; align-items: end; }
+    .score-card { min-width: 10rem; padding: 0.8rem 1rem; border-radius: 1rem; color: #fff; background: linear-gradient(135deg, var(--ink), #284b75); box-shadow: var(--shadow-soft); text-align: center; }
+    .score-card strong { display: block; font-size: 1.55rem; }
+    .question { margin: 1rem 0; padding: 1.25rem; border: 1px solid var(--line); border-radius: 1.05rem; background: var(--surface-solid); box-shadow: var(--shadow-soft); }
+    .question.correct { border-color: rgba(19, 138, 97, 0.5); box-shadow: inset 4px 0 var(--green); }
+    .question.incorrect { border-color: rgba(196, 61, 79, 0.5); box-shadow: inset 4px 0 var(--red); }
+    fieldset { min-width: 0; margin: 0; padding: 0; border: 0; }
+    legend { margin-bottom: 0.75rem; font-weight: 800; }
+    .option { display: flex; min-height: 44px; gap: 0.65rem; align-items: flex-start; margin: 0.5rem 0; padding: 0.68rem 0.78rem; border: 1px solid transparent; border-radius: 0.7rem; background: #f5f8fb; cursor: pointer; }
+    .option:hover { border-color: rgba(99, 91, 255, 0.16); background: #f0f3fb; }
+    .option:focus-within { outline: 3px solid rgba(99, 91, 255, 0.32); outline-offset: 2px; }
+    .option input { margin-top: 0.25rem; accent-color: var(--purple); }
+    .feedback { min-height: 1.5rem; margin: 0.65rem 0 0; color: var(--muted); font-size: 0.9rem; }
+    .question.correct .feedback { color: var(--green); }
+    .question.incorrect .feedback { color: var(--red); }
+    .actions { display: flex; flex-wrap: wrap; gap: 0.7rem; margin-top: 1.2rem; }
+    .button { display: inline-flex; min-height: 44px; padding: 0.68rem 1rem; border: 0; border-radius: 999px; align-items: center; justify-content: center; color: #fff; background: linear-gradient(135deg, var(--purple), #7a73ff); box-shadow: 0 8px 20px rgba(99, 91, 255, 0.22); font-size: 0.88rem; font-weight: 750; text-decoration: none; cursor: pointer; transition: transform 160ms ease, box-shadow 160ms ease; }
+    .button:hover { box-shadow: 0 11px 25px rgba(99, 91, 255, 0.28); transform: translateY(-1px); }
+    .button.secondary { border: 1px solid var(--line); color: var(--ink); background: #fff; box-shadow: none; }
+    .button.danger { border: 1px solid rgba(196, 61, 79, 0.22); color: var(--red); background: #fff; box-shadow: none; }
+    .button:disabled, .button[aria-disabled="true"] { opacity: 0.45; box-shadow: none; cursor: not-allowed; pointer-events: none; transform: none; }
+
+    .finish { position: relative; overflow: hidden; padding: 2rem; border-radius: 1.5rem; color: #f6fbfd; background: linear-gradient(135deg, #0a2540 0%, #263b72 62%, #635bff 140%); box-shadow: var(--shadow); }
+    .finish::after { position: absolute; right: -5rem; bottom: -7rem; width: 18rem; aspect-ratio: 1; border: 1px solid rgba(255, 255, 255, 0.16); border-radius: 45%; content: ""; transform: rotate(24deg); }
+    .finish h2 { color: #fff; }
+    .finish ul { columns: 2; padding-left: 1.15rem; }
+    footer { padding: 1.5rem 0 3.5rem; color: var(--muted); font-size: 0.88rem; }
+
+    @media (max-width: 880px) {
+      .concept-chain { grid-template-columns: repeat(2, 1fr); }
+      .day-grid, .lesson-grid, .library-shell { grid-template-columns: 1fr; }
+      .masthead::after { opacity: 0.48; }
+      .viewer-frame, .viewer-frame iframe { min-height: 30rem; }
+    }
+    @media (max-width: 560px) {
+      .shell { width: min(100% - 1.2rem, 1180px); }
+      .masthead { padding: 4.2rem 0 2.8rem; }
+      .masthead::after { display: none; }
+      .concept-chain { grid-template-columns: 1fr; }
+      .finish ul { columns: 1; }
+      .pdf-viewer-head { display: block; }
+      .coach-head { display: grid; }
+      .coach-sync-grid { grid-template-columns: 1fr; }
+      .coach-locator { grid-template-columns: 1fr; }
+      .coach-locator .coach-sync-check { grid-column: 1; }
+      .pdf-analysis-results, .pdf-starters { grid-template-columns: 1fr; }
+      .coach-resource-list { grid-template-columns: 1fr; }
+      .viewer-actions { justify-content: flex-start; margin-top: 0.8rem; }
+      .viewer-frame, .viewer-frame iframe { min-height: 24rem; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      html { scroll-behavior: auto; }
+      *, *::before, *::after { scroll-behavior: auto !important; transition-duration: 0.01ms !important; }
+    }
+  </style>
+</head>
+<body>
+  <a class="skip-link" href="#main-content">Skip to study content</a>
+  <header class="masthead shell">
+    <p class="eyebrow">Three-day hardware foundations</p>
+    <h1>RTL Sprint Lab</h1>
+    <p class="lede">A three-day core path from Boolean behavior to clocked RTL, independent verification, generic synthesis, and the evidence required for C-to-HLS-C work.</p>
+    <div class="status-row" aria-label="Lab status">
+      <span class="pill"><span class="dot" aria-hidden="true"></span> Directed trace verified: 11/11 edges</span>
+      <span class="pill">One-cycle delayed adder</span>
+      <span class="pill">Full local gate: make verify</span>
+    </div>
+  </header>
+
+  <nav class="nav" aria-label="Study sections">
+    <div class="nav-inner shell">
+      <a href="#map">Concept map</a>
+      <a href="#plan">Three-day plan</a>
+      <a href="#reading-route">Reading route</a>
+      <a href="#lesson">Waveform lesson</a>
+      <a href="#quiz">Quiz</a>
+      <a href="#finish">Finish line</a>
+    </div>
+  </nav>
+
+  <main class="shell" id="main-content" tabindex="-1">
+    <section id="map">
+      <p class="eyebrow">The hardware ladder</p>
+      <h2>Keep this mental model in view</h2>
+      <p class="section-intro">RTL is not ordinary software. It describes hardware structures whose values exist in parallel and whose registered state changes on clock edges.</p>
+      <div class="concept-chain" aria-label="RTL abstraction flow">
+        <div><span class="step-number">01</span><strong>Specification</strong><br><small>What must the circuit do?</small></div>
+        <div><span class="step-number">02</span><strong>Truth table</strong><br><small>Enumerate input/output behavior.</small></div>
+        <div><span class="step-number">03</span><strong>Boolean logic</strong><br><small>Express and simplify equations.</small></div>
+        <div><span class="step-number">04</span><strong>Gates</strong><br><small>Build combinational paths.</small></div>
+        <div><span class="step-number">05</span><strong>Registers</strong><br><small>Add clocked state and memory.</small></div>
+        <div><span class="step-number">06</span><strong>RTL</strong><br><small>Describe datapath and control.</small></div>
+        <div><span class="step-number">07</span><strong>Verify + synthesize</strong><br><small>Test behavior, then lower to gates.</small></div>
+      </div>
+    </section>
+
+    <section id="plan">
+      <p class="eyebrow">18–24 focused hours</p>
+      <h2>Your three-day route</h2>
+      <p class="section-intro">Use the local, manual, and external gates in the <a href="ordered_exercises.md">ordered exercise sheet</a>, following the <a href="#reading-route">just-in-time reading route</a> below. Reading supports the work; the required output and its named gate establish each skill.</p>
+      <div class="day-grid">
+        <article class="day-card" style="--accent:#2369a6">
+          <span class="day-label">Day 1</span>
+          <h3>Logic becomes hardware</h3>
+          <ul>
+            <li>Preflight: binary, hex, algebra, tools</li>
+            <li>Truth tables, Boolean equations, gates</li>
+            <li>Widths, signedness, combinational RTL, latches</li>
+          </ul>
+          <div class="task"><input class="progress" id="d1-read" type="checkbox"><label for="d1-read">Read, produce, and pass stages 1-4</label></div>
+          <div class="task"><input class="progress" id="d1-build" type="checkbox"><label for="d1-build">Pass exhaustive truth-table and lint gates</label></div>
+        </article>
+        <article class="day-card" style="--accent:#8b5a00">
+          <span class="day-label">Day 2</span>
+          <h3>State moves on clock edges</h3>
+          <ul>
+            <li>Registers and nonblocking old/new state</li>
+            <li>Reset, FSMs, valid, ready, stalls</li>
+            <li>Predict, then verify, the waveform below</li>
+          </ul>
+          <div class="task"><input class="progress" id="d2-read" type="checkbox"><label for="d2-read">Read, produce, and pass stages 5-8</label></div>
+          <div class="task"><input class="progress" id="d2-quiz" type="checkbox" disabled><label for="d2-quiz">Machine-set after scoring at least 8/10</label></div>
+        </article>
+        <article class="day-card" style="--accent:#247a57">
+          <span class="day-label">Day 3</span>
+          <h3>RTL reaches synthesis and HLS</h3>
+          <ul>
+            <li>Black-box oracle and mutation sensitivity</li>
+            <li>Lint, synthesis, and evidence limits</li>
+            <li>Defined C → HLS-C → RTL validation ladder</li>
+          </ul>
+          <div class="task"><input class="progress" id="d3-read" type="checkbox"><label for="d3-read">Complete stages 9-12; run <code>make verify</code></label></div>
+          <div class="task"><input class="progress" id="d3-explain" type="checkbox"><label for="d3-explain">Fill the generation contract for a capstone</label></div>
+        </article>
+      </div>
+    </section>
+
+    <section id="library" aria-labelledby="library-title">
+      <p class="eyebrow">Private reading shelf</p>
+      <h2 id="library-title">Keep the full PDF beside the lesson</h2>
+      <p class="section-intro">Add complete PDFs from your computer, select one, and read it without leaving the study flow. Files stay in this browser profile on this exact local address. Analysis is off by default; when you explicitly opt in, one temporary copy goes only to the loopback study process and is deleted after text extraction. The corrected <a href="pdf_reading_map.md">PDF reading workflow</a> tells you what to read, understand, produce, and pass for every stage.</p>
+      <div class="reading-route" id="reading-route" aria-label="Three-day PDF reading route">
+        <article class="reading-step">
+          <span class="route-label">Day 1 / Stages 1-4</span>
+          <h3>Turn behavior into logic</h3>
+          <p>Pair Chapters 1-2 with the exact Chapter 4-5 HDL sections needed for each truth table, equation, gate, width, and RTL artifact.</p>
+        </article>
+        <article class="reading-step">
+          <span class="route-label">Day 2 / Stages 5-8</span>
+          <h3>Predict state at each edge</h3>
+          <p>Use Chapter 3 for state and FSMs, then use the local waveform lab and explicit transfer rule for pipeline and ready/valid reasoning.</p>
+        </article>
+        <article class="reading-step">
+          <span class="route-label">Day 3 / Stages 9-12</span>
+          <h3>Separate claims from evidence</h3>
+          <p>Combine HDL and synthesis reading, HLStrans pages 1-2, and exact vendor documentation without inventing unavailable HLS results.</p>
+        </article>
+      </div>
+      <div class="library-shell">
+        <div class="library-card">
+          <div class="pdf-list-head">
+            <div>
+              <h3>Your PDFs</h3>
+              <p class="pdf-meta">Stored on this device</p>
+            </div>
+            <span class="pdf-count" id="pdf-count">0 files</span>
+          </div>
+          <div class="drop-zone" id="pdf-drop-zone">
+            <div>
+              <strong>Add full PDF files</strong>
+              <p>Choose one or several PDFs, or drop them here.</p>
+              <button class="button" id="choose-pdf" type="button">Choose PDFs</button>
+              <input id="pdf-input" type="file" accept=".pdf,application/pdf" multiple hidden>
+            </div>
+          </div>
+          <p class="privacy-note"><strong>Private by design:</strong> PDFs, source confirmation, and page locators are stored in IndexedDB for <code>127.0.0.1:4173</code>. Nothing is parsed or transmitted automatically. Keep your originals—private browsing, clearing site data, storage pressure, or using a different hostname/port can remove or hide this shelf.</p>
+          <p class="pdf-status" id="pdf-status" role="status" aria-live="polite" aria-atomic="true">Ready for your first PDF.</p>
+          <div class="pdf-list" id="pdf-list" aria-label="Saved PDF files" aria-busy="false">
+            <p class="empty-state">No PDFs added yet.</p>
+          </div>
+        </div>
+
+        <div class="library-card">
+          <div class="pdf-viewer-head">
+            <div>
+              <h3 class="pdf-title" id="pdf-title">Select a PDF to read</h3>
+              <p class="pdf-meta" id="pdf-meta">The full document will appear below.</p>
+            </div>
+            <div class="viewer-actions">
+              <a class="button secondary" id="open-pdf" href="#" target="_blank" rel="noopener noreferrer" aria-disabled="true" tabindex="-1">Open</a>
+              <a class="button secondary" id="download-pdf" href="#" aria-disabled="true" tabindex="-1">Download copy</a>
+              <button class="button danger" id="remove-pdf" type="button" disabled>Remove</button>
+            </div>
+          </div>
+          <aside class="reading-coach" id="reading-coach" aria-labelledby="coach-title">
+            <div class="coach-head">
+              <div>
+                <span class="coach-badge" id="coach-badge">No PDF selected</span>
+                <h3 id="coach-title">Select a PDF to get a reading assignment</h3>
+              </div>
+              <div class="coach-controls">
+                <label for="coach-stage">Current study block</label>
+                <select id="coach-stage">
+                  <option value="day1">Day 1 / Stages 1-4</option>
+                  <option value="day2">Day 2 / Stages 5-8</option>
+                  <option value="day3">Day 3 / Stages 9-12</option>
+                </select>
+              </div>
+            </div>
+            <p class="coach-summary" id="coach-summary">The coach treats filenames only as hints. Optional page detection runs only after consent on this computer; shelf PDFs are never sent to Codex or the internet.</p>
+            <span class="sr-only" id="coach-announcement" role="status" aria-live="polite"></span>
+            <form class="coach-sync" id="coach-sync-form">
+              <div class="coach-sync-head">
+                <h4>Synchronize readings to this uploaded PDF</h4>
+                <span class="coach-sync-state" id="coach-sync-state">No PDF selected</span>
+              </div>
+              <p class="coach-sync-message" id="coach-sync-message">Select a PDF, then confirm its identity and two locators for the current day. Filename matching is only a suggestion.</p>
+              <fieldset id="coach-sync-fields" disabled>
+                <div class="coach-sync-grid">
+                  <label>Actual source type
+                    <select id="coach-source-type" required>
+                      <option value="">Choose after checking the PDF</option>
+                      <option value="textbook">Digital Design and Computer Architecture</option>
+                      <option value="hlstrans">HLStrans arXiv v3</option>
+                      <option value="unmapped">Other / uploaded source</option>
+                    </select>
+                  </label>
+                  <label>Exact title and author/organization
+                    <input id="coach-source-identity" type="text" autocomplete="off" placeholder="Copy from the title page" required>
+                  </label>
+                  <label>Edition, version, date, or identifier
+                    <input id="coach-source-version" type="text" autocomplete="off" placeholder="Example: arXiv:2507.04315v3" required>
+                  </label>
+                  <label>Page-number convention
+                    <input id="coach-page-convention" type="text" autocomplete="off" placeholder="Example: viewer p. 76 = printed p. 51" required>
+                  </label>
+                  <label class="coach-sync-check"><input id="coach-identity-confirmed" type="checkbox"> I checked these identity fields against the opened PDF.</label>
+                  <section class="pdf-analysis" aria-labelledby="pdf-analysis-title">
+                    <h5 id="pdf-analysis-title">Detect relevant pages and code starters locally</h5>
+                    <p>This opt-in action sends a temporary copy only to the <code>127.0.0.1</code> study process. Poppler extracts text, returns two qualified page candidates, and deletes the temporary copy. Nothing runs automatically and nothing is uploaded to the internet.</p>
+                    <label class="coach-sync-check"><input id="pdf-analysis-consent" type="checkbox"> I want to analyze this selected PDF locally for the current day.</label>
+                    <div class="pdf-analysis-actions">
+                      <button class="button secondary" id="analyze-pdf-locally" type="button" disabled>Analyze selected PDF locally</button>
+                      <button class="button secondary" id="apply-analysis-locators" type="button" disabled>Use both as unconfirmed locators</button>
+                      <span class="pdf-analysis-status" id="pdf-analysis-status" role="status" aria-live="polite"></span>
+                    </div>
+                    <div class="pdf-analysis-results" id="pdf-analysis-results">
+                      <p class="empty-state">No local analysis run for this PDF and day.</p>
+                    </div>
+                    <div class="pdf-starters" id="pdf-code-starters"></div>
+                  </section>
+                </div>
+                <div class="coach-locators">
+                  <div class="coach-locator">
+                    <label>Reading 1 locator in this PDF
+                      <input id="coach-locator-1" type="text" autocomplete="off" placeholder="Section/chapter title and printed page">
+                    </label>
+                    <label>PDF viewer page
+                      <input id="coach-locator-1-page" type="number" min="1" step="1" inputmode="numeric" placeholder="1">
+                    </label>
+                    <label class="coach-sync-check"><input id="coach-locator-1-confirmed" type="checkbox"> Checked</label>
+                  </div>
+                  <div class="coach-locator">
+                    <label>Reading 2 locator in this PDF
+                      <input id="coach-locator-2" type="text" autocomplete="off" placeholder="Section/chapter title and printed page">
+                    </label>
+                    <label>PDF viewer page
+                      <input id="coach-locator-2-page" type="number" min="1" step="1" inputmode="numeric" placeholder="1">
+                    </label>
+                    <label class="coach-sync-check"><input id="coach-locator-2-confirmed" type="checkbox"> Checked</label>
+                  </div>
+                </div>
+                <div class="coach-sync-actions">
+                  <button class="button secondary" id="save-coach-sync" type="submit">Save PDF synchronization</button>
+                  <span class="coach-sync-save-status" id="coach-sync-save-status" role="status" aria-live="polite"></span>
+                </div>
+              </fieldset>
+            </form>
+            <ol class="coach-steps" id="coach-steps">
+              <li>Add or select a PDF from your shelf.</li>
+              <li>Confirm the source identity before following its assignment.</li>
+            </ol>
+            <section class="coach-resource-section" aria-labelledby="coach-readings-title">
+              <h4 id="coach-readings-title">Two targeted readings</h4>
+              <div class="coach-resource-list" id="coach-readings">
+                <p class="empty-state">Select a PDF to map two readings.</p>
+              </div>
+            </section>
+            <section class="coach-resource-section" aria-labelledby="coach-runs-title">
+              <h4 id="coach-runs-title">Two video or guided runs</h4>
+              <div class="coach-resource-list" id="coach-runs">
+                <p class="empty-state">Select a PDF to load two trusted runs.</p>
+              </div>
+            </section>
+            <div class="coach-proof">
+              <p><strong>Produce:</strong> <span id="coach-artifact">A stage-specific artifact will appear here.</span></p>
+              <p><strong>Gate:</strong> <span id="coach-gate">A matching evidence gate will appear here.</span></p>
+            </div>
+            <section class="coach-output" aria-labelledby="coach-output-title">
+              <h4 id="coach-output-title">Ready-to-fill output worksheet</h4>
+              <p id="coach-output-help">Synchronize the PDF identity and both reading locators to unlock a worksheet tied to this PDF and day.</p>
+              <pre id="coach-output-worksheet">Select and synchronize a PDF to generate the worksheet.</pre>
+              <div class="coach-output-actions">
+                <button class="button secondary" id="copy-output-worksheet" type="button" disabled>Copy output worksheet</button>
+                <span class="coach-output-status" id="coach-output-status" role="status" aria-live="polite"></span>
+              </div>
+            </section>
+            <details class="coach-handoff">
+              <summary>Codex analysis request for this PDF</summary>
+              <p>The shelf remains private. For an unfamiliar source, attach the PDF separately in this conversation, then paste this request.</p>
+              <pre class="coach-prompt" id="coach-prompt">Select a PDF to generate the request.</pre>
+              <div class="coach-copy-row">
+                <button class="button secondary" id="copy-coach-prompt" type="button" disabled>Copy analysis request</button>
+                <span class="coach-status" id="coach-status" role="status" aria-live="polite"></span>
+              </div>
+            </details>
+          </aside>
+          <div class="viewer-frame">
+            <p class="viewer-placeholder" id="pdf-placeholder">Your selected PDF will open here. The browser’s native viewer provides page navigation, zoom, search, print, and download controls.</p>
+            <iframe id="pdf-viewer" title="PDF reader" hidden></iframe>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="lesson">
+      <p class="eyebrow">Verified lab</p>
+      <h2>Read a one-cycle pipeline</h2>
+      <p class="section-intro">The directed simulator and black-box reference model agree on every edge below. This trace teaches one valid-only pipeline; the exhaustive and mutation gates establish broader evidence for this exact module contract.</p>
+      <div class="lesson-grid">
+        <article class="panel">
+          <p class="rule"><strong>Validity rule:</strong> <code>sum</code> is meaningful only when <code>out_valid=1</code>. A held numeric value during an invalid cycle is not a transaction.</p>
+          <p class="rule"><strong>Nonblocking rule:</strong> all right-hand sides read pre-edge values; all <code>&lt;=</code> updates become visible together after the edge. The lines do not execute as software-like “first, then” state changes.</p>
+          <p class="table-hint">Scroll horizontally to inspect every signal column.</p>
+          <div class="table-wrap" tabindex="0" role="region" aria-label="Pipeline edge table">
+            <table>
+              <thead><tr><th>Edge</th><th>Time</th><th>rst</th><th>in_valid</th><th>Input</th><th>out_valid</th><th>Output meaning</th></tr></thead>
+              <tbody>
+                <tr class="reset-row"><td>E0</td><td>5 ns</td><td>1</td><td>0</td><td>—</td><td>0</td><td class="invalid">Reset clears state</td></tr>
+                <tr class="reset-row"><td>E1</td><td>15 ns</td><td>1</td><td>0</td><td>—</td><td>0</td><td class="invalid">Reset remains active</td></tr>
+                <tr><td>E2</td><td>25 ns</td><td>0</td><td>1</td><td>T0: 3 + 5 accepted</td><td>0</td><td class="invalid">No output yet</td></tr>
+                <tr><td>E3</td><td>35 ns</td><td>0</td><td>0</td><td>Bubble</td><td>1</td><td class="valid">T0 result: 8</td></tr>
+                <tr><td>E4</td><td>45 ns</td><td>0</td><td>1</td><td>T1: 200 + 100 accepted</td><td>0</td><td class="invalid">Bubble; held 8 ignored</td></tr>
+                <tr><td>E5</td><td>55 ns</td><td>0</td><td>1</td><td>T2: 255 + 255 accepted</td><td>1</td><td class="valid">T1 result: 300</td></tr>
+                <tr><td>E6</td><td>65 ns</td><td>0</td><td>0</td><td>Bubble</td><td>1</td><td class="valid">T2 result: 510</td></tr>
+                <tr><td>E7</td><td>75 ns</td><td>0</td><td>0</td><td>Bubble</td><td>0</td><td class="invalid">Held 510 ignored</td></tr>
+                <tr><td>E8</td><td>85 ns</td><td>0</td><td>1</td><td>Probe: 1 + 2 accepted</td><td>0</td><td class="invalid">No output</td></tr>
+                <tr class="reset-row"><td>E9</td><td>95 ns</td><td>1</td><td>0</td><td>—</td><td>0</td><td class="invalid">Reset flushes probe</td></tr>
+                <tr><td>E10</td><td>105 ns</td><td>0</td><td>0</td><td>—</td><td>0</td><td class="invalid">No stale result appears</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <pre><code>always_ff @(posedge clk) begin
+  if (rst) begin
+    pending_valid &lt;= 1'b0;
+    pending_sum   &lt;= 9'd0;
+    out_valid     &lt;= 1'b0;
+    sum           &lt;= 9'd0;
+  end else begin
+    out_valid &lt;= pending_valid;
+    if (pending_valid)
+      sum &lt;= pending_sum;
+
+    pending_valid &lt;= in_valid;
+    if (in_valid)
+      pending_sum &lt;= {1'b0, a} + {1'b0, b};
+  end
+end</code></pre>
+        </article>
+
+        <aside class="panel">
+          <h3>Signal dictionary</h3>
+          <dl class="signal-list">
+            <div><dt>clk</dt><dd>The timing reference. State changes on rising edges.</dd></div>
+            <div><dt>rst</dt><dd>Active-high synchronous reset; effective only on a rising edge.</dd></div>
+            <div><dt>in_valid</dt><dd>Says whether <code>a</code> and <code>b</code> are a real input transaction.</dd></div>
+            <div><dt>out_valid</dt><dd>Says whether <code>sum</code> is a real output transaction.</dd></div>
+            <div><dt>interface limit</dt><dd>No <code>ready</code> exists: this toy always accepts valid input and cannot backpressure or stall.</dd></div>
+            <div><dt>latency</dt><dd>One complete cycle from accepted input to valid output.</dd></div>
+            <div><dt>throughput</dt><dd>One result per cycle when inputs arrive consecutively.</dd></div>
+          </dl>
+          <h3 style="margin-top:1.4rem">Lab resources</h3>
+          <div class="resources">
+            <a href="generation_contract.md">Precise code-generation input contract</a>
+            <a href="ordered_exercises.md">Ordered exercises and mastery gates</a>
+            <a href="fundamentals_field_guide.md">Fundamentals field guide and scope</a>
+            <a href="pdf_reading_map.md">Full three-day PDF workflow</a>
+            <a href="waveform_walkthrough.md">Full waveform walkthrough</a>
+            <a href="cycle_table.md">Detailed cycle table</a>
+            <a href="expected_waveform.json">Checked WaveDrom data (offline-safe)</a>
+            <a href="../rtl/one_cycle_delayed_adder.sv">Synthesizable RTL source</a>
+            <a href="../tb/tb_one_cycle_delayed_adder.sv">Self-checking testbench</a>
+          </div>
+        </aside>
+      </div>
+    </section>
+
+    <section id="quiz">
+      <div class="quiz-head">
+        <div>
+          <p class="eyebrow">Knowledge check</p>
+          <h2>Waveform-reading quiz</h2>
+          <p class="section-intro">Choose one answer per question. Aim for 8/10 before moving to Day 3. This checkpoint assesses waveform and clocked-update concepts only.</p>
+        </div>
+        <div class="score-card" aria-live="polite"><span>Current score</span><strong id="score">Not graded</strong></div>
+      </div>
+      <form id="quiz-form">
+        <div id="questions"></div>
+        <div class="actions">
+          <button class="button" type="submit">Grade my quiz</button>
+          <button class="button secondary" id="reset-quiz" type="button">Reset answers</button>
+        </div>
+      </form>
+    </section>
+
+    <section class="finish" id="finish">
+      <p class="eyebrow" style="color:#8de0e9">Your finish line</p>
+      <h2>Your core-literacy checkpoint</h2>
+      <ul>
+        <li>Turn a truth table into a Boolean equation and RTL.</li>
+        <li>Distinguish combinational logic from registered state.</li>
+        <li>Predict reset, latency, bubbles, and valid outputs.</li>
+        <li>Explain blocking versus nonblocking assignments.</li>
+        <li>Describe simulation, synthesis, and a testbench.</li>
+        <li>Fill a precise functional, temporal, oracle, and QoR contract.</li>
+        <li>Describe compile → CSim → synthesis/report → CoSim.</li>
+        <li>Name the limits: timing closure, CDC, and QoR remain advanced.</li>
+      </ul>
+      <p>Confirm these with the ordered artifacts and <code>make verify</code>; the quiz alone is not a generalized RTL or HLS credential.</p>
+    </section>
+  </main>
+
+  <footer class="shell">RTL Sprint Lab · Calm, private technical study workspace · Progress and added PDFs stay on this device.</footer>
+
+  <script>
+    const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)");
+    const quiz = [
+      { q: "At which rising edges is synchronous reset active?", options: ["E0 only", "E0, E1, and E9", "E1, E2, and E10", "E9 and E10"], answer: 1, why: "rst is high at E0, E1, and E9, so state clears on those rising edges." },
+      { q: "When is an ordinary input transaction accepted?", options: ["Whenever a or b changes", "When rst=1", "When rst=0 and in_valid=1 at a rising edge", "Whenever out_valid=1"], answer: 2, why: "The interface samples meaningful input only when reset is inactive and in_valid is asserted at the clock edge." },
+      { q: "T0 (3+5) is accepted at E2. When does its result appear?", options: ["E2 as 8", "E3 as 8", "E4 as 8", "E3 as 300"], answer: 1, why: "The pipeline latency is one cycle, so T0 moves from E2 to the valid output at E3." },
+      { q: "What is the input-to-output latency?", options: ["Half a cycle / 5 ns", "One cycle / 10 ns", "Two cycles / 20 ns", "It varies with the operands"], answer: 1, why: "Each accepted transaction appears on the following rising edge: one 10 ns cycle later." },
+      { q: "Why is out_valid=0 at E4?", options: ["The adder overflowed", "Reset is active", "The input at E3 was a bubble", "T0 is still computing"], answer: 2, why: "in_valid=0 at E3 creates an empty pipeline slot that reaches the output at E4." },
+      { q: "What do the valid outputs at E5 and E6 demonstrate?", options: ["Two-cycle latency", "One-result-per-cycle throughput", "An asynchronous reset", "A combinational feedback loop"], answer: 1, why: "T1 and T2 were accepted on consecutive edges and emerge on consecutive edges." },
+      { q: "At E7, sum still shows 510 while out_valid=0. How should 510 be interpreted?", options: ["A new valid result", "An overflow error", "Held bus data that must be ignored", "An unknown X value"], answer: 2, why: "Data and validity form one interface contract. Without out_valid, the held number has no transactional meaning." },
+      { q: "Why is sum nine bits wide?", options: ["The clock is nine bits", "To represent 255+255=510 without truncation", "SystemVerilog requires odd widths", "To store the valid bit"], answer: 1, why: "Eight unsigned bits stop at 255; nine bits represent values through 511." },
+      { q: "In one always_ff edge, what values do nonblocking right-hand sides observe?", options: ["Values updated by the preceding source line", "Pre-edge values; left-hand updates appear together afterward", "Only zero", "Post-synthesis gate delays"], answer: 1, why: "Nonblocking assignments sample their right-hand sides from the old state and schedule left-hand-side updates for the nonblocking update region." },
+      { q: "Does a valid result 3 ever appear for the probe accepted at E8?", options: ["Yes, at E9", "Yes, at E10", "No; synchronous reset clears it at E9", "No; 1+2 cannot be synthesized"], answer: 2, why: "Reset has priority at E9 and clears pending state before the probe can emerge." }
+    ];
+
+    const questions = document.querySelector("#questions");
+    const score = document.querySelector("#score");
+
+    quiz.forEach((item, index) => {
+      const wrapper = document.createElement("div");
+      wrapper.className = "question";
+      wrapper.dataset.question = index;
+      const fieldset = document.createElement("fieldset");
+      const legend = document.createElement("legend");
+      legend.textContent = `${index + 1}. ${item.q}`;
+      fieldset.appendChild(legend);
+
+      item.options.forEach((option, optionIndex) => {
+        const label = document.createElement("label");
+        label.className = "option";
+        const input = document.createElement("input");
+        input.type = "radio";
+        input.name = `q${index}`;
+        input.value = optionIndex;
+        input.checked = localStorage.getItem(`rtl-answer-q${index}`) === String(optionIndex);
+        input.addEventListener("change", () => {
+          localStorage.setItem(`rtl-answer-q${index}`, input.value);
+        });
+        const text = document.createElement("span");
+        text.textContent = option;
+        label.append(input, text);
+        fieldset.appendChild(label);
+      });
+
+      const feedback = document.createElement("p");
+      feedback.className = "feedback";
+      feedback.setAttribute("aria-live", "polite");
+      wrapper.append(fieldset, feedback);
+      questions.appendChild(wrapper);
+    });
+
+    document.querySelectorAll(".progress").forEach((checkbox) => {
+      checkbox.checked = localStorage.getItem(`rtl-progress-${checkbox.id}`) === "true";
+      checkbox.addEventListener("change", () => localStorage.setItem(`rtl-progress-${checkbox.id}`, checkbox.checked));
+    });
+
+    document.querySelector("#quiz-form").addEventListener("submit", (event) => {
+      event.preventDefault();
+      let correct = 0;
+      quiz.forEach((item, index) => {
+        const wrapper = document.querySelector(`[data-question="${index}"]`);
+        const selected = document.querySelector(`input[name="q${index}"]:checked`);
+        const isCorrect = selected && Number(selected.value) === item.answer;
+        wrapper.classList.toggle("correct", Boolean(isCorrect));
+        wrapper.classList.toggle("incorrect", !isCorrect);
+        wrapper.querySelector(".feedback").textContent = selected
+          ? `${isCorrect ? "Correct." : "Not quite."} ${item.why}`
+          : "Choose an answer before grading this question.";
+        if (isCorrect) correct += 1;
+      });
+      score.textContent = `${correct}/10`;
+      localStorage.setItem("rtl-quiz-score", String(correct));
+      if (correct >= 8) {
+        const completion = document.querySelector("#d2-quiz");
+        completion.checked = true;
+        localStorage.setItem("rtl-progress-d2-quiz", "true");
+      } else {
+        const completion = document.querySelector("#d2-quiz");
+        completion.checked = false;
+        localStorage.setItem("rtl-progress-d2-quiz", "false");
+      }
+      score.scrollIntoView({ behavior: reduceMotion.matches ? "auto" : "smooth", block: "center" });
+    });
+
+    document.querySelector("#reset-quiz").addEventListener("click", () => {
+      document.querySelector("#quiz-form").reset();
+      document.querySelectorAll(".question").forEach((question) => {
+        question.classList.remove("correct", "incorrect");
+        question.querySelector(".feedback").textContent = "";
+      });
+      score.textContent = "Not graded";
+      localStorage.removeItem("rtl-quiz-score");
+      quiz.forEach((_, index) => localStorage.removeItem(`rtl-answer-q${index}`));
+      const completion = document.querySelector("#d2-quiz");
+      completion.checked = false;
+      localStorage.setItem("rtl-progress-d2-quiz", "false");
+    });
+
+    const savedScore = localStorage.getItem("rtl-quiz-score");
+    if (savedScore !== null) score.textContent = `${savedScore}/10 saved`;
+  </script>
+  <script src="reading_coach.js" defer></script>
+  <script src="pdf_shelf.js" defer></script>
+</body>
+</html>

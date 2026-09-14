@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Expected waveform — one-cycle delayed adder</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 2rem; color: #172033; }
+    h1 { margin-bottom: 0.25rem; }
+    p { max-width: 75rem; }
+    .note { padding: 0.8rem 1rem; background: #fff6d8; border-left: 4px solid #e0a000; }
+    svg { max-width: none; }
+    .wave { overflow-x: auto; }
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/wavedrom@3.5.0/wavedrom.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/wavedrom@3.5.0/skins/default.js"></script>
+</head>
+<body onload="WaveDrom.ProcessAll()">
+  <h1>Expected one-cycle delayed adder waveform</h1>
+  <p class="note"><strong>Validity rule:</strong> read <code>sum</code> only when <code>out_valid</code> is 1. A held number while <code>out_valid</code> is 0 is deliberately shown but must be ignored.</p>
+  <p>The local WaveDrom CLI was not required to create this page. Internet access is needed once to load the two pinned WaveDrom 3.5.0 browser scripts.</p>
+  <div class="wave">
+    <script type="WaveDrom">
+{
+  "signal": [
+    {"name": "clk", "wave": "p.........."},
+    {"name": "Rising edge", "wave": "===========", "data": ["E0", "E1", "E2", "E3", "E4", "E5", "E6", "E7", "E8", "E9", "E10"]},
+    {},
+    {"name": "rst", "wave": "1.0......10"},
+    {},
+    ["Input side",
+      {"name": "in_valid", "wave": "0.101.0.10.", "node": "..a.cd..g.."},
+      {"name": "a (unsigned)", "wave": "=.=====.==.", "data": ["0", "3", "42", "200", "255", "17", "1", "0"]},
+      {"name": "b (unsigned)", "wave": "=.=====.==.", "data": ["0", "5", "99", "100", "255", "34", "2", "0"]},
+      {"name": "Accepted input", "wave": "x.=x==xx=x.", "data": ["T0: 3+5", "T1: 200+100", "T2: 255+255", "flush probe: 1+2"]}
+    ],
+    {},
+    ["Output side",
+      {"name": "out_valid", "wave": "0..101.0...", "node": "...b.ef..h."},
+      {"name": "sum (unsigned)", "wave": "=..=.==..=.", "data": ["0", "8", "300", "510", "0"]},
+      {"name": "Output transaction", "wave": "x..=x==xxx.", "data": ["T0: 8", "T1: 300", "T2: 510"]}
+    ],
+    {},
+    {"name": "pending_valid", "wave": "0.101.0.10."},
+    {"name": "pending_sum", "wave": "=.=.==..==.", "data": ["0", "8", "300", "510", "3", "0"]}
+  ],
+  "edge": [
+    "a~>b T0: one complete cycle",
+    "c~>e T1: one complete cycle",
+    "d~>f T2: one complete cycle",
+    "g~>h reset flushes the probe and clears pending_valid"
+  ],
+  "head": {"text": "Expected waveform: one_cycle_delayed_adder"},
+  "foot": {"text": "Interpret sum only when out_valid=1. The held values 8 and 510 are ignored during invalid cycles."},
+  "config": {"hscale": 2}
+}
+    </script>
+  </div>
+</body>
+</html>
